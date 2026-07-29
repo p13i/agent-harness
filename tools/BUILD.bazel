@@ -7,6 +7,22 @@ py_binary(
 )
 
 py_test(
+    name = "coverage_gate_test",
+    srcs = [
+        "coverage_gate.py",
+        "coverage_gate_test.py",
+    ],
+    main = "coverage_gate_test.py",
+    deps = ["@agent_harness_pip//pytest"],
+)
+
+py_binary(
+    name = "coverage_gate",
+    srcs = ["coverage_gate.py"],
+    main = "coverage_gate.py",
+)
+
+py_test(
     name = "install_test",
     srcs = [
         "install.py",

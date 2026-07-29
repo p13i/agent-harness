@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+from textual.containers import Vertical
 from textual.widgets import Input
 from textual.widgets import Static
 
@@ -9,6 +11,10 @@ from agent_harness.tui import _native_command
 
 
 class Client:
+    def __init__(self, *, theme: str = "system") -> None:
+        self.theme = theme
+        self.ui_updates = []
+
     async def request(
         self,
         method: str,
@@ -18,8 +24,9 @@ class Client:
         idempotency_key: str = "",
     ):
         del method
-        del payload
         del idempotency_key
+        if payload is not None and path.endswith("/ui-state"):
+            self.ui_updates.append(payload)
         if path == "/v1/sessions":
             return {
                 "sessions": [
@@ -36,6 +43,7 @@ class Client:
                 "ui_state": {
                     "composer": "unfinished",
                     "provider": "codex",
+                    "theme": self.theme,
                 }
             }
         if path.startswith("/v1/providers"):
@@ -44,6 +52,7 @@ class Client:
                     "codex": {
                         "ready": True,
                         "usage": {"binding_percent": 40},
+                        "usage_refreshing": False,
                     }
                 }
             }
@@ -86,6 +95,84 @@ def test_textual_workspace_restores_draft_and_inspector(
             inspector = app.query_one("#inspector-content", Static)
             assert "Finish the implementation." in str(inspector.render())
             assert "codex" in str(inspector.render())
+
+    asyncio.run(scenario())
+
+
+def test_textual_workspace_theme_and_responsive_visual_contract(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client = Client(theme="dark")
+        app = HarnessApp(
+            client,
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            dark_svg = app.export_screenshot()
+            assert dark_svg.startswith("<svg")
+            assert "P13I AGENT HARNESS" in str(
+                app.query_one("#brand", Static).render()
+            )
+            assert "SESSION CONTROL" in str(
+                app.query_one("#inspector-heading", Static).render()
+            )
+            assert not app.screen.has_class("compact")
+            assert app.query_one("#inspector", Vertical).display
+
+            await app._slash("/theme light")
+            await pilot.pause()
+            light_svg = app.export_screenshot()
+            assert light_svg != dark_svg
+            assert app.screen.has_class("light")
+            assert client.ui_updates[-1]["theme"] == "light"
+
+            await pilot.resize_terminal(100, 36)
+            await pilot.pause()
+            assert app.screen.has_class("compact")
+            assert not app.query_one("#inspector", Vertical).display
+
+            await pilot.resize_terminal(70, 32)
+            await pilot.pause()
+            assert app.screen.has_class("narrow")
+            assert not app.query_one("#sidebar", Vertical).display
+
+    asyncio.run(scenario())
+
+
+def test_system_theme_tracks_host_appearance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    appearance = {"dark": False}
+
+    def system_theme(default: bool) -> bool:
+        del default
+        return appearance["dark"]
+
+    monkeypatch.setattr(
+        "agent_harness.tui._system_dark_mode",
+        system_theme,
+    )
+
+    async def scenario() -> None:
+        app = HarnessApp(
+            Client(theme="system"),
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.screen.has_class("light")
+            assert app.theme == "textual-light"
+
+            appearance["dark"] = True
+            await app._sync_system_theme()
+            await pilot.pause()
+            assert not app.screen.has_class("light")
+            assert app.theme == "textual-dark"
 
     asyncio.run(scenario())
 

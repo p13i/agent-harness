@@ -11,7 +11,9 @@ py_test(
     name = "unit_tests",
     srcs = [
         "test_context.py",
+        "test_foundations.py",
         "test_claude_provider.py",
+        "test_cli.py",
         "test_goals.py",
         "test_normalize.py",
         "test_projections.py",
@@ -42,6 +44,29 @@ py_test(
     deps = [
         "//agent_harness",
         "@agent_harness_pip//aiohttp",
+        "@agent_harness_pip//pytest",
+        "@agent_harness_pip//pytest_asyncio",
+    ],
+)
+
+py_test(
+    name = "chat_pty_test",
+    srcs = ["test_chat_pty.py"],
+    data = ["//cmd:agent-harness"],
+    main = "test_chat_pty.py",
+    deps = ["@agent_harness_pip//pytest"],
+)
+
+py_test(
+    name = "e2e_tests",
+    srcs = [
+        "e2e_test_runner.py",
+        "test_e2e_journeys.py",
+        "test_support.py",
+    ],
+    main = "e2e_test_runner.py",
+    deps = [
+        "//agent_harness",
         "@agent_harness_pip//pytest",
         "@agent_harness_pip//pytest_asyncio",
     ],

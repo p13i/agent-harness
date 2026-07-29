@@ -13,6 +13,8 @@ if __name__ == "__main__":
                 str(directory),
                 "-q",
                 "--ignore=" + str(directory / "test_api_integration.py"),
+                "--ignore=" + str(directory / "test_chat_pty.py"),
+                "--ignore=" + str(directory / "test_e2e_journeys.py"),
                 "--ignore=" + str(directory / "parity_test.py"),
                 "--ignore=" + str(directory / "style_test.py"),
             ]
