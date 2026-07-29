@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p13i/agent-harness/transfer/v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "ephemeral_public",
+    "nonce",
+    "ciphertext",
+    "signature"
+  ],
+  "properties": {
+    "schema": {
+      "const": "p13i/agent-harness/transfer/v1"
+    },
+    "ephemeral_public": {
+      "type": "string"
+    },
+    "nonce": {
+      "type": "string"
+    },
+    "ciphertext": {
+      "type": "string"
+    },
+    "signature": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+exports_files(
+    ["agent_harness.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "agent-harness",
+    srcs = ["agent_harness.py"],
+    main = "agent_harness.py",
+    visibility = ["//visibility:public"],
+    deps = ["//agent_harness"],
+)

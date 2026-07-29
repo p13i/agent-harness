@@ -1,0 +1,9 @@
+aiohttp==3.14.2
+claude-agent-sdk==0.2.123
+cryptography==49.0.0
+keyring==25.7.0
+pyte==0.8.2
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.15.21
+textual==8.2.8

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p13i/agent-harness/goal/v1",
+  "type": "object",
+  "required": [
+    "goal_id",
+    "session_id",
+    "kind",
+    "objective",
+    "status",
+    "predicates",
+    "budgets"
+  ],
+  "properties": {
+    "goal_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "kind": {
+      "enum": [
+        "finite",
+        "invariant"
+      ]
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string"
+    },
+    "predicates": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "budgets": {
+      "type": "object"
+    }
+  }
+}

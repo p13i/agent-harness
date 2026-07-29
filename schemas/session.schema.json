@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p13i/agent-harness/session/v1",
+  "type": "object",
+  "required": [
+    "session_id",
+    "workspace",
+    "worktree",
+    "lifecycle",
+    "attention",
+    "permission_mode",
+    "owner_epoch"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "workspace": {
+      "type": "string"
+    },
+    "worktree": {
+      "type": "string"
+    },
+    "lifecycle": {
+      "type": "string"
+    },
+    "attention": {
+      "type": "string"
+    },
+    "permission_mode": {
+      "enum": [
+        "approval",
+        "full",
+        "read-only",
+        "plan"
+      ]
+    },
+    "owner_epoch": {
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

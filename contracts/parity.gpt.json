@@ -1,0 +1,161 @@
+{
+  "schema": "p13i/agent-harness/parity/v1",
+  "statuses": [
+    "normalized",
+    "native-passthrough",
+    "not-applicable"
+  ],
+  "common": [
+    "approval",
+    "checkpoint",
+    "fork",
+    "hooks",
+    "mcp",
+    "plugins",
+    "resume",
+    "skills",
+    "streaming",
+    "subagents",
+    "tools",
+    "worktree"
+  ],
+  "codex": [
+    "apps",
+    "images",
+    "steer"
+  ],
+  "features": [
+    {
+      "id": "durable-chat",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "streaming-output",
+      "capability": "streaming",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "tool-execution",
+      "capability": "tools",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "tool-approvals-and-questions",
+      "capability": "approval",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "permission-modes",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "native-session-resume",
+      "capability": "resume",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "provider-switch-resume",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "fork-and-checkpoint",
+      "capability": "checkpoint",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "formal-goals-and-budgets",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "model-and-effort-selection",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "steering",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "subagents",
+      "capability": "subagents",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "skills",
+      "capability": "skills",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "plugins",
+      "capability": "plugins",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "mcp",
+      "capability": "mcp",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "hooks",
+      "capability": "hooks",
+      "claude": "normalized",
+      "codex": "normalized"
+    },
+    {
+      "id": "images",
+      "claude": "native-passthrough",
+      "codex": "normalized"
+    },
+    {
+      "id": "codex-apps",
+      "claude": "not-applicable",
+      "codex": "normalized"
+    },
+    {
+      "id": "slash-commands",
+      "claude": "native-passthrough",
+      "codex": "native-passthrough"
+    },
+    {
+      "id": "provider-command-palette",
+      "claude": "native-passthrough",
+      "codex": "native-passthrough"
+    },
+    {
+      "id": "provider-desktop-affordances",
+      "claude": "native-passthrough",
+      "codex": "native-passthrough"
+    },
+    {
+      "id": "interactive-terminal",
+      "claude": "native-passthrough",
+      "codex": "native-passthrough"
+    },
+    {
+      "id": "file-and-diff-inspection",
+      "claude": "native-passthrough",
+      "codex": "native-passthrough"
+    }
+  ],
+  "escape_hatch": {
+    "transport": "authenticated-pty-websocket",
+    "providers": [
+      "claude",
+      "codex"
+    ]
+  }
+}

@@ -1,0 +1,389 @@
+openapi: 3.1.0
+info:
+  title: p13i agent harness
+  version: 1.0.0
+  description: >-
+    Durable provider-neutral agent sessions, goals, events,
+    approvals, routing, checkpoints, terminals, and fleet
+    transfer.
+servers:
+  - url: https://localhost
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /readyz:
+    get:
+      operationId: ready
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions:
+    get:
+      operationId: listSessions
+      parameters:
+        - name: archived
+          in: query
+          schema:
+            type: string
+            enum:
+              - "0"
+              - "1"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+    post:
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSession"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getSession
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+    patch:
+      operationId: configureSession
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/ui-state:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getSessionUiState
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+    put:
+      operationId: setSessionUiState
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: listEvents
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/stream:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: streamEvents
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - name: Last-Event-ID
+          in: header
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Ordered server-sent event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /v1/sessions/{session_id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      operationId: submitMessage
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "202":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/commands/{command_type}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/CommandType"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      operationId: submitSessionCommand
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "202":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/commands/{command_id}:
+    parameters:
+      - $ref: "#/components/parameters/CommandId"
+    get:
+      operationId: getCommand
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/approvals:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: listApprovals
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/approvals/{approval_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/ApprovalId"
+    post:
+      operationId: resolveApproval
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/goal:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getGoal
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/evidence:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: addGoalEvidence
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/export:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: exportSession
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/checkpoints:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: checkpointSession
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/fork:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: forkSession
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/route:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: previewRoute
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/terminal:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: providerTerminal
+      responses:
+        "101":
+          description: Authenticated provider PTY WebSocket
+  /v1/providers:
+    get:
+      operationId: providers
+      parameters:
+        - name: workspace
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/registry:
+    get:
+      operationId: registry
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/fleet/keys:
+    get:
+      operationId: fleetKeys
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/transfers:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: createTransfer
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/transfers/import:
+    post:
+      operationId: importTransfer
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/transfers/finalize:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: finalizeTransfer
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+components:
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CommandId:
+      name: command_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ApprovalId:
+      name: approval_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CommandType:
+      name: command_type
+      in: path
+      required: true
+      schema:
+        type: string
+        enum:
+          - interrupt
+          - pause
+          - resume
+          - steer
+          - stop
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    After:
+      name: after
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 5000
+        default: 1000
+  requestBodies:
+    JsonObject:
+      required: false
+      content:
+        application/json:
+          schema:
+            type: object
+  responses:
+    JsonResponse:
+      description: JSON response
+      headers:
+        X-Correlation-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            type: object
+  schemas:
+    CreateSession:
+      type: object
+      required:
+        - workspace
+      properties:
+        workspace:
+          type: string
+        name:
+          type: string
+        goal:
+          type: string
+        goal_kind:
+          type: string
+          enum:
+            - finite
+            - invariant
+        constraints:
+          type: array
+          items:
+            type: string
+        predicates:
+          type: array
+          items:
+            type: object
+        budgets:
+          type: object
+        permission_mode:
+          type: string
+          enum:
+            - approval
+            - full
+            - read-only
+            - plan
+        direct:
+          type: boolean
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

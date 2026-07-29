@@ -1,0 +1,17 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+py_binary(
+    name = "install",
+    srcs = ["install.py"],
+    main = "install.py",
+)
+
+py_test(
+    name = "install_test",
+    srcs = [
+        "install.py",
+        "install_test.py",
+    ],
+    main = "install_test.py",
+    deps = ["@agent_harness_pip//pytest"],
+)

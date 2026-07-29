@@ -1,0 +1,16 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "agent_harness",
+    srcs = glob(
+        ["*.py", "providers/*.py"],
+    ),
+    imports = [".."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@agent_harness_pip//aiohttp",
+        "@agent_harness_pip//claude_agent_sdk",
+        "@agent_harness_pip//cryptography",
+        "@agent_harness_pip//textual",
+    ],
+)

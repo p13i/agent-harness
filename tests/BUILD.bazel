@@ -1,0 +1,55 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "style_test",
+    srcs = ["style_test.py"],
+    data = ["//cmd:agent_harness.py"],
+    deps = ["//agent_harness"],
+)
+
+py_test(
+    name = "unit_tests",
+    srcs = [
+        "test_context.py",
+        "test_claude_provider.py",
+        "test_goals.py",
+        "test_normalize.py",
+        "test_projections.py",
+        "test_routing.py",
+        "test_sdk.py",
+        "test_storage.py",
+        "test_transfer.py",
+        "test_tui.py",
+        "test_usage.py",
+        "test_workspace.py",
+        "test_support.py",
+        "unit_test_runner.py",
+    ],
+    main = "unit_test_runner.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
+)
+
+py_test(
+    name = "integration_tests",
+    srcs = [
+        "integration_test_runner.py",
+        "test_api_integration.py",
+    ],
+    main = "integration_test_runner.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//aiohttp",
+        "@agent_harness_pip//pytest",
+        "@agent_harness_pip//pytest_asyncio",
+    ],
+)
+
+py_test(
+    name = "parity_test",
+    srcs = ["parity_test.py"],
+    data = ["//contracts:parity.gpt.json"],
+    deps = ["//agent_harness"],
+)
