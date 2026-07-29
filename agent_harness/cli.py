@@ -23,7 +23,7 @@ from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
 from agent_harness.scheduler import Scheduler
 from agent_harness.storage import StateStore
-from agent_harness.tui import HarnessApp
+from agent_harness.tui import run_tui
 from agent_harness.worker import SessionWorker
 
 
@@ -160,6 +160,8 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
+        if arguments.command in {"chat", "resume"}:
+            return _run_tui_command(arguments)
         return asyncio.run(_run(arguments))
     except KeyboardInterrupt:
         return 130
@@ -176,6 +178,29 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         print("E_INPUT: " + str(error), file=sys.stderr)
         return 2
+
+
+def _run_tui_command(arguments: argparse.Namespace) -> int:
+    harness_paths = paths(arguments.state_dir)
+    prepare_paths(harness_paths)
+    client = asyncio.run(ensure_daemon(harness_paths))
+    session_id = ""
+    permission_mode = "approval"
+    if arguments.command == "chat":
+        permission_mode = arguments.permission_mode
+        if arguments.chat_action == "resume":
+            if not arguments.session_id:
+                raise ValueError("chat resume requires a session UUID")
+            session_id = arguments.session_id
+    else:
+        session_id = arguments.session_id
+    run_tui(
+        client,
+        arguments.cwd.expanduser().resolve(),
+        session_id=session_id,
+        permission_mode=permission_mode,
+    )
+    return 0
 
 
 async def _run(arguments: argparse.Namespace) -> int:
@@ -208,28 +233,6 @@ async def _run(arguments: argparse.Namespace) -> int:
     if arguments.command == "doctor":
         return await _doctor(harness_paths)
     client = await ensure_daemon(harness_paths)
-    if arguments.command == "chat":
-        session_id = ""
-        if arguments.chat_action == "resume":
-            if not arguments.session_id:
-                raise ValueError("chat resume requires a session UUID")
-            session_id = arguments.session_id
-        app = HarnessApp(
-            client,
-            arguments.cwd.expanduser().resolve(),
-            session_id=session_id,
-            permission_mode=arguments.permission_mode,
-        )
-        await asyncio.to_thread(app.run)
-        return 0
-    if arguments.command == "resume":
-        app = HarnessApp(
-            client,
-            arguments.cwd.expanduser().resolve(),
-            session_id=arguments.session_id,
-        )
-        await asyncio.to_thread(app.run)
-        return 0
     if arguments.command == "new":
         predicates = [
             _json_object(value, "--predicate")

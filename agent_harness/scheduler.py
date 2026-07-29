@@ -32,8 +32,9 @@ class Scheduler:
         self.store = store
         self.adapters = adapters
         self._model_cache: dict[str, tuple[ProviderModel, ...]] = {}
-        self._usage_cache: dict[str, UsageSnapshot] = {}
+        self._usage_cache = _durable_usage(store.latest_usage())
         self._usage_at = 0.0
+        self._status_refresh: asyncio.Task[None] | None = None
 
     async def refresh_usage(self) -> dict[str, UsageSnapshot]:
         snapshots = await probe_all()
@@ -132,8 +133,12 @@ class Scheduler:
         )
 
     async def status(self, workspace: Path) -> dict[str, Any]:
-        usage = await self.usage()
-        models = await self.models(workspace)
+        self._start_status_refresh(workspace)
+        usage = dict(self._usage_cache)
+        models = dict(self._model_cache)
+        refreshing = self._status_refresh is not None
+        if self._status_refresh is not None:
+            refreshing = not self._status_refresh.done()
         result: dict[str, Any] = {}
         for provider, adapter in self.adapters.items():
             provider_status = adapter.status()
@@ -146,6 +151,7 @@ class Scheduler:
                 "detail": provider_status.detail,
                 "capabilities": sorted(provider_status.capabilities),
                 "usage": usage_value,
+                "usage_refreshing": refreshing,
                 "models": [
                     {
                         "id": item.model_id,
@@ -154,10 +160,67 @@ class Scheduler:
                         "context_window": item.context_window,
                         "default": item.default,
                     }
-                    for item in models.get(provider, ())
+                    for item in models.get(
+                        provider,
+                        _fallback_models(provider),
+                    )
                 ],
             }
         return result
+
+    def _start_status_refresh(self, workspace: Path) -> None:
+        if self._status_refresh is not None:
+            if not self._status_refresh.done():
+                return
+        now = asyncio.get_running_loop().time()
+        models_complete = all(
+            provider in self._model_cache for provider in self.adapters
+        )
+        usage_fresh = self._usage_at > 0
+        if usage_fresh:
+            usage_fresh = now - self._usage_at <= 60
+        if usage_fresh and models_complete:
+            return
+        self._status_refresh = asyncio.create_task(
+            self._refresh_status(workspace)
+        )
+
+    async def _refresh_status(self, workspace: Path) -> None:
+        await asyncio.gather(
+            self.refresh_usage(),
+            self.models(workspace, refresh=True),
+        )
+
+
+def _durable_usage(
+    values: dict[str, dict[str, Any]],
+) -> dict[str, UsageSnapshot]:
+    snapshots: dict[str, UsageSnapshot] = {}
+    for provider, value in values.items():
+        stored = value.get("payload", {})
+        if not isinstance(stored, dict):
+            stored = {}
+        payload = stored.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        snapshots[provider] = UsageSnapshot(
+            provider=provider,
+            binding_percent=_optional_number(
+                value.get("binding_percent")
+            ),
+            credits_engaged=bool(value.get("credits_engaged", False)),
+            payload=payload,
+            error=str(stored.get("error", "")),
+        )
+    return snapshots
+
+
+def _optional_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
 
 
 def _select_model(

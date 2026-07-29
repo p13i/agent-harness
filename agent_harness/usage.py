@@ -36,10 +36,29 @@ class UsageSnapshot:
 
 async def probe_all() -> dict[str, UsageSnapshot]:
     results = await asyncio.gather(
-        asyncio.to_thread(_probe_codex),
-        asyncio.to_thread(_probe_claude),
+        _timed_probe("codex", _probe_codex),
+        _timed_probe("claude", _probe_claude),
     )
     return {item.provider: item for item in results}
+
+
+async def _timed_probe(
+    provider: str,
+    probe: Any,
+) -> UsageSnapshot:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(probe),
+            timeout=5.0,
+        )
+    except TimeoutError:
+        return UsageSnapshot(
+            provider=provider,
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="probe timed out",
+        )
 
 
 def normalize_usage(

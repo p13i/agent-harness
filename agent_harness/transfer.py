@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -195,7 +196,7 @@ def open_transfer(
     key = _derive_key(shared)
     try:
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, ephemeral_public)
-    except ValueError as error:
+    except (InvalidTag, ValueError) as error:
         raise HarnessError(
             "E_TRANSFER_DECRYPT",
             "transfer cannot be decrypted",
