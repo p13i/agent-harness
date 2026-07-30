@@ -71,6 +71,7 @@ class ClaudeAdapter(ProviderAdapter):
 
     def __init__(self) -> None:
         self._client: ClaudeSDKClient | None = None
+        self._transport: NpxClaudeTransport | None = None
 
     def status(self) -> ProviderStatus:
         ready = shutil.which("npx") is not None
@@ -173,6 +174,7 @@ class ClaudeAdapter(ProviderAdapter):
         transport = NpxClaudeTransport(_empty_stream(), options)
         client = ClaudeSDKClient(options=options, transport=transport)
         self._client = client
+        self._transport = transport
         usage: dict[str, Any] = {}
         result_status = "failed"
         try:
@@ -222,6 +224,7 @@ class ClaudeAdapter(ProviderAdapter):
                 await client.disconnect()
             finally:
                 self._client = None
+                self._transport = None
 
     async def interrupt(self) -> None:
         client = self._client
@@ -235,10 +238,33 @@ class ClaudeAdapter(ProviderAdapter):
             return
         await client.query(text)
 
+    def process_identity(self) -> tuple[int, str]:
+        transport = self._transport
+        if transport is None:
+            return (0, "")
+        process = getattr(transport, "_process", None)
+        if process is None:
+            return (0, "")
+        pid = int(getattr(process, "pid", 0) or 0)
+        if pid <= 0:
+            return (0, "")
+        return (pid, _process_start(pid))
+
 
 async def _empty_stream() -> AsyncIterator[dict[str, Any]]:
     if False:
         yield {}
+
+
+def _process_start(pid: int) -> str:
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        fields = stat_path.read_text(encoding="utf-8").split()
+    except OSError:
+        return str(pid)
+    if len(fields) <= 21:
+        return str(pid)
+    return fields[21]
 
 
 async def _prompt_stream(

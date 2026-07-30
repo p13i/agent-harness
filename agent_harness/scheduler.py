@@ -12,6 +12,7 @@ from agent_harness.models import Session
 from agent_harness.providers.base import ProviderAdapter
 from agent_harness.providers.base import ProviderModel
 from agent_harness.routing import route
+from agent_harness.safety import INTERACTIVE
 from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
 from agent_harness.usage import probe_all
@@ -88,6 +89,9 @@ class Scheduler:
         metered_budget: float | None = None,
         excluded: frozenset[str] = frozenset(),
         context_transfer_tokens: int = 0,
+        binding_ceiling: float | None = None,
+        execution_profile: str = INTERACTIVE,
+        enforce_concurrency: bool = False,
     ) -> RoutingDecision:
         usage = await self.usage()
         models = await self.models(Path(session.worktree))
@@ -103,6 +107,18 @@ class Scheduler:
             if provider_usage is not None:
                 binding = provider_usage.binding_percent
                 credits = provider_usage.credits_engaged
+            safety_ready = status.ready
+            if binding_ceiling is not None:
+                if binding is None and execution_profile != INTERACTIVE:
+                    safety_ready = False
+                if binding is not None and binding >= binding_ceiling:
+                    safety_ready = False
+            if enforce_concurrency and execution_profile == "unattended":
+                active = self.store.active_unattended_provider_count(
+                    provider_id
+                )
+                if active >= 1:
+                    safety_ready = False
             chosen_model = _select_model(models.get(provider_id, ()), model)
             if chosen_model is None:
                 continue
@@ -114,7 +130,7 @@ class Scheduler:
                     provider=provider_id,
                     model=chosen_model.model_id,
                     effort=chosen_effort,
-                    ready=status.ready,
+                    ready=safety_ready,
                     capabilities=status.capabilities,
                     quality=QUALITY.get(provider_id, 90.0),
                     binding_percent=binding,

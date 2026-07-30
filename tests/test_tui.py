@@ -14,6 +14,7 @@ class Client:
     def __init__(self, *, theme: str = "system") -> None:
         self.theme = theme
         self.ui_updates = []
+        self.requests = []
 
     async def request(
         self,
@@ -25,6 +26,7 @@ class Client:
     ):
         del method
         del idempotency_key
+        self.requests.append((path, payload))
         if payload is not None and path.endswith("/ui-state"):
             self.ui_updates.append(payload)
         if path == "/v1/sessions":
@@ -76,6 +78,38 @@ class Client:
                     "objective": "Finish the implementation.",
                 },
                 "approvals": [],
+                "safety": {
+                    "session": {"profile": "interactive"},
+                    "envelopes": [
+                        {
+                            "state": "running",
+                            "guard_reason": "",
+                            "recovery_stage": 1,
+                            "limits": {
+                                "max_total_tokens": 300000,
+                                "max_seconds": 3600,
+                                "max_tool_calls": 256,
+                            },
+                            "consumption": {
+                                "total_tokens": 1200,
+                                "elapsed_seconds": 12.4,
+                                "tool_calls": 3,
+                                "exact_tokens": False,
+                            },
+                        }
+                    ],
+                    "incidents": [],
+                },
+            }
+        if path.endswith("/budget-extensions"):
+            return {"safety": {"profile": "interactive"}}
+        if path.endswith("/usage"):
+            return {
+                "safety": {
+                    "session": {"profile": "interactive"},
+                    "envelopes": [],
+                    "incidents": [],
+                }
             }
         return {"ui_state": {}}
 
@@ -95,6 +129,10 @@ def test_textual_workspace_restores_draft_and_inspector(
             inspector = app.query_one("#inspector-content", Static)
             assert "Finish the implementation." in str(inspector.render())
             assert "codex" in str(inspector.render())
+            assert "SAFETY ENVELOPE" in str(inspector.render())
+            assert "interactive" in str(inspector.render())
+            assert "1200 / 300000" in str(inspector.render())
+            assert "estimated" in str(inspector.render())
 
     asyncio.run(scenario())
 
@@ -189,3 +227,40 @@ def test_native_attachment_uses_pinned_provider_packages() -> None:
         "@anthropic-ai/claude-code@2.1.220",
         "--dangerously-skip-permissions",
     ]
+
+
+def test_budget_commands_require_explicit_operator_actions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client = Client()
+        app = HarnessApp(
+            client,
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await app._slash(
+                "/budget extend 60 1000 finish bounded validation"
+            )
+            await app._slash("/budget xhigh inspect one hard failure")
+
+        extensions = [
+            payload
+            for path, payload in client.requests
+            if path.endswith("/budget-extensions")
+        ]
+        assert extensions == [
+            {
+                "reason": "finish bounded validation",
+                "additional_seconds": 60,
+                "additional_tokens": 1000,
+            },
+            {
+                "reason": "inspect one hard failure",
+                "allow_xhigh_once": True,
+            },
+        ]
+
+    asyncio.run(scenario())

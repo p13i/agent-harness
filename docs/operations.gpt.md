@@ -17,6 +17,12 @@ The durable service starts on demand. Closing the TUI leaves
 workers running. The following commands provide non-TUI
 control:
 
+Health responses carry a control protocol version and a
+build fingerprint derived from the harness Python package.
+Before opening chat, a new CLI replaces an older managed
+daemon when either value differs. This prevents a rebuilt
+client from silently using stale in-memory service code.
+
 ```sh
 make doctor
 npx --yes @bazel/bazelisk run //cmd:agent-harness -- status
@@ -35,11 +41,21 @@ npx --yes @bazel/bazelisk run //cmd:agent-harness -- \
   --cwd /absolute/workspace new \
   --goal "Complete the scoped implementation." \
   --goal-kind finite \
-  --predicate '{"type":"command","subject":"make test"}'
+  --predicate '{"type":"command","subject":"make test"}' \
+  --execution-profile unattended
 ```
 
-Submit a non-interactive turn with an explicit route when
-needed:
+Unattended xhigh requires one explicit authorization before
+the command:
+
+```sh
+npx --yes @bazel/bazelisk run //cmd:agent-harness -- \
+  extend-budget <session-uuid> \
+  --allow-xhigh-once \
+  --reason "One bounded architecture pass"
+```
+
+Then submit the explicit route:
 
 ```sh
 npx --yes @bazel/bazelisk run //cmd:agent-harness -- \
@@ -52,6 +68,22 @@ back. Automatic routing uses readiness, capability
 requirements, subscription headroom, metered-credit policy,
 role bias, provider affinity, queue share, quality, and
 context-transfer cost.
+
+Inside chat, `/usage` displays the current profile,
+envelope, exact or estimated accounting, provider headroom,
+recovery stage, and guard reason. `/budget` shows the same
+state. These commands extend one future envelope:
+
+```text
+/budget extend 300 10000 Finish bounded validation
+/budget xhigh One bounded architecture pass
+```
+
+The dashboard exposes the same allowlisted usage state and
+bounded extension control. Every extension requires a
+reason. Retrying an extension or lease mutation with the
+same idempotency key replays the original response; changing
+the request under that key conflicts.
 
 ## API
 
@@ -82,6 +114,23 @@ enters reconciliation instead of replaying the mutation on
 another provider. Read-only or clearly unstarted work can
 fail over automatically.
 
+Hard safety limits do not fail over. Recoverable soft
+violations can lower effort once and switch provider once,
+while retaining cumulative use in the original command
+envelope. A session requiring more capacity stays paused
+until an operator explicitly extends time, tokens, or one
+xhigh authorization.
+
+Machines-managed background processes must reserve a lease
+before launch. Lease admission requires a fresh provider
+usage sample below the profile ceiling with metered credits
+off. The process then attaches its PID start identity,
+heartbeats while active, and releases at exit. The host
+watchdog allows a short registration grace period and then
+terminates unleased, expired, or PID-reused background
+Claude and Codex processes. It does not target foreground
+terminal sessions.
+
 ## Validation
 
 ```sh
@@ -90,3 +139,16 @@ make test
 make build
 make doctor
 ```
+
+These targets use scripted adapters and do not invoke live
+providers. A separate smoke validates one initial and one
+native-resumed turn, with low effort, read-only permission,
+one attempt per turn, and a 50 percent binding ceiling:
+
+```sh
+make live-smoke ARGS="codex --confirm-spend"
+make live-smoke ARGS="claude --confirm-spend"
+```
+
+Without `--confirm-spend`, the smoke exits before creating a
+session or invoking a provider.

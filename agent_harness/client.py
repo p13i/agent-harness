@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 from typing import Any
 
@@ -13,6 +15,8 @@ from aiohttp import ClientSession
 from aiohttp import UnixConnector
 
 from agent_harness.config import HarnessPaths
+from agent_harness.config import CONTROL_BUILD_ID
+from agent_harness.config import CONTROL_PROTOCOL_VERSION
 from agent_harness.config import api_token
 from agent_harness.config import prepare_paths
 from agent_harness.errors import HarnessError
@@ -79,18 +83,25 @@ class HarnessClient:
                 return result
 
     async def health(self) -> bool:
+        result = await self._health_payload()
+        return _compatible_health(result)
+
+    async def _health_payload(self) -> dict[str, Any]:
         try:
             result = await self.request("GET", "/healthz")
         except (HarnessError, ClientConnectorError, OSError):
-            return False
-        return result.get("status") == "ok"
+            return {}
+        return result
 
 
 async def ensure_daemon(paths: HarnessPaths) -> HarnessClient:
     prepare_paths(paths)
     client = HarnessClient(paths)
-    if await client.health():
+    health = await client._health_payload()
+    if _compatible_health(health):
         return client
+    if health.get("status") == "ok":
+        await _stop_incompatible_daemon(paths, client)
     command = [
         *launcher_command(),
         "--state-dir",
@@ -118,6 +129,97 @@ async def ensure_daemon(paths: HarnessPaths) -> HarnessClient:
         retryable=True,
         status=503,
     )
+
+
+def _compatible_health(value: dict[str, Any]) -> bool:
+    if value.get("status") != "ok":
+        return False
+    if (
+        value.get("control_protocol_version")
+        != CONTROL_PROTOCOL_VERSION
+    ):
+        return False
+    return value.get("control_build_id") == CONTROL_BUILD_ID
+
+
+async def _stop_incompatible_daemon(
+    paths: HarnessPaths,
+    client: HarnessClient,
+) -> None:
+    pids = _managed_daemon_pids(paths)
+    if not pids:
+        raise HarnessError(
+            "E_DAEMON_UPGRADE",
+            "an incompatible harness daemon is running, but its managed "
+            "process could not be identified",
+            retryable=True,
+            status=503,
+        )
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    for unused in range(50):
+        del unused
+        health = await client._health_payload()
+        if health.get("status") != "ok":
+            return
+        await asyncio.sleep(0.1)
+    raise HarnessError(
+        "E_DAEMON_UPGRADE",
+        "the incompatible harness daemon did not stop cleanly",
+        retryable=True,
+        status=503,
+    )
+
+
+def _managed_daemon_pids(paths: HarnessPaths) -> tuple[int, ...]:
+    candidates: set[int] = set()
+    if paths.daemon_pid.exists():
+        try:
+            candidates.add(
+                int(paths.daemon_pid.read_text(encoding="utf-8").strip())
+            )
+        except ValueError:
+            pass
+    managed = _filter_managed_daemon_pids(candidates)
+    if managed:
+        return managed
+    completed = subprocess.run(
+        ["lsof", "-t", str(paths.socket)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in completed.stdout.splitlines():
+        try:
+            candidates.add(int(line))
+        except ValueError:
+            continue
+    return _filter_managed_daemon_pids(candidates)
+
+
+def _filter_managed_daemon_pids(
+    candidates: set[int],
+) -> tuple[int, ...]:
+    managed: list[int] = []
+    for pid in sorted(candidates):
+        if pid <= 1 or pid == os.getpid():
+            continue
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        command = completed.stdout.casefold()
+        if "agent-harness" not in command:
+            continue
+        if " daemon" not in command:
+            continue
+        managed.append(pid)
+    return tuple(managed)
 
 
 async def wait_command(

@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_harness.context import CompiledContext
 from agent_harness.ids import utc_now
 from agent_harness.models import SessionEvent
+from agent_harness.projections import _jsonl
 from agent_harness.projections import write_session_projections
 
 
@@ -66,3 +69,24 @@ def test_projection_set_is_complete_and_private(tmp_path: Path) -> None:
     assert "Durable output" in paths[
         "transcript_markdown"
     ].read_text(encoding="utf-8")
+
+
+def test_projection_rejects_invalid_session_and_empty_transcript(
+    tmp_path: Path,
+) -> None:
+    context = CompiledContext(
+        text="",
+        estimated_tokens=0,
+        included_sequences=(),
+        omitted_events=0,
+        projection={},
+    )
+    with pytest.raises(ValueError):
+        write_session_projections(
+            tmp_path,
+            {"session": []},
+            context,
+            [],
+            None,
+        )
+    assert _jsonl([]) == ""

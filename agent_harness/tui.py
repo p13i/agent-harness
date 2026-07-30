@@ -364,6 +364,7 @@ class HarnessApp(App[None]):
         self._sessions: list[dict[str, Any]] = []
         self._session: dict[str, Any] = {}
         self._goal: dict[str, Any] | None = None
+        self._safety: dict[str, Any] = {}
         self._approvals: tuple[dict[str, Any], ...] = ()
         self._providers: dict[str, Any] = {}
         self._provider_override = ""
@@ -525,6 +526,7 @@ class HarnessApp(App[None]):
             payload={
                 "workspace": str(self.workspace),
                 "permission_mode": self.permission_mode,
+                "execution_profile": "interactive",
             },
         )
         session = _object(result.get("session"))
@@ -535,6 +537,11 @@ class HarnessApp(App[None]):
     async def _open_session(self, session_id: str) -> None:
         self.session_id = session_id
         self.sequence = 0
+        await self.client.request(
+            "PATCH",
+            "/v1/sessions/" + session_id,
+            payload={"execution_profile": "interactive"},
+        )
         state = await self.client.request(
             "GET",
             "/v1/sessions/" + session_id + "/ui-state",
@@ -596,6 +603,7 @@ class HarnessApp(App[None]):
             return
         session = _object(state.get("session"))
         self._session = session
+        self._safety = _object(state.get("safety"))
         goal = state.get("goal")
         self._goal = None
         goal_text = ""
@@ -786,6 +794,51 @@ class HarnessApp(App[None]):
             await self._load_providers()
             self._render_inspector()
             return
+        if command in {"/usage", "/budget"} and len(parts) == 1:
+            result = await self.client.request(
+                "GET",
+                "/v1/sessions/" + self.session_id + "/usage",
+            )
+            self._safety = _object(result.get("safety"))
+            self._render_inspector()
+            self._write_notice("[bold]Safety usage refreshed[/bold]")
+            return
+        if command == "/budget" and len(parts) >= 3:
+            payload: dict[str, Any] = {
+                "reason": " ".join(parts[3:]) or "TUI operator extension",
+            }
+            if parts[1] == "xhigh":
+                payload["allow_xhigh_once"] = True
+                payload["reason"] = " ".join(parts[2:])
+            elif parts[1] == "extend":
+                try:
+                    payload["additional_seconds"] = int(parts[2])
+                    if len(parts) >= 4:
+                        payload["additional_tokens"] = int(parts[3])
+                        payload["reason"] = (
+                            " ".join(parts[4:])
+                            or "TUI operator extension"
+                        )
+                except ValueError:
+                    self._write_notice(
+                        "[red]Budget values must be integers[/red]"
+                    )
+                    return
+            else:
+                self._write_notice(
+                    "[red]Use /budget extend or /budget xhigh[/red]"
+                )
+                return
+            await self.client.request(
+                "POST",
+                "/v1/sessions/"
+                + self.session_id
+                + "/budget-extensions",
+                payload=payload,
+                idempotency_key=new_uuid(),
+            )
+            await self._poll()
+            return
         if command == "/native" and len(parts) == 2:
             await self._native(parts[1])
             return
@@ -868,6 +921,58 @@ class HarnessApp(App[None]):
                     escape(str(self._goal.get("objective", ""))),
                 ]
             )
+        safety_session = _object(self._safety.get("session"))
+        envelopes = self._safety.get("envelopes", [])
+        if not isinstance(envelopes, list):
+            envelopes = []
+        lines.extend(
+            [
+                "",
+                "[bold cyan]SAFETY ENVELOPE[/bold cyan]",
+                "Profile    "
+                + escape(str(safety_session.get("profile", "unknown"))),
+            ]
+        )
+        if envelopes:
+            envelope = _object(envelopes[-1])
+            consumption = _object(envelope.get("consumption"))
+            limits = _object(envelope.get("limits"))
+            accounting = "estimated"
+            if bool(consumption.get("exact_tokens", False)):
+                accounting = "exact"
+            lines.extend(
+                [
+                    "State      "
+                    + escape(str(envelope.get("state", ""))),
+                    "Tokens     "
+                    + escape(str(consumption.get("total_tokens", 0)))
+                    + " / "
+                    + escape(str(limits.get("max_total_tokens", 0))),
+                    "Time       "
+                    + escape(
+                        str(round(float(
+                            consumption.get("elapsed_seconds", 0)
+                        )))
+                    )
+                    + "s / "
+                    + escape(str(limits.get("max_seconds", 0)))
+                    + "s",
+                    "Tools      "
+                    + escape(str(consumption.get("tool_calls", 0)))
+                    + " / "
+                    + escape(str(limits.get("max_tool_calls", 0))),
+                    "Accounting " + accounting,
+                    "Recovery   stage "
+                    + escape(str(envelope.get("recovery_stage", 0))),
+                ]
+            )
+            guard_reason = str(envelope.get("guard_reason", ""))
+            if guard_reason:
+                lines.append(
+                    "[bold red]Guard      "
+                    + escape(guard_reason)
+                    + "[/bold red]"
+                )
         lines.extend(
             ["", "[bold cyan]PENDING APPROVALS[/bold cyan]"]
         )
@@ -930,6 +1035,9 @@ class HarnessApp(App[None]):
             "/model <auto|id>\n"
             "         /effort <auto|level> · /route · /providers\n"
             "[bold]Display[/bold]  /theme <system|light|dark>\n"
+            "[bold]Safety[/bold]   /usage · /budget · "
+            "/budget extend <seconds> <tokens> <reason> · "
+            "/budget xhigh <reason>\n"
             "[bold]Access[/bold]   /permission <mode> · "
             "/approve <uuid> <decision>\n"
             "[bold]Native[/bold]   /native <claude|codex>\n"
@@ -1065,6 +1173,20 @@ def _render_event(event: dict[str, Any]) -> str:
         return (
             "[bold magenta]Approval required[/bold magenta] "
             + escape(str(metadata.get("approval_id", "")))
+        )
+    if event_type == "guard.warning":
+        return (
+            "[bold yellow]Safety envelope is above 80%[/bold yellow]"
+        )
+    if event_type == "guard.tripped":
+        metadata = _object(event.get("metadata"))
+        return (
+            "\n[bold red]TURN INTERRUPTED BY SAFETY GUARD[/bold red]\n"
+            + "Reason: "
+            + escape(str(metadata.get("reason", "unknown")))
+            + "\nAction: "
+            + escape(str(metadata.get("action", "pause")))
+            + "\n"
         )
     if event_type in {
         "routing.selected",

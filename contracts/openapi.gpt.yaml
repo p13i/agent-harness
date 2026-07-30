@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: p13i agent harness
-  version: 1.0.0
+  version: 1.1.0
   description: >-
     Durable provider-neutral agent sessions, goals, events,
     approvals, routing, checkpoints, terminals, and fleet
@@ -88,6 +88,30 @@ paths:
         - $ref: "#/components/parameters/Limit"
       responses:
         "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/usage:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getSessionUsage
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/budget-extensions:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: extendSessionBudget
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BudgetExtension"
+      responses:
+        "201":
           $ref: "#/components/responses/JsonResponse"
   /v1/sessions/{session_id}/stream:
     parameters:
@@ -237,6 +261,41 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/JsonResponse"
+  /v1/leases:
+    get:
+      operationId: listProcessLeases
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+    post:
+      operationId: createProcessLease
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProcessLease"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/leases/{lease_id}:
+    parameters:
+      - $ref: "#/components/parameters/LeaseId"
+    patch:
+      operationId: updateProcessLease
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProcessLease"
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
   /v1/fleet/keys:
     get:
       operationId: fleetKeys
@@ -289,6 +348,13 @@ components:
         format: uuid
     ApprovalId:
       name: approval_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    LeaseId:
+      name: lease_id
       in: path
       required: true
       schema:
@@ -383,6 +449,64 @@ components:
             - plan
         direct:
           type: boolean
+        execution_profile:
+          $ref: "#/components/schemas/ExecutionProfile"
+    BudgetExtension:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          minLength: 1
+        additional_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+        additional_tokens:
+          type: integer
+          minimum: 1
+          maximum: 300000
+        allow_xhigh_once:
+          type: boolean
+    CreateProcessLease:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          type: string
+          enum:
+            - claude
+            - codex
+        session_id:
+          type: string
+          format: uuid
+        execution_profile:
+          $ref: "#/components/schemas/ExecutionProfile"
+    UpdateProcessLease:
+      type: object
+      required:
+        - action
+      properties:
+        action:
+          type: string
+          enum:
+            - attach
+            - heartbeat
+            - release
+        pid:
+          type: integer
+          minimum: 1
+        pid_start:
+          type: string
+          minLength: 1
+    ExecutionProfile:
+      type: string
+      enum:
+        - interactive
+        - live-smoke
+        - unattended
   securitySchemes:
     bearerAuth:
       type: http

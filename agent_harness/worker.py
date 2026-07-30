@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 from agent_harness.blobs import BlobStore
@@ -14,6 +17,7 @@ from agent_harness.context import workspace_instructions
 from agent_harness.errors import HarnessError
 from agent_harness.errors import ProviderExhaustedError
 from agent_harness.errors import ProviderUnavailableError
+from agent_harness.errors import SafetyGuardError
 from agent_harness.goals import evaluate_goal
 from agent_harness.goals import exhausted_budget
 from agent_harness.goals import goal_consumption
@@ -29,6 +33,13 @@ from agent_harness.models import Session
 from agent_harness.providers.base import ProviderAdapter
 from agent_harness.providers.base import ProviderEvent
 from agent_harness.scheduler import Scheduler
+from agent_harness.safety import SafetyLimits
+from agent_harness.safety import TurnGuard
+from agent_harness.safety import INTERACTIVE
+from agent_harness.safety import apply_extension
+from agent_harness.safety import effective_effort
+from agent_harness.safety import limits_for
+from agent_harness.safety import lower_effort
 from agent_harness.storage import StateStore
 from agent_harness.workspace import checkpoint_workspace
 from agent_harness.workspace import workspace_summary
@@ -168,13 +179,83 @@ class SessionWorker:
                 result,
             )
             return
+        safety = self.store.session_safety(self.session_id)
+        profile = str(safety.get("profile", ""))
+        if not profile:
+            result = {
+                "code": "E_SAFETY_PROFILE",
+                "message": "session execution profile must be claimed",
+            }
+            self.store.update_session(
+                self.session_id,
+                lifecycle=Lifecycle.PAUSED,
+                attention=Attention.NEEDS_INPUT,
+            )
+            self.store.resolve_command(
+                command.command_id,
+                CommandStatus.FAILED,
+                result,
+            )
+            return
+        workload = str(payload.get("workload", "implementation"))
+        limits = limits_for(profile, workload)
+        extension = self.store.consume_session_extensions(
+            self.session_id
+        )
+        limits = apply_extension(limits, extension)
+        requested_effort = str(payload.get("effort", ""))
+        xhigh_authorized = int(
+            safety.get("xhigh_authorizations", 0)
+        ) > 0
+        try:
+            effort = effective_effort(
+                requested_effort,
+                limits,
+                xhigh_authorized=xhigh_authorized,
+            )
+        except ValueError as error:
+            self.store.resolve_command(
+                command.command_id,
+                CommandStatus.FAILED,
+                {
+                    "code": "E_SAFETY_EFFORT",
+                    "message": str(error),
+                },
+            )
+            return
+        if effort == "xhigh" and profile != "interactive":
+            self.store.consume_xhigh_authorization(self.session_id)
+        payload = dict(payload)
+        payload["effort"] = effort
+        envelope = self.store.create_command_envelope(
+            command.command_id,
+            self.session_id,
+            profile,
+            limits.as_dict(),
+        )
+        self.store.append_event(
+            self.session_id,
+            "usage.reserved",
+            status="complete",
+            metadata={
+                "command_id": command.command_id,
+                "profile": profile,
+                "limits": envelope["limits"],
+            },
+        )
+        guard = TurnGuard(limits)
         self.store.update_session(
             self.session_id,
             lifecycle=Lifecycle.RUNNING,
             attention=Attention.WORKING,
         )
         try:
-            result = await self._execute_with_failover(payload, text)
+            result = await self._execute_with_failover(
+                command.command_id,
+                payload,
+                text,
+                guard,
+            )
         except HarnessError as error:
             self.store.append_event(
                 self.session_id,
@@ -188,7 +269,14 @@ class SessionWorker:
             )
             self.store.update_session(
                 self.session_id,
-                attention=Attention.FAILED,
+                lifecycle=Lifecycle.PAUSED,
+                attention=Attention.NEEDS_INPUT,
+            )
+            self.store.update_command_envelope(
+                command.command_id,
+                state="paused",
+                consumption=guard.consumption.as_dict(),
+                guard_reason=getattr(error, "reason", ""),
             )
             self.store.resolve_command(
                 command.command_id,
@@ -200,6 +288,11 @@ class SessionWorker:
                 },
             )
             return
+        self.store.update_command_envelope(
+            command.command_id,
+            state="complete",
+            consumption=guard.consumption.as_dict(),
+        )
         self.store.resolve_command(
             command.command_id,
             CommandStatus.COMPLETE,
@@ -209,24 +302,82 @@ class SessionWorker:
 
     async def _execute_with_failover(
         self,
+        command_id: str,
         payload: dict[str, Any],
         text: str,
+        guard: TurnGuard,
     ) -> dict[str, Any]:
         excluded: set[str] = set()
         first_error: HarnessError | None = None
-        for unused in range(2):
-            del unused
+        attempt_payload = dict(payload)
+        recovery_stage = 0
+        for attempt_index in range(guard.limits.max_attempts):
             try:
                 return await self._execute_attempt(
-                    payload,
+                    command_id,
+                    attempt_payload,
                     text,
                     frozenset(excluded),
+                    guard,
+                    recovery_stage,
+                    enforce_concurrency=attempt_index == 0,
                 )
+            except SafetyGuardError as error:
+                if first_error is None:
+                    first_error = error
+                if not error.recoverable:
+                    raise
+                if recovery_stage == 0:
+                    lowered = lower_effort(
+                        str(attempt_payload.get("effort", ""))
+                    )
+                    if lowered != str(
+                        attempt_payload.get("effort", "")
+                    ):
+                        guard.recover()
+                        attempt_payload["provider"] = error.provider
+                        attempt_payload["effort"] = lowered
+                        recovery_stage = 1
+                        self._record_recovery(
+                            command_id,
+                            recovery_stage,
+                            "downgrade",
+                            error.provider,
+                            lowered,
+                        )
+                        continue
+                if str(payload.get("provider", "")):
+                    raise
+                guard.recover()
+                excluded.add(error.provider)
+                attempt_payload.pop("provider", None)
+                attempt_payload["effort"] = lower_effort(
+                    str(attempt_payload.get("effort", ""))
+                )
+                recovery_stage = 2
+                self._record_recovery(
+                    command_id,
+                    recovery_stage,
+                    "failover",
+                    error.provider,
+                    str(attempt_payload.get("effort", "")),
+                )
+                continue
             except (ProviderExhaustedError, ProviderUnavailableError) as error:
                 if first_error is None:
                     first_error = error
                 provider = error.detail.message.split(" ", 1)[0]
+                if str(payload.get("provider", "")):
+                    raise
                 excluded.add(provider)
+                attempt_payload.pop("provider", None)
+                recovery_stage = 2
+                self.store.update_command_envelope(
+                    command_id,
+                    state="recovering",
+                    recovery_stage=recovery_stage,
+                    consumption=guard.consumption.as_dict(),
+                )
                 self.store.append_event(
                     self.session_id,
                     "routing.failover",
@@ -236,18 +387,25 @@ class SessionWorker:
                         "reason": error.detail.code,
                     },
                 )
+                continue
+            break
         if first_error is not None:
             raise first_error
         raise ProviderUnavailableError("all providers")
 
     async def _execute_attempt(
         self,
+        command_id: str,
         payload: dict[str, Any],
         text: str,
         excluded: frozenset[str],
+        guard: TurnGuard,
+        recovery_stage: int,
+        *,
+        enforce_concurrency: bool,
     ) -> dict[str, Any]:
         session = self.store.get_session(self.session_id)
-        context = self._compile_context(session)
+        context = self._compile_context(session, guard.limits)
         metered_budget = _optional_number(payload.get("metered_budget"))
         decision = await self.scheduler.choose(
             session,
@@ -262,11 +420,31 @@ class SessionWorker:
             metered_budget=metered_budget,
             excluded=excluded,
             context_transfer_tokens=context.estimated_tokens,
+            binding_ceiling=guard.limits.binding_ceiling,
+            execution_profile=guard.limits.profile,
+            enforce_concurrency=enforce_concurrency,
         )
         native_session_id = self._native_session(decision.provider)
         prompt = text
         if not native_session_id or session.active_provider != decision.provider:
             prompt = context.text + "\n\n# Next instruction\n\n" + text
+            digest = hashlib.sha256(
+                context.text.encode("utf-8")
+            ).hexdigest()
+            self.store.record_context_delivery(
+                self.session_id,
+                decision.provider,
+                digest,
+                "",
+            )
+        submitted_tokens = (len(prompt) + 3) // 4
+        violation = guard.begin_attempt(submitted_tokens)
+        if violation:
+            raise SafetyGuardError(
+                violation,
+                decision.provider,
+                recoverable=False,
+            )
         attempt_id = new_uuid()
         attempt = ProviderAttempt(
             attempt_id=attempt_id,
@@ -281,6 +459,13 @@ class SessionWorker:
             ended_at="",
         )
         self.store.create_attempt(attempt)
+        self.store.update_command_envelope(
+            command_id,
+            provider=decision.provider,
+            state="running",
+            recovery_stage=recovery_stage,
+            consumption=guard.consumption.as_dict(),
+        )
         turn_id = self.store.start_turn(self.session_id, attempt_id)
         self.store.record_routing(
             self.session_id,
@@ -305,8 +490,59 @@ class SessionWorker:
         )
         adapter = self.adapters[decision.provider]
         self._active_adapter = adapter
+        lease_id = ""
+        if guard.limits.profile != INTERACTIVE:
+            lease = self.store.create_process_lease(
+                self.session_id,
+                decision.provider,
+                guard.limits.profile,
+                _lease_expiry(),
+            )
+            lease_id = str(lease["lease_id"])
+            self.store.append_event(
+                self.session_id,
+                "lease.reserved",
+                status="complete",
+                metadata={
+                    "lease_id": lease_id,
+                    "provider": decision.provider,
+                },
+                turn_id=turn_id,
+            )
+
+        resolved_native_session_id = native_session_id
 
         async def event_handler(event: ProviderEvent) -> None:
+            nonlocal resolved_native_session_id
+            if (
+                event.native_session_id
+                and event.native_session_id
+                != resolved_native_session_id
+            ):
+                resolved_native_session_id = event.native_session_id
+                self.store.update_attempt(
+                    attempt_id,
+                    status="running",
+                    native_session_id=resolved_native_session_id,
+                )
+            guard.observe(event)
+            if event.event_type.startswith("file.change."):
+                guard.note_material_progress()
+            self.store.update_command_envelope(
+                command_id,
+                consumption=guard.consumption.as_dict(),
+            )
+            if guard.warning_due():
+                self.store.append_event(
+                    self.session_id,
+                    "guard.warning",
+                    status="warning",
+                    metadata={
+                        "command_id": command_id,
+                        "snapshot": guard.snapshot(),
+                    },
+                    turn_id=turn_id,
+                )
             await self._provider_event(turn_id, event)
 
         async def approval_handler(
@@ -327,16 +563,114 @@ class SessionWorker:
                 approval_handler=approval_handler,
             )
         )
+        lease_attached = False
+        last_lease_heartbeat = time.monotonic()
         try:
             while not run_task.done():
+                if lease_id:
+                    pid, pid_start = adapter.process_identity()
+                    if not lease_attached and pid > 0 and pid_start:
+                        self.store.update_process_lease(
+                            lease_id,
+                            pid=pid,
+                            pid_start=pid_start,
+                            state="active",
+                            expires_at=_lease_expiry(),
+                        )
+                        lease_attached = True
+                        last_lease_heartbeat = time.monotonic()
+                        self.store.append_event(
+                            self.session_id,
+                            "lease.attached",
+                            status="complete",
+                            metadata={
+                                "lease_id": lease_id,
+                                "pid": pid,
+                            },
+                            turn_id=turn_id,
+                        )
+                    now = time.monotonic()
+                    if now - last_lease_heartbeat >= 15:
+                        self.store.update_process_lease(
+                            lease_id,
+                            expires_at=_lease_expiry(),
+                        )
+                        last_lease_heartbeat = now
                 control = self.store.claim_command(
                     self.session_id,
                     CONTROL_COMMANDS,
                 )
                 if control is not None:
                     await self._control(control)
+                violation = guard.violation()
+                if violation:
+                    await self._interrupt_guarded_turn(
+                        adapter,
+                        run_task,
+                    )
+                    recoverable = violation in {
+                        "repeated-tool",
+                        "repeated-cycle",
+                        "stagnation",
+                    }
+                    action = "pause"
+                    if recoverable and recovery_stage == 0:
+                        action = "downgrade"
+                    elif recoverable:
+                        action = "failover"
+                    snapshot = guard.snapshot()
+                    self.store.add_guard_incident(
+                        self.session_id,
+                        command_id,
+                        attempt_id,
+                        violation,
+                        action,
+                        snapshot,
+                    )
+                    self.store.append_event(
+                        self.session_id,
+                        "guard.tripped",
+                        status="interrupted",
+                        metadata={
+                            "command_id": command_id,
+                            "attempt_id": attempt_id,
+                            "reason": violation,
+                            "action": action,
+                            "snapshot": snapshot,
+                        },
+                        turn_id=turn_id,
+                    )
+                    await self._guard_checkpoint(
+                        session,
+                        decision.provider,
+                        resolved_native_session_id,
+                        context.text,
+                        turn_id,
+                    )
+                    raise SafetyGuardError(
+                        violation,
+                        decision.provider,
+                        recoverable=recoverable,
+                    )
                 await asyncio.sleep(0.1)
             result = await run_task
+            guard.observe(
+                ProviderEvent(
+                    "usage.updated",
+                    metadata=result.usage,
+                )
+            )
+            violation = guard.violation()
+            if violation:
+                raise SafetyGuardError(
+                    violation,
+                    decision.provider,
+                    recoverable=False,
+                )
+        except SafetyGuardError:
+            self.store.update_attempt(attempt_id, status="interrupted")
+            self.store.finish_turn(turn_id, "interrupted")
+            raise
         except (ProviderExhaustedError, ProviderUnavailableError):
             self.store.update_attempt(attempt_id, status="exhausted")
             self.store.finish_turn(turn_id, "exhausted")
@@ -347,6 +681,18 @@ class SessionWorker:
             raise
         finally:
             self._active_adapter = None
+            if lease_id:
+                self.store.update_process_lease(
+                    lease_id,
+                    state="released",
+                )
+                self.store.append_event(
+                    self.session_id,
+                    "lease.released",
+                    status="complete",
+                    metadata={"lease_id": lease_id},
+                    turn_id=turn_id,
+                )
         self.store.update_attempt(
             attempt_id,
             status=result.status,
@@ -384,6 +730,7 @@ class SessionWorker:
             "status": result.status,
             "checkpoint_id": checkpoint.checkpoint_id,
             "usage": result.usage,
+            "safety": guard.snapshot(),
         }
 
     async def _provider_event(
@@ -515,7 +862,83 @@ class SessionWorker:
             result,
         )
 
-    def _compile_context(self, session: Session):
+    def _record_recovery(
+        self,
+        command_id: str,
+        stage: int,
+        action: str,
+        provider: str,
+        effort: str,
+    ) -> None:
+        self.store.update_command_envelope(
+            command_id,
+            state="recovering",
+            recovery_stage=stage,
+        )
+        self.store.append_event(
+            self.session_id,
+            "recovery.started",
+            status="retrying",
+            metadata={
+                "command_id": command_id,
+                "stage": stage,
+                "action": action,
+                "provider": provider,
+                "effort": effort,
+            },
+        )
+
+    async def _interrupt_guarded_turn(
+        self,
+        adapter: ProviderAdapter,
+        run_task: asyncio.Task,
+    ) -> None:
+        try:
+            await adapter.interrupt()
+        except BaseException:
+            pass
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(run_task),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+        except BaseException:
+            pass
+
+    async def _guard_checkpoint(
+        self,
+        session: Session,
+        provider: str,
+        native_session_id: str,
+        context_text: str,
+        turn_id: str,
+    ) -> None:
+        checkpoint = await asyncio.to_thread(
+            checkpoint_workspace,
+            session,
+            self.blobs,
+            sequence=self.store.last_sequence(self.session_id),
+            provider=provider,
+            native_session_id=native_session_id,
+            context_text=context_text,
+        )
+        self.store.add_checkpoint(checkpoint)
+        self.store.append_event(
+            self.session_id,
+            "checkpoint.created",
+            status="guard",
+            metadata=checkpoint.as_dict(),
+            turn_id=turn_id,
+        )
+
+    def _compile_context(
+        self,
+        session: Session,
+        limits: SafetyLimits,
+    ):
         goal = self.store.goal_for_session(self.session_id)
         evidence = []
         if goal is not None:
@@ -530,6 +953,11 @@ class SessionWorker:
                 Path(session.worktree)
             ),
             workspace_summary=summary,
+            max_input_tokens=(
+                limits.max_context_tokens
+                + limits.max_output_tokens
+            ),
+            reserve_output_tokens=limits.max_output_tokens,
         )
 
     def _native_session(self, provider: str) -> str:
@@ -600,3 +1028,9 @@ def _optional_number(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _lease_expiry() -> str:
+    value = datetime.datetime.now(datetime.UTC)
+    value += datetime.timedelta(seconds=90)
+    return value.isoformat()

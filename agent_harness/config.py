@@ -3,10 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import secrets
 import socket
+
+
+CONTROL_PROTOCOL_VERSION = 2
+
+
+def _control_build_id() -> str:
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(str(path.relative_to(package)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+CONTROL_BUILD_ID = _control_build_id()
 
 
 @dataclass(frozen=True)
@@ -18,6 +36,7 @@ class HarnessPaths:
     exports: Path
     logs: Path
     socket: Path
+    daemon_pid: Path
     token: Path
     machine_keys: Path
 
@@ -42,6 +61,7 @@ def paths(state_dir: Path | None = None) -> HarnessPaths:
         exports=root / "exports",
         logs=root / "logs",
         socket=root / "control.sock",
+        daemon_pid=root / "daemon.pid",
         token=root / "secrets" / "api-token",
         machine_keys=root / "secrets" / "machine-keys.json",
     )

@@ -25,7 +25,7 @@ from agent_harness.models import Session
 from agent_harness.models import SessionEvent
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 SCHEMA = """
@@ -163,6 +163,69 @@ CREATE TABLE IF NOT EXISTS usage_samples (
     credits_engaged INTEGER NOT NULL,
     payload_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session_safety (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id),
+    profile TEXT NOT NULL,
+    xhigh_authorizations INTEGER NOT NULL,
+    extensions_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS command_envelopes (
+    command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    provider TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    state TEXT NOT NULL,
+    limits_json TEXT NOT NULL,
+    consumption_json TEXT NOT NULL,
+    guard_reason TEXT NOT NULL,
+    recovery_stage INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS command_envelopes_active
+ON command_envelopes(provider, state, profile);
+CREATE TABLE IF NOT EXISTS guard_incidents (
+    incident_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    command_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    action TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS context_deliveries (
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    provider TEXT NOT NULL,
+    context_digest TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL,
+    delivered_at TEXT NOT NULL,
+    PRIMARY KEY(session_id, provider, context_digest)
+);
+CREATE TABLE IF NOT EXISTS process_leases (
+    lease_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    pid_start TEXT NOT NULL,
+    state TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS process_leases_active
+ON process_leases(state, expires_at);
+CREATE TABLE IF NOT EXISTS mutation_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS routing_decisions (
     decision_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id),
@@ -239,6 +302,11 @@ class StateStore:
             if row is None:
                 connection.execute(
                     "INSERT INTO schema_meta(version) VALUES (?)",
+                    (SCHEMA_VERSION,),
+                )
+            elif int(row["version"]) == 1:
+                connection.execute(
+                    "UPDATE schema_meta SET version = ?",
                     (SCHEMA_VERSION,),
                 )
             elif int(row["version"]) != SCHEMA_VERSION:
@@ -954,6 +1022,470 @@ class StateStore:
             return None
         return _load_object(row["decision_json"])
 
+    def set_session_safety(
+        self,
+        session_id: str,
+        profile: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO session_safety(
+                    session_id, profile, xhigh_authorizations,
+                    extensions_json, created_at, updated_at
+                ) VALUES (?, ?, 0, '{}', ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    profile = excluded.profile,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, profile, now, now),
+            )
+        return self.session_safety(session_id)
+
+    def session_safety(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM session_safety WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return {
+                "session_id": session_id,
+                "profile": "",
+                "xhigh_authorizations": 0,
+                "extensions": {},
+                "created_at": "",
+                "updated_at": "",
+            }
+        return {
+            "session_id": str(row["session_id"]),
+            "profile": str(row["profile"]),
+            "xhigh_authorizations": int(
+                row["xhigh_authorizations"]
+            ),
+            "extensions": _load_object(row["extensions_json"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def extend_session_safety(
+        self,
+        session_id: str,
+        extension: dict[str, Any],
+    ) -> dict[str, Any]:
+        current = self.session_safety(session_id)
+        if not current["profile"]:
+            raise ConflictError("session execution profile is not claimed")
+        extensions = dict(current["extensions"])
+        extensions.update(extension)
+        xhigh = int(current["xhigh_authorizations"])
+        if extension.get("allow_xhigh_once") is True:
+            xhigh += 1
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE session_safety
+                SET xhigh_authorizations = ?, extensions_json = ?,
+                    updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    xhigh,
+                    _dump(extensions),
+                    utc_now(),
+                    session_id,
+                ),
+            )
+        return self.session_safety(session_id)
+
+    def consume_xhigh_authorization(self, session_id: str) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE session_safety
+                SET xhigh_authorizations = xhigh_authorizations - 1,
+                    updated_at = ?
+                WHERE session_id = ? AND xhigh_authorizations > 0
+                """,
+                (utc_now(), session_id),
+            )
+        return cursor.rowcount == 1
+
+    def consume_session_extensions(
+        self,
+        session_id: str,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT extensions_json FROM session_safety
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ConflictError(
+                    "session execution profile is not claimed"
+                )
+            extension = _load_object(row["extensions_json"])
+            connection.execute(
+                """
+                UPDATE session_safety
+                SET extensions_json = '{}', updated_at = ?
+                WHERE session_id = ?
+                """,
+                (utc_now(), session_id),
+            )
+        return extension
+
+    def create_command_envelope(
+        self,
+        command_id: str,
+        session_id: str,
+        profile: str,
+        limits: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        consumption = {
+            "context_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "tool_calls": 0,
+            "attempts": 0,
+            "elapsed_seconds": 0.0,
+            "exact_tokens": False,
+        }
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO command_envelopes(
+                    command_id, session_id, provider, profile, state,
+                    limits_json, consumption_json, guard_reason,
+                    recovery_stage, created_at, updated_at
+                ) VALUES (?, ?, '', ?, 'reserved', ?, ?, '', 0, ?, ?)
+                """,
+                (
+                    command_id,
+                    session_id,
+                    profile,
+                    _dump(limits),
+                    _dump(consumption),
+                    now,
+                    now,
+                ),
+            )
+        return self.command_envelope(command_id)
+
+    def command_envelope(self, command_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM command_envelopes WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("command envelope")
+        return {
+            "command_id": str(row["command_id"]),
+            "session_id": str(row["session_id"]),
+            "provider": str(row["provider"]),
+            "profile": str(row["profile"]),
+            "state": str(row["state"]),
+            "limits": _load_object(row["limits_json"]),
+            "consumption": _load_object(row["consumption_json"]),
+            "guard_reason": str(row["guard_reason"]),
+            "recovery_stage": int(row["recovery_stage"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def update_command_envelope(
+        self,
+        command_id: str,
+        *,
+        provider: str | None = None,
+        state: str | None = None,
+        consumption: dict[str, Any] | None = None,
+        guard_reason: str | None = None,
+        recovery_stage: int | None = None,
+    ) -> dict[str, Any]:
+        fields = ["updated_at = ?"]
+        values: list[Any] = [utc_now()]
+        consumption_json: str | None = None
+        if consumption is not None:
+            consumption_json = _dump(consumption)
+        for name, value in (
+            ("provider", provider),
+            ("state", state),
+            ("consumption_json", consumption_json),
+            ("guard_reason", guard_reason),
+            ("recovery_stage", recovery_stage),
+        ):
+            if value is None:
+                continue
+            fields.append(name + " = ?")
+            values.append(value)
+        values.append(command_id)
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE command_envelopes SET "
+                + ", ".join(fields)
+                + " WHERE command_id = ?",
+                tuple(values),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("command envelope")
+        return self.command_envelope(command_id)
+
+    def active_unattended_provider_count(self, provider: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM command_envelopes
+                WHERE provider = ? AND profile = 'unattended'
+                AND state IN ('reserved', 'running', 'recovering')
+                """,
+                (provider,),
+            ).fetchone()
+        return int(row["count"])
+
+    def session_envelopes(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT command_id FROM command_envelopes
+                WHERE session_id = ? ORDER BY created_at, command_id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            self.command_envelope(str(row["command_id"])) for row in rows
+        ]
+
+    def add_guard_incident(
+        self,
+        session_id: str,
+        command_id: str,
+        attempt_id: str,
+        reason: str,
+        action: str,
+        snapshot: dict[str, Any],
+    ) -> str:
+        incident_id = new_uuid()
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO guard_incidents VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    incident_id,
+                    session_id,
+                    command_id,
+                    attempt_id,
+                    reason,
+                    action,
+                    _dump(snapshot),
+                    utc_now(),
+                ),
+            )
+        return incident_id
+
+    def guard_incidents(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM guard_incidents
+                WHERE session_id = ? ORDER BY created_at, incident_id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "incident_id": str(row["incident_id"]),
+                "command_id": str(row["command_id"]),
+                "attempt_id": str(row["attempt_id"]),
+                "reason": str(row["reason"]),
+                "action": str(row["action"]),
+                "snapshot": _load_object(row["snapshot_json"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def record_context_delivery(
+        self,
+        session_id: str,
+        provider: str,
+        context_digest: str,
+        checkpoint_id: str,
+    ) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO context_deliveries
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    provider,
+                    context_digest,
+                    checkpoint_id,
+                    utc_now(),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def create_process_lease(
+        self,
+        session_id: str,
+        provider: str,
+        profile: str,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        lease_id = new_uuid()
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO process_leases
+                VALUES (?, ?, ?, ?, 0, '', 'reserved', ?, ?, ?)
+                """,
+                (
+                    lease_id,
+                    session_id,
+                    provider,
+                    profile,
+                    expires_at,
+                    now,
+                    now,
+                ),
+            )
+        return self.process_lease(lease_id)
+
+    def process_lease(self, lease_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM process_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("process lease")
+        return {
+            "lease_id": str(row["lease_id"]),
+            "session_id": str(row["session_id"]),
+            "provider": str(row["provider"]),
+            "profile": str(row["profile"]),
+            "pid": int(row["pid"]),
+            "pid_start": str(row["pid_start"]),
+            "state": str(row["state"]),
+            "expires_at": str(row["expires_at"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def update_process_lease(
+        self,
+        lease_id: str,
+        *,
+        pid: int | None = None,
+        pid_start: str | None = None,
+        state: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        fields = ["updated_at = ?"]
+        values: list[Any] = [utc_now()]
+        for name, value in (
+            ("pid", pid),
+            ("pid_start", pid_start),
+            ("state", state),
+            ("expires_at", expires_at),
+        ):
+            if value is None:
+                continue
+            fields.append(name + " = ?")
+            values.append(value)
+        values.append(lease_id)
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE process_leases SET "
+                + ", ".join(fields)
+                + " WHERE lease_id = ?",
+                tuple(values),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("process lease")
+        return self.process_lease(lease_id)
+
+    def active_process_leases(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT lease_id FROM process_leases
+                WHERE state IN ('reserved', 'active')
+                ORDER BY created_at, lease_id
+                """
+            ).fetchall()
+        return [self.process_lease(str(row["lease_id"])) for row in rows]
+
+    def mutation_receipt(
+        self,
+        idempotency_key: str,
+        operation: str,
+        request_digest: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM mutation_receipts
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        if (
+            str(row["operation"]) != operation
+            or str(row["request_digest"]) != request_digest
+        ):
+            raise ConflictError(
+                "idempotency key was already used for "
+                "another mutation"
+            )
+        return {
+            "response": _load_object(row["response_json"]),
+            "status_code": int(row["status_code"]),
+        }
+
+    def record_mutation_receipt(
+        self,
+        idempotency_key: str,
+        operation: str,
+        request_digest: str,
+        response: dict[str, Any],
+        status_code: int,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO mutation_receipts
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    operation,
+                    request_digest,
+                    _dump(response),
+                    status_code,
+                    utc_now(),
+                ),
+            )
+        receipt = self.mutation_receipt(
+            idempotency_key,
+            operation,
+            request_digest,
+        )
+        if receipt is None:
+            raise RuntimeError("mutation receipt was not recorded")
+        return receipt
+
     def record_usage(
         self,
         provider: str,
@@ -1192,6 +1724,7 @@ class StateStore:
             "checkpoints": [
                 item.as_dict() for item in self.checkpoints(session_id)
             ],
+            "safety": self.session_safety(session_id),
         }
 
     def import_session(
@@ -1243,6 +1776,7 @@ class StateStore:
             self._import_events(connection, payload, session_id)
             self._import_goal(connection, payload, session_id)
             self._import_checkpoints(connection, payload, session_id)
+            self._import_safety(connection, payload, session_id)
         return self.get_session(session_id)
 
     def _import_attempts(
@@ -1357,6 +1891,33 @@ class StateStore:
                     str(value.get("created_at", utc_now())),
                 ),
             )
+
+    def _import_safety(
+        self,
+        connection: sqlite3.Connection,
+        payload: dict[str, Any],
+        session_id: str,
+    ) -> None:
+        safety = payload.get("safety")
+        if not isinstance(safety, dict):
+            return
+        profile = str(safety.get("profile", ""))
+        if not profile:
+            return
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO session_safety VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                profile,
+                int(safety.get("xhigh_authorizations", 0)),
+                _dump(_object_or_empty(safety.get("extensions"))),
+                str(safety.get("created_at", now)),
+                str(safety.get("updated_at", now)),
+            ),
+        )
 
 
 def _dump(value: Any) -> str:

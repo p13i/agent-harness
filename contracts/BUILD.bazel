@@ -1,4 +1,5 @@
 exports_files([
+    "acceptance.gpt.json",
     "openapi.gpt.yaml",
     "parity.gpt.json",
 ])

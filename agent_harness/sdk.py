@@ -21,6 +21,7 @@ class SessionView:
     session: dict[str, Any]
     goal: dict[str, Any] | None
     approvals: tuple[dict[str, Any], ...]
+    safety: dict[str, Any]
     last_sequence: int
 
 
@@ -75,6 +76,7 @@ class AgentHarnessClient:
         budgets: dict[str, Any] | None = None,
         permission_mode: str = "approval",
         direct: bool = False,
+        execution_profile: str = "unattended",
     ) -> dict[str, Any]:
         if budgets is None:
             budgets = {}
@@ -91,6 +93,7 @@ class AgentHarnessClient:
                 "budgets": budgets,
                 "permission_mode": permission_mode,
                 "direct": direct,
+                "execution_profile": execution_profile,
             },
         )
         return _object(result.get("session"))
@@ -108,6 +111,7 @@ class AgentHarnessClient:
             session=_object(result.get("session")),
             goal=goal,
             approvals=_object_tuple(result.get("approvals")),
+            safety=_object(result.get("safety")),
             last_sequence=int(result.get("last_sequence", 0)),
         )
 
@@ -117,12 +121,15 @@ class AgentHarnessClient:
         *,
         name: str | None = None,
         permission_mode: str | None = None,
+        execution_profile: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if name is not None:
             payload["name"] = name
         if permission_mode is not None:
             payload["permission_mode"] = permission_mode
+        if execution_profile is not None:
+            payload["execution_profile"] = execution_profile
         result = await self.raw.request(
             "PATCH",
             "/v1/sessions/" + session_id,
@@ -375,6 +382,82 @@ class AgentHarnessClient:
             "/v1/providers?workspace="
             + str(workspace.expanduser().resolve()),
         )
+
+    async def usage(self, session_id: str) -> dict[str, Any]:
+        result = await self.raw.request(
+            "GET",
+            "/v1/sessions/" + session_id + "/usage",
+        )
+        return _object(result.get("safety"))
+
+    async def extend_budget(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        additional_seconds: int | None = None,
+        additional_tokens: int | None = None,
+        allow_xhigh_once: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "allow_xhigh_once": allow_xhigh_once,
+        }
+        if additional_seconds is not None:
+            payload["additional_seconds"] = additional_seconds
+        if additional_tokens is not None:
+            payload["additional_tokens"] = additional_tokens
+        result = await self.raw.request(
+            "POST",
+            "/v1/sessions/" + session_id + "/budget-extensions",
+            payload=payload,
+            idempotency_key=new_uuid(),
+        )
+        return _object(result.get("safety"))
+
+    async def create_process_lease(
+        self,
+        provider: str,
+        *,
+        session_id: str = "",
+        execution_profile: str = "unattended",
+    ) -> dict[str, Any]:
+        result = await self.raw.request(
+            "POST",
+            "/v1/leases",
+            payload={
+                "provider": provider,
+                "session_id": session_id,
+                "execution_profile": execution_profile,
+            },
+            idempotency_key=new_uuid(),
+        )
+        return _object(result.get("lease"))
+
+    async def update_process_lease(
+        self,
+        lease_id: str,
+        *,
+        action: str,
+        pid: int | None = None,
+        pid_start: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"action": action}
+        if pid is not None:
+            payload["pid"] = pid
+        if pid_start:
+            payload["pid_start"] = pid_start
+        result = await self.raw.request(
+            "PATCH",
+            "/v1/leases/" + lease_id,
+            payload=payload,
+            idempotency_key=new_uuid(),
+        )
+        return _object(result.get("lease"))
+
+    async def process_leases(self) -> tuple[dict[str, Any], ...]:
+        result = await self.raw.request("GET", "/v1/leases")
+        return _object_tuple(result.get("leases"))
 
     async def export(self, session_id: str) -> Path:
         result = await self.raw.request(

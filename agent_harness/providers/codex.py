@@ -446,6 +446,13 @@ class CodexAdapter(ProviderAdapter):
             },
         )
 
+    def process_identity(self) -> tuple[int, str]:
+        server = self._active_server
+        if server is None or server.process is None:
+            return (0, "")
+        pid = server.process.pid
+        return (pid, _process_start(pid))
+
 
 def _approval_policy(permission_mode: str) -> str:
     if permission_mode == "approval":
@@ -469,6 +476,17 @@ def _object(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _process_start(pid: int) -> str:
+    path = Path("/proc") / str(pid) / "stat"
+    try:
+        fields = path.read_text(encoding="utf-8").split()
+    except OSError:
+        return str(pid)
+    if len(fields) <= 21:
+        return str(pid)
+    return fields[21]
 
 
 def _nested_id(value: dict[str, Any], field: str) -> str:

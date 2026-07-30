@@ -6,7 +6,10 @@ from aiohttp.test_utils import TestServer
 import pytest
 
 from agent_harness.api import create_app
+from agent_harness.config import CONTROL_BUILD_ID
+from agent_harness.config import CONTROL_PROTOCOL_VERSION
 from agent_harness.config import paths
+from agent_harness.errors import SafetyGuardError
 from agent_harness.service import HarnessService
 
 
@@ -46,6 +49,7 @@ def repository(path: Path) -> None:
 @pytest.mark.asyncio
 async def test_api_creates_session_and_accepts_message(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "repo"
     repository(workspace)
@@ -70,11 +74,225 @@ async def test_api_creates_session_and_accepts_message(
         created = await client.post(
             "/v1/sessions",
             headers=headers,
-            json={"workspace": str(workspace)},
+            json={
+                "workspace": str(workspace),
+                "goal": "Maintain bounded operation.",
+                "goal_kind": "invariant",
+            },
         )
         assert created.status == 201
         session = (await created.json())["session"]
         session_id = session["session_id"]
+        health = await client.get("/healthz", headers=headers)
+        health_value = await health.json()
+        assert health_value["status"] == "ok"
+        assert health_value["control_build_id"] == CONTROL_BUILD_ID
+        assert health_value["control_protocol_version"] == (
+            CONTROL_PROTOCOL_VERSION
+        )
+        ready = await client.get("/readyz", headers=headers)
+        assert (await ready.json())["status"] == "ready"
+        listed = await client.get("/v1/sessions", headers=headers)
+        assert (await listed.json())["sessions"][0]["session_id"] == (
+            session_id
+        )
+        archived = await client.get(
+            "/v1/sessions?archived=1",
+            headers=headers,
+        )
+        assert len((await archived.json())["sessions"]) == 1
+        detail = await client.get(
+            "/v1/sessions/" + session_id,
+            headers=headers,
+        )
+        assert (await detail.json())["safety"]["session"]["profile"] == (
+            "unattended"
+        )
+        usage = await client.get(
+            "/v1/sessions/" + session_id + "/usage",
+            headers=headers,
+        )
+        assert (await usage.json())["safety"]["envelopes"] == []
+        goal = await client.get(
+            "/v1/sessions/" + session_id + "/goal",
+            headers=headers,
+        )
+        assert (await goal.json())["goal"]["kind"] == "invariant"
+        evidence = await client.post(
+            "/v1/sessions/" + session_id + "/evidence",
+            headers=headers,
+            json={
+                "type": "command",
+                "subject": "make test",
+                "outcome": "passed",
+                "value": {"exit_code": 0},
+            },
+        )
+        assert evidence.status == 201
+        approvals = await client.get(
+            "/v1/sessions/" + session_id + "/approvals",
+            headers=headers,
+        )
+        assert (await approvals.json())["approvals"] == []
+        extension = await client.post(
+            "/v1/sessions/" + session_id + "/budget-extensions",
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-extension",
+            },
+            json={
+                "reason": "finish one bounded validation",
+                "additional_seconds": 60,
+                "allow_xhigh_once": True,
+            },
+        )
+        assert extension.status == 201
+        extension_value = (await extension.json())["safety"]
+        assert extension_value["xhigh_authorizations"] == 1
+        repeated_extension = await client.post(
+            "/v1/sessions/" + session_id + "/budget-extensions",
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-extension",
+            },
+            json={
+                "reason": "finish one bounded validation",
+                "additional_seconds": 60,
+                "allow_xhigh_once": True,
+            },
+        )
+        repeated_value = (await repeated_extension.json())["safety"]
+        assert repeated_value["xhigh_authorizations"] == 1
+        conflicting_extension = await client.post(
+            "/v1/sessions/" + session_id + "/budget-extensions",
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-extension",
+            },
+            json={
+                "reason": "different request",
+                "additional_seconds": 120,
+            },
+        )
+        assert conflicting_extension.status == 409
+
+        refused_lease = await client.post(
+            "/v1/leases",
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-lease-refused",
+            },
+            json={
+                "provider": "claude",
+                "execution_profile": "unattended",
+            },
+        )
+        assert refused_lease.status == 429
+        assert (await refused_lease.json())["error"]["code"] == (
+            "E_SAFETY_GUARD"
+        )
+        samples = [
+            {
+                "observed_at": "invalid",
+                "binding_percent": 25,
+                "credits_engaged": False,
+            },
+            {
+                "observed_at": "2020-01-01T00:00:00+00:00",
+                "binding_percent": 25,
+                "credits_engaged": False,
+            },
+            {
+                "observed_at": "2099-01-01T00:00:00+00:00",
+                "binding_percent": None,
+                "credits_engaged": False,
+            },
+            {
+                "observed_at": "2099-01-01T00:00:00+00:00",
+                "binding_percent": 25,
+                "credits_engaged": True,
+            },
+            {
+                "observed_at": "2099-01-01T00:00:00+00:00",
+                "binding_percent": 70,
+                "credits_engaged": False,
+            },
+        ]
+        latest_usage = service.store.latest_usage
+        for sample in samples:
+            monkeypatch.setattr(
+                service.store,
+                "latest_usage",
+                lambda sample=sample: {"codex": sample},
+            )
+            with pytest.raises(SafetyGuardError):
+                service._require_process_lease_capacity(
+                    "codex",
+                    "unattended",
+                )
+        monkeypatch.setattr(
+            service.store,
+            "latest_usage",
+            latest_usage,
+        )
+        service.store.record_usage(
+            "codex",
+            25.0,
+            False,
+            {"payload": {}, "error": ""},
+        )
+        created_lease = await client.post(
+            "/v1/leases",
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-lease",
+            },
+            json={
+                "provider": "codex",
+                "session_id": session_id,
+                "execution_profile": "unattended",
+            },
+        )
+        assert created_lease.status == 201
+        lease = (await created_lease.json())["lease"]
+        lease_id = lease["lease_id"]
+        repeated_lease = await client.post(
+            "/v1/leases",
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-lease",
+            },
+            json={
+                "provider": "codex",
+                "session_id": session_id,
+                "execution_profile": "unattended",
+            },
+        )
+        assert (await repeated_lease.json())["lease"]["lease_id"] == lease_id
+        attached = await client.patch(
+            "/v1/leases/" + lease_id,
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-lease-attach",
+            },
+            json={
+                "action": "attach",
+                "pid": 1234,
+                "pid_start": "5678",
+            },
+        )
+        assert (await attached.json())["lease"]["state"] == "active"
+        leases = await client.get("/v1/leases", headers=headers)
+        assert (await leases.json())["leases"][0]["pid"] == 1234
+        released = await client.patch(
+            "/v1/leases/" + lease_id,
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-lease-release",
+            },
+            json={"action": "release"},
+        )
+        assert (await released.json())["lease"]["state"] == "released"
         missing_key = await client.post(
             "/v1/sessions/" + session_id + "/messages",
             headers=headers,
@@ -98,6 +316,23 @@ async def test_api_creates_session_and_accepts_message(
         values = (await events.json())["events"]
         assert values[-1]["event_type"] == "user.message"
         assert workers.started == [session_id]
+        command_value = (await accepted.json())["command"]
+        command_status = await client.get(
+            "/v1/commands/" + command_value["command_id"],
+            headers=headers,
+        )
+        assert (await command_status.json())["command"]["status"] == (
+            "queued"
+        )
+        paused = await client.post(
+            "/v1/sessions/" + session_id + "/commands/pause",
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-pause",
+            },
+            json={},
+        )
+        assert paused.status == 202
 
         configured = await client.patch(
             "/v1/sessions/" + session_id,
@@ -166,6 +401,34 @@ async def test_api_creates_session_and_accepts_message(
         forked_session = (await forked.json())["session"]
         assert forked_session["session_id"] != session_id
         assert forked_session["name"] == "Forked session"
+        registry = await client.get("/v1/registry", headers=headers)
+        assert isinstance((await registry.json())["entries"], list)
+        public_keys = await client.get(
+            "/v1/fleet/keys",
+            headers=headers,
+        )
+        key_values = (await public_keys.json())["keys"]
+        transfer = await client.post(
+            "/v1/sessions/" + forked_session["session_id"] + "/transfers",
+            headers=headers,
+            json={
+                "destination_host": "destination-host",
+                "destination_encryption_public": key_values["encryption"],
+            },
+        )
+        assert transfer.status == 201
+        transfer_value = (await transfer.json())["transfer"]
+        finalized = await client.post(
+            "/v1/sessions/"
+            + forked_session["session_id"]
+            + "/transfers/finalize",
+            headers=headers,
+            json={
+                "destination_host": "destination-host",
+                "owner_epoch": transfer_value["owner_epoch"],
+            },
+        )
+        assert finalized.status == 200
     finally:
         await client.close()
         service.close()

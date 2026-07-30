@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+import signal
+import subprocess
 import threading
 
+import pytest
+
 from agent_harness import cli
+from agent_harness import client as client_module
+from agent_harness.config import CONTROL_BUILD_ID
+from agent_harness.config import CONTROL_PROTOCOL_VERSION
+from agent_harness.config import paths as harness_paths_for
+from agent_harness.errors import HarnessError
 
 
 def test_chat_runs_textual_on_the_main_thread(
@@ -52,3 +63,374 @@ def test_chat_runs_textual_on_the_main_thread(
     assert captured["session_id"] == ""
     assert captured["permission_mode"] == "approval"
     assert captured["thread"] is threading.main_thread()
+
+
+def test_client_replaces_an_incompatible_daemon_before_chat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness_paths = harness_paths_for(tmp_path / "state")
+    health_values = [
+        {"status": "ok"},
+        {
+            "status": "ok",
+            "control_build_id": CONTROL_BUILD_ID,
+            "control_protocol_version": CONTROL_PROTOCOL_VERSION,
+        },
+    ]
+    stopped: list[object] = []
+    launched: list[list[str]] = []
+
+    async def fake_health(unused) -> dict[str, object]:
+        del unused
+        return health_values.pop(0)
+
+    async def fake_stop(value, client) -> None:
+        stopped.extend([value, client])
+
+    class Process:
+        def __init__(self, command, **kwargs) -> None:
+            del kwargs
+            launched.append(command)
+
+    monkeypatch.setattr(
+        client_module.HarnessClient,
+        "_health_payload",
+        fake_health,
+    )
+    monkeypatch.setattr(
+        client_module,
+        "_stop_incompatible_daemon",
+        fake_stop,
+    )
+    monkeypatch.setattr(
+        client_module,
+        "launcher_command",
+        lambda: ["agent-harness"],
+    )
+    monkeypatch.setattr(client_module.subprocess, "Popen", Process)
+
+    client = asyncio.run(client_module.ensure_daemon(harness_paths))
+
+    assert isinstance(client, client_module.HarnessClient)
+    assert stopped[0] is harness_paths
+    assert launched[0][-1] == "daemon"
+
+
+def test_client_stops_only_managed_incompatible_daemons(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness_paths = harness_paths_for(tmp_path / "state")
+    client = client_module.HarnessClient(harness_paths)
+    health_values = [{"status": "ok"}, {}]
+    signals: list[tuple[int, signal.Signals]] = []
+
+    async def fake_health() -> dict[str, object]:
+        return health_values.pop(0)
+
+    def terminate(pid: int, value: signal.Signals) -> None:
+        signals.append((pid, value))
+        if pid == 456:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(client, "_health_payload", fake_health)
+    monkeypatch.setattr(
+        client_module,
+        "_managed_daemon_pids",
+        lambda unused: (123, 456),
+    )
+    monkeypatch.setattr(client_module.os, "kill", terminate)
+
+    asyncio.run(
+        client_module._stop_incompatible_daemon(
+            harness_paths,
+            client,
+        )
+    )
+
+    assert signals == [
+        (123, signal.SIGTERM),
+        (456, signal.SIGTERM),
+    ]
+
+    monkeypatch.setattr(
+        client_module,
+        "_managed_daemon_pids",
+        lambda unused: (),
+    )
+    with pytest.raises(HarnessError, match="could not be identified"):
+        asyncio.run(
+            client_module._stop_incompatible_daemon(
+                harness_paths,
+                client,
+            )
+        )
+
+
+def test_client_discovers_only_daemon_processes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness_paths = harness_paths_for(tmp_path / "state")
+    harness_paths.state_dir.mkdir()
+    harness_paths.daemon_pid.write_text("123\n", encoding="utf-8")
+
+    def run(command, **kwargs):
+        del kwargs
+        if command[0] == "ps":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "agent-harness --state-dir state daemon\n",
+                "",
+            )
+        raise AssertionError("lsof fallback was not expected")
+
+    monkeypatch.setattr(client_module.subprocess, "run", run)
+    monkeypatch.setattr(client_module.os, "getpid", lambda: 999)
+    assert client_module._managed_daemon_pids(harness_paths) == (123,)
+
+    harness_paths.daemon_pid.write_text("invalid\n", encoding="utf-8")
+
+    def fallback(command, **kwargs):
+        del kwargs
+        if command[0] == "lsof":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "bad\n456\n789\n",
+                "",
+            )
+        if command[2] == "456":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "agent-harness worker session\n",
+                "",
+            )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "agent-harness daemon\n",
+            "",
+        )
+
+    monkeypatch.setattr(client_module.subprocess, "run", fallback)
+    assert client_module._managed_daemon_pids(harness_paths) == (789,)
+
+
+def test_cli_dispatches_every_session_control(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requests: list[tuple[str, str, object, str]] = []
+
+    class Client:
+        async def request(
+            self,
+            method,
+            path,
+            *,
+            payload=None,
+            idempotency_key="",
+        ):
+            requests.append(
+                (method, path, payload, idempotency_key)
+            )
+            if path.endswith("/messages"):
+                return {
+                    "command": {
+                        "command_id": "command-1",
+                        "status": "queued",
+                    }
+                }
+            return {"ok": True}
+
+    client = Client()
+
+    async def fake_ensure_daemon(unused):
+        del unused
+        return client
+
+    async def fake_wait_command(unused_client, command_id):
+        del unused_client
+        return {
+            "command_id": command_id,
+            "status": "complete",
+        }
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(cli, "wait_command", fake_wait_command)
+    transfer_file = tmp_path / "transfer.json"
+    transfer_file.write_text('{"sealed":"value"}\n', encoding="utf-8")
+    base = ["--state-dir", str(tmp_path / "state")]
+    commands = [
+        [
+            *base,
+            "--cwd",
+            str(tmp_path),
+            "new",
+            "--name",
+            "session",
+            "--goal",
+            "finish",
+            "--constraint",
+            "bounded",
+            "--predicate",
+            '{"type":"command"}',
+            "--budgets",
+            '{"turns":2}',
+            "--execution-profile",
+            "unattended",
+        ],
+        [
+            *base,
+            "send",
+            "session-1",
+            "continue",
+            "--provider",
+            "codex",
+            "--wait",
+        ],
+        [*base, "status"],
+        [*base, "status", "session-1"],
+        [*base, "--cwd", str(tmp_path), "providers"],
+        [*base, "usage", "session-1"],
+        [
+            *base,
+            "extend-budget",
+            "session-1",
+            "--seconds",
+            "60",
+            "--tokens",
+            "1000",
+            "--allow-xhigh-once",
+            "--reason",
+            "bounded",
+        ],
+        [
+            *base,
+            "events",
+            "session-1",
+            "--after",
+            "2",
+            "--limit",
+            "10",
+        ],
+        [*base, "fork", "session-1", "--name", "fork"],
+        [*base, "checkpoint", "session-1"],
+        [
+            *base,
+            "route",
+            "session-1",
+            "--provider",
+            "claude",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+            "--required-capability",
+            "tools",
+            "--metered-budget",
+            "1",
+        ],
+        [*base, "action", "session-1", "pause"],
+        [
+            *base,
+            "evidence",
+            "session-1",
+            "command",
+            "make test",
+            "passed",
+            "--value",
+            '{"exit_code":0}',
+        ],
+        [*base, "export", "session-1"],
+        [
+            *base,
+            "transfer",
+            "create",
+            "session-1",
+            "host-2",
+            "public-key",
+        ],
+        [
+            *base,
+            "transfer",
+            "import",
+            str(transfer_file),
+            "signing-key",
+        ],
+        [
+            *base,
+            "transfer",
+            "finalize",
+            "session-1",
+            "host-2",
+            "2",
+        ],
+    ]
+
+    for arguments in commands:
+        parsed = cli.parser().parse_args(arguments)
+        assert asyncio.run(cli._run(parsed)) == 0
+
+    capsys.readouterr()
+    paths = [item[1] for item in requests]
+    assert "/v1/sessions" in paths
+    assert "/v1/sessions/session-1/messages" in paths
+    assert "/v1/transfers/import" in paths
+    assert any(
+        item[1].endswith("/budget-extensions")
+        and bool(item[3])
+        for item in requests
+    )
+
+
+def test_cli_rejects_invalid_event_and_evidence_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Client:
+        async def request(self, *args, **kwargs):
+            del args
+            del kwargs
+            return {}
+
+    async def fake_ensure_daemon(unused):
+        del unused
+        return Client()
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    base = ["--state-dir", str(tmp_path / "state")]
+    invalid = [
+        [*base, "events", "session-1", "--after", "-1"],
+        [*base, "events", "session-1", "--limit", "5001"],
+        [
+            *base,
+            "evidence",
+            "session-1",
+            "command",
+            "make test",
+            "passed",
+            "--value",
+            "[]",
+        ],
+    ]
+
+    for arguments in invalid:
+        parsed = cli.parser().parse_args(arguments)
+        with pytest.raises(ValueError):
+            asyncio.run(cli._run(parsed))
+
+    assert cli._json_object('{"value":1}', "--value") == {
+        "value": 1
+    }
+    with pytest.raises(ValueError, match="JSON object"):
+        cli._json_object("[]", "--value")
+    assert cli._object({"value": 1}) == {"value": 1}
+    assert cli._object(None) == {}
+    assert cli._command_exit({"status": "failed"}) == 1
+    assert cli._command_exit({"status": "complete"}) == 0

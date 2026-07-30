@@ -62,6 +62,11 @@ def parser() -> argparse.ArgumentParser:
         choices=("approval", "full", "read-only", "plan"),
         default="approval",
     )
+    new.add_argument(
+        "--execution-profile",
+        choices=("interactive", "unattended", "live-smoke"),
+        default="interactive",
+    )
 
     resume = subcommands.add_parser("resume")
     resume.add_argument("session_id")
@@ -77,6 +82,14 @@ def parser() -> argparse.ArgumentParser:
 
     status = subcommands.add_parser("status")
     status.add_argument("session_id", nargs="?")
+    usage = subcommands.add_parser("usage")
+    usage.add_argument("session_id")
+    extend = subcommands.add_parser("extend-budget")
+    extend.add_argument("session_id")
+    extend.add_argument("--seconds", type=int)
+    extend.add_argument("--tokens", type=int)
+    extend.add_argument("--allow-xhigh-once", action="store_true")
+    extend.add_argument("--reason", required=True)
     subcommands.add_parser("providers")
 
     events = subcommands.add_parser("events")
@@ -252,6 +265,7 @@ async def _run(arguments: argparse.Namespace) -> int:
                 "budgets": budgets,
                 "direct": arguments.direct,
                 "permission_mode": arguments.permission_mode,
+                "execution_profile": arguments.execution_profile,
             },
         )
         _print_json(result)
@@ -288,6 +302,32 @@ async def _run(arguments: argparse.Namespace) -> int:
         result = await client.request(
             "GET",
             "/v1/providers?workspace=" + workspace,
+        )
+        _print_json(result)
+        return 0
+    if arguments.command == "usage":
+        result = await client.request(
+            "GET",
+            "/v1/sessions/" + arguments.session_id + "/usage",
+        )
+        _print_json(result)
+        return 0
+    if arguments.command == "extend-budget":
+        payload = {
+            "reason": arguments.reason,
+            "allow_xhigh_once": arguments.allow_xhigh_once,
+        }
+        if arguments.seconds is not None:
+            payload["additional_seconds"] = arguments.seconds
+        if arguments.tokens is not None:
+            payload["additional_tokens"] = arguments.tokens
+        result = await client.request(
+            "POST",
+            "/v1/sessions/"
+            + arguments.session_id
+            + "/budget-extensions",
+            payload=payload,
+            idempotency_key=new_uuid(),
         )
         _print_json(result)
         return 0

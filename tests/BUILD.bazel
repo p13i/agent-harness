@@ -18,6 +18,7 @@ py_test(
         "test_normalize.py",
         "test_projections.py",
         "test_routing.py",
+        "test_safety.py",
         "test_sdk.py",
         "test_storage.py",
         "test_transfer.py",
@@ -70,6 +71,17 @@ py_test(
         "@agent_harness_pip//pytest",
         "@agent_harness_pip//pytest_asyncio",
     ],
+)
+
+py_test(
+    name = "acceptance_test",
+    srcs = ["acceptance_test.gpt.py"],
+    data = [
+        "//contracts:acceptance.gpt.json",
+        "//contracts:openapi.gpt.yaml",
+    ],
+    main = "acceptance_test.gpt.py",
+    deps = ["//agent_harness"],
 )
 
 py_test(

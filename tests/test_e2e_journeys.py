@@ -38,15 +38,20 @@ class ScriptedAdapter(ProviderAdapter):
         provider: str,
         *,
         fail_turns: int = 0,
+        guard_turns: int = 0,
+        usage_turns: int = 0,
         request_approval: bool = False,
         turn_delay: float = 0.0,
     ) -> None:
         self.provider_id = provider
         self.fail_turns = fail_turns
+        self.guard_turns = guard_turns
+        self.usage_turns = usage_turns
         self.request_approval = request_approval
         self.turn_delay = turn_delay
         self.prompts: list[str] = []
         self.native_inputs: list[str] = []
+        self.efforts: list[str] = []
         self.approval_decisions: list[dict[str, Any]] = []
         self.steered: list[str] = []
         self.interruptions = 0
@@ -66,12 +71,46 @@ class ScriptedAdapter(ProviderAdapter):
         del workspace
         del permission_mode
         del model
-        del effort
         self.prompts.append(prompt)
         self.native_inputs.append(native_session_id)
+        self.efforts.append(effort)
         if self.fail_turns:
             self.fail_turns -= 1
             raise ProviderExhaustedError(self.provider_id)
+        if self.guard_turns:
+            self.guard_turns -= 1
+            for unused in range(3):
+                del unused
+                await event_handler(
+                    ProviderEvent(
+                        "tool.started",
+                        text="Read",
+                        metadata={"path": "SKILL.md"},
+                        native_session_id=(
+                            self.provider_id + "-native-session"
+                        ),
+                    )
+                )
+                await event_handler(
+                    ProviderEvent(
+                        "tool.completed",
+                        text="unchanged",
+                    )
+                )
+            await asyncio.sleep(0.25)
+        if self.usage_turns:
+            self.usage_turns -= 1
+            await event_handler(
+                ProviderEvent(
+                    "usage.updated",
+                    metadata={
+                        "input_tokens": 90_000,
+                        "output_tokens": 20_000,
+                        "total_tokens": 110_000,
+                    },
+                )
+            )
+            await asyncio.sleep(0.25)
         if self.request_approval:
             decision = await approval_handler(
                 "tool.execute",
@@ -112,7 +151,7 @@ class ScriptedAdapter(ProviderAdapter):
             ProviderModel(
                 self.provider_id + "-default",
                 self.provider_id.title(),
-                ("medium", "high", "xhigh"),
+                ("low", "medium", "high", "xhigh"),
                 200_000,
                 default=True,
             ),
@@ -163,6 +202,10 @@ class JourneyRig:
         self.blobs = BlobStore(harness_paths.blobs)
         self.session = session(workspace)
         self.store.create_session(self.session)
+        self.store.set_session_safety(
+            self.session.session_id,
+            "interactive",
+        )
         if claude is None:
             claude = ScriptedAdapter("claude")
         if codex is None:
@@ -267,7 +310,7 @@ async def test_e2e_capacity_exhaustion_fails_over_once(
 
         attempts = rig.store.attempts(rig.session.session_id)
         events = rig.store.all_events(rig.session.session_id)
-        assert receipt.status == "complete"
+        assert receipt.status == "complete", receipt.result
         assert [item.provider for item in attempts] == ["claude", "codex"]
         assert [item.status for item in attempts] == [
             "exhausted",
@@ -412,6 +455,135 @@ async def test_e2e_exhausted_goal_budget_pauses_before_provider_work(
         rig.close()
 
 
+@pytest.mark.asyncio
+async def test_e2e_unattended_admission_requires_fresh_headroom(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    rig.scheduler._usage_cache = {
+        "claude": _usage("claude", None),
+        "codex": _usage("codex", None),
+    }
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    try:
+        receipt = await rig.message("Run unattended operations.")
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_PROVIDER_UNAVAILABLE"
+        assert not rig.adapters["claude"].prompts
+        assert not rig.adapters["codex"].prompts
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_hard_usage_limit_interrupts_without_recovery(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude", usage_turns=1)
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Run bounded operations.",
+            provider="claude",
+            workload="operations",
+        )
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_SAFETY_GUARD"
+        assert claude.interruptions == 1
+        assert len(rig.store.attempts(rig.session.session_id)) == 1
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["state"] == "paused"
+        assert envelope["guard_reason"] == "output-tokens"
+        incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert incidents[0]["action"] == "pause"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_repetition_downgrades_then_fails_over_in_one_envelope(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude", guard_turns=2)
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message("Implement without rereading context.")
+
+        assert receipt.status == "complete", receipt.result
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [item.provider for item in attempts] == [
+            "claude",
+            "claude",
+            "codex",
+        ]
+        assert claude.efforts == ["high", "medium"]
+        assert codex.efforts == ["low"]
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["recovery_stage"] == 2
+        assert envelope["consumption"]["attempts"] == 3
+        assert len(rig.store.guard_incidents(rig.session.session_id)) == 2
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_xhigh_requires_and_consumes_one_authorization(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    rig.prime_capacity()
+    try:
+        rejected = await rig.message(
+            "Use maximum effort.",
+            provider="codex",
+            effort="xhigh",
+        )
+        assert rejected.status == "failed"
+        assert rejected.result["code"] == "E_SAFETY_EFFORT"
+
+        rig.store.extend_session_safety(
+            rig.session.session_id,
+            {
+                "reason": "operator approved one bounded attempt",
+                "allow_xhigh_once": True,
+            },
+        )
+        accepted = await rig.message(
+            "Use maximum effort once.",
+            provider="codex",
+            effort="xhigh",
+        )
+
+        assert accepted.status == "complete"
+        codex = rig.adapters["codex"]
+        assert codex.efforts == ["xhigh"]
+        safety = rig.store.session_safety(rig.session.session_id)
+        assert safety["xhigh_authorizations"] == 0
+    finally:
+        rig.close()
+
+
 async def _wait_for_approval(
     reader: Callable[[], list[dict[str, Any]]],
 ) -> dict[str, Any]:
@@ -424,7 +596,10 @@ async def _wait_for_approval(
     raise AssertionError("provider approval was not published")
 
 
-def _usage(provider: str, binding: float) -> UsageSnapshot:
+def _usage(
+    provider: str,
+    binding: float | None,
+) -> UsageSnapshot:
     return UsageSnapshot(
         provider=provider,
         binding_percent=binding,

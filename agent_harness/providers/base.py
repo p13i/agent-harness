@@ -92,6 +92,9 @@ class ProviderAdapter(ABC):
         del text
         return
 
+    def process_identity(self) -> tuple[int, str]:
+        return (0, "")
+
 
 _SENSITIVE_NAME = re.compile(
     r"(?:TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY)",
@@ -115,4 +118,3 @@ def provider_environment(provider: str, auth_mode: str = "subscription") -> dict
                 continue
         environment[name] = value
     return environment
-

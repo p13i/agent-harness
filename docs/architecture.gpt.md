@@ -9,9 +9,10 @@ provider transcript is the canonical database.
 SQLite in WAL mode stores the session UUID, ordered event
 log, commands, goals, evidence, approvals, provider
 attempts, checkpoints, routing decisions, usage snapshots,
-and fleet ownership. A content-addressed blob store holds
-large raw payloads without placing them in status or audit
-responses.
+safety profiles and envelopes, process leases, idempotent
+mutation receipts, and fleet ownership. A content-addressed
+blob store holds large raw payloads without placing them in
+status or audit responses.
 
 The export command derives five private, atomic projections:
 
@@ -58,6 +59,38 @@ that launches the pinned Claude Code npm package. Codex uses
 the pinned app-server protocol. The stable event model
 normalizes both providers while retaining raw payloads in
 private blobs.
+
+## Usage safety
+
+Every command has one provider-neutral safety envelope
+before a provider process starts. Its profile fixes wall
+time, submitted context, output, total tokens, tool calls,
+stagnation, provider attempts, and the maximum allowed
+binding-window usage. Unattended work reserves 30 percent of
+each provider's binding window and fails closed when usage
+is unknown. Live smoke tests reserve 50 percent.
+
+Runtime events update the same envelope across retries.
+Exact provider accounting replaces conservative estimates
+without discarding earlier-attempt consumption. The generic
+guard fingerprints tool operations to detect repeated
+identical calls and short cycles, so rereading the same
+instructions cannot reset by changing provider.
+
+Eligible soft failures may lower effort once on the same
+provider and then use one alternate provider. Neither step
+creates a new envelope. Hard limits interrupt the active
+process, checkpoint observable work, and pause. Unattended
+xhigh requires one explicit authorization, which one command
+consumes.
+
+All harness-managed background Claude and Codex processes
+hold a durable lease containing provider, profile, PID, PID
+start identity, heartbeat expiry, and session. Machines
+launchers use the same lease contract, and a host watchdog
+terminates unleased background processes after a grace
+period. Foreground terminal sessions are outside that
+watchdog policy.
 
 ## Goals
 

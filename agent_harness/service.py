@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
 from pathlib import Path
 import signal
 import subprocess
@@ -14,6 +15,7 @@ from agent_harness.config import HarnessPaths
 from agent_harness.config import host_id
 from agent_harness.context import compile_context
 from agent_harness.context import workspace_instructions
+from agent_harness.errors import SafetyGuardError
 from agent_harness.goals import create_goal
 from agent_harness.goals import make_evidence
 from agent_harness.ids import new_uuid
@@ -28,6 +30,10 @@ from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
 from agent_harness.projections import write_session_projections
 from agent_harness.scheduler import Scheduler
+from agent_harness.safety import UNATTENDED
+from agent_harness.safety import effective_effort
+from agent_harness.safety import limits_for
+from agent_harness.safety import validate_profile
 from agent_harness.storage import StateStore
 from agent_harness.transfer import load_machine_keys
 from agent_harness.transfer import open_transfer
@@ -145,6 +151,10 @@ class HarnessService:
             updated_at=now,
         )
         self.store.create_session(session)
+        execution_profile = validate_profile(
+            str(payload.get("execution_profile", UNATTENDED))
+        )
+        self.store.set_session_safety(session_id, execution_profile)
         objective = str(payload.get("goal", "")).strip()
         if objective:
             predicates = payload.get("predicates", [])
@@ -175,6 +185,7 @@ class HarnessService:
                 "workspace": str(workspace),
                 "worktree": str(worktree),
                 "direct": direct,
+                "execution_profile": execution_profile,
             },
         )
         return session
@@ -224,16 +235,202 @@ class HarnessService:
             if permission_mode not in set(PermissionMode):
                 raise ValueError("unsupported permission mode")
             changes["permission_mode"] = permission_mode
+        if "execution_profile" in payload:
+            profile = validate_profile(
+                str(payload.get("execution_profile", ""))
+            )
+            self.store.set_session_safety(session_id, profile)
         if not changes:
-            raise ValueError("no supported session settings were provided")
+            if "execution_profile" not in payload:
+                raise ValueError(
+                    "no supported session settings were provided"
+                )
         session = self.store.update_session(session_id, **changes)
+        configured_fields = sorted(changes)
+        if "execution_profile" in payload:
+            configured_fields.append("execution_profile")
         self.store.append_event(
             session_id,
             "session.configured",
             status="complete",
-            metadata={"fields": sorted(changes)},
+            metadata={"fields": configured_fields},
         )
         return session
+
+    def safety_state(self, session_id: str) -> dict[str, Any]:
+        require_uuid(session_id, "session_id")
+        self.store.get_session(session_id)
+        return {
+            "session": self.store.session_safety(session_id),
+            "envelopes": self.store.session_envelopes(session_id),
+            "incidents": self.store.guard_incidents(session_id),
+        }
+
+    def extend_budget(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        require_uuid(session_id, "session_id")
+        reason = str(payload.get("reason", "")).strip()
+        if not reason:
+            raise ValueError("budget extension reason is required")
+        extension: dict[str, Any] = {"reason": reason}
+        for name in ("additional_seconds", "additional_tokens"):
+            value = payload.get(name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(name + " must be an integer")
+            if value < 1:
+                raise ValueError(name + " must be positive")
+            maximum = 3_600
+            if name == "additional_tokens":
+                maximum = 300_000
+            if value > maximum:
+                raise ValueError(name + " exceeds one profile envelope")
+            extension[name] = value
+        allow_xhigh = payload.get("allow_xhigh_once", False)
+        if not isinstance(allow_xhigh, bool):
+            raise ValueError("allow_xhigh_once must be boolean")
+        extension["allow_xhigh_once"] = allow_xhigh
+        if len(extension) == 2 and not allow_xhigh:
+            raise ValueError("budget extension has no additive capacity")
+        result = self.store.extend_session_safety(
+            session_id,
+            extension,
+        )
+        self.store.append_event(
+            session_id,
+            "budget.extended",
+            status="complete",
+            metadata={
+                "additional_seconds": extension.get(
+                    "additional_seconds",
+                    0,
+                ),
+                "additional_tokens": extension.get(
+                    "additional_tokens",
+                    0,
+                ),
+                "allow_xhigh_once": allow_xhigh,
+                "reason": reason,
+            },
+        )
+        return result
+
+    def create_process_lease(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        provider = str(payload.get("provider", "")).strip()
+        if provider not in {"claude", "codex"}:
+            raise ValueError("unsupported lease provider")
+        profile = validate_profile(
+            str(payload.get("execution_profile", UNATTENDED))
+        )
+        if profile == "interactive":
+            raise ValueError("background leases cannot be interactive")
+        session_id = str(payload.get("session_id", "")).strip()
+        if session_id:
+            require_uuid(session_id, "session_id")
+            self.store.get_session(session_id)
+        self._require_process_lease_capacity(provider, profile)
+        return self.store.create_process_lease(
+            session_id,
+            provider,
+            profile,
+            _lease_expiry(),
+        )
+
+    def _require_process_lease_capacity(
+        self,
+        provider: str,
+        profile: str,
+    ) -> None:
+        usage = self.store.latest_usage().get(provider)
+        if usage is None:
+            raise SafetyGuardError(
+                "fresh provider usage is required",
+                provider,
+                recoverable=False,
+            )
+        observed_at = str(usage.get("observed_at", ""))
+        try:
+            observed = datetime.datetime.fromisoformat(observed_at)
+        except ValueError as error:
+            raise SafetyGuardError(
+                "provider usage timestamp is invalid",
+                provider,
+                recoverable=False,
+            ) from error
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=datetime.UTC)
+        age = datetime.datetime.now(datetime.UTC) - observed
+        if age > datetime.timedelta(seconds=90):
+            raise SafetyGuardError(
+                "provider usage is stale",
+                provider,
+                recoverable=False,
+            )
+        binding = _optional_number(usage.get("binding_percent"))
+        if binding is None:
+            raise SafetyGuardError(
+                "provider binding usage is unavailable",
+                provider,
+                recoverable=False,
+            )
+        if bool(usage.get("credits_engaged", False)):
+            raise SafetyGuardError(
+                "metered provider credits would engage",
+                provider,
+                recoverable=False,
+            )
+        ceiling = limits_for(profile, "operations").binding_ceiling
+        if binding >= ceiling:
+            raise SafetyGuardError(
+                "provider binding usage reached the safety ceiling",
+                provider,
+                recoverable=False,
+            )
+
+    def update_process_lease(
+        self,
+        lease_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        action = str(payload.get("action", "heartbeat"))
+        if action == "release":
+            return self.store.update_process_lease(
+                lease_id,
+                state="released",
+            )
+        if action not in {"attach", "heartbeat"}:
+            raise ValueError("unsupported lease action")
+        pid: int | None = None
+        pid_start: str | None = None
+        state: str | None = None
+        if action == "attach":
+            raw_pid = payload.get("pid")
+            if isinstance(raw_pid, bool) or not isinstance(raw_pid, int):
+                raise ValueError("lease pid must be an integer")
+            if raw_pid < 1:
+                raise ValueError("lease pid must be positive")
+            pid = raw_pid
+            pid_start = str(payload.get("pid_start", "")).strip()
+            if not pid_start:
+                raise ValueError("lease pid_start is required")
+            state = "active"
+        return self.store.update_process_lease(
+            lease_id,
+            pid=pid,
+            pid_start=pid_start,
+            state=state,
+            expires_at=_lease_expiry(),
+        )
+
+    def process_leases(self) -> list[dict[str, Any]]:
+        return self.store.active_process_leases()
 
     def ui_state(self, session_id: str) -> dict[str, Any]:
         require_uuid(session_id, "session_id")
@@ -414,10 +611,16 @@ class HarnessService:
         source = self.store.get_session(session_id)
         checkpoint = self.checkpoint(session_id)
         goal = self.store.goal_for_session(session_id)
+        source_profile = str(
+            self.store.session_safety(session_id)["profile"]
+        )
+        if not source_profile:
+            source_profile = UNATTENDED
         create_payload: dict[str, Any] = {
             "workspace": source.worktree,
             "name": str(payload.get("name", "")).strip(),
             "permission_mode": source.permission_mode,
+            "execution_profile": source_profile,
         }
         if not create_payload["name"]:
             create_payload["name"] = source.name + " fork"
@@ -459,19 +662,36 @@ class HarnessService:
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         session = self.store.get_session(session_id)
+        workload = str(payload.get("workload", "implementation"))
+        safety = self.store.session_safety(session_id)
+        profile = str(safety["profile"])
+        if not profile:
+            profile = UNATTENDED
+        limits = limits_for(profile, workload)
+        effort = effective_effort(
+            str(payload.get("effort", "")),
+            limits,
+            xhigh_authorized=int(
+                safety["xhigh_authorizations"]
+            )
+            > 0,
+        )
         decision = await self.scheduler.choose(
             session,
-            workload=str(payload.get("workload", "implementation")),
+            workload=workload,
             required_capabilities=frozenset(
                 str(item)
                 for item in payload.get("required_capabilities", [])
             ),
             provider=str(payload.get("provider", "")),
             model=str(payload.get("model", "")),
-            effort=str(payload.get("effort", "")),
+            effort=effort,
             metered_budget=_optional_number(
                 payload.get("metered_budget")
             ),
+            binding_ceiling=limits.binding_ceiling,
+            execution_profile=profile,
+            enforce_concurrency=True,
         )
         return decision.as_dict()
 
@@ -578,6 +798,14 @@ class HarnessService:
             owner_host=host_id(),
             owner_epoch=owner_epoch,
         )
+        imported_safety = exported.get("safety")
+        if not isinstance(imported_safety, dict):
+            imported_safety = {}
+        profile = str(imported_safety.get("profile", UNATTENDED))
+        self.store.set_session_safety(
+            session_id,
+            validate_profile(profile),
+        )
         checkpoints = self.store.checkpoints(session_id)
         if checkpoints:
             restore_checkpoint(worktree, checkpoints[-1], self.blobs)
@@ -675,3 +903,9 @@ def _optional_number(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _lease_expiry() -> str:
+    value = datetime.datetime.now(datetime.UTC)
+    value += datetime.timedelta(seconds=90)
+    return value.isoformat()

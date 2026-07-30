@@ -22,6 +22,20 @@ py_binary(
     main = "coverage_gate.py",
 )
 
+py_binary(
+    name = "live_smoke",
+    srcs = ["live_smoke.gpt.py"],
+    main = "live_smoke.gpt.py",
+    deps = ["//agent_harness"],
+)
+
+py_test(
+    name = "live_smoke_test",
+    srcs = ["live_smoke_test.gpt.py"],
+    data = [":live_smoke"],
+    main = "live_smoke_test.gpt.py",
+)
+
 py_test(
     name = "install_test",
     srcs = [

@@ -70,6 +70,25 @@ class ProviderExhaustedError(HarnessError):
         )
 
 
+class SafetyGuardError(HarnessError):
+    def __init__(
+        self,
+        reason: str,
+        provider: str,
+        *,
+        recoverable: bool,
+    ) -> None:
+        super().__init__(
+            "E_SAFETY_GUARD",
+            "execution safety guard stopped " + provider + ": " + reason,
+            retryable=recoverable,
+            status=429,
+        )
+        self.reason = reason
+        self.provider = provider
+        self.recoverable = recoverable
+
+
 class NeedsReconciliationError(HarnessError):
     def __init__(self) -> None:
         super().__init__(
