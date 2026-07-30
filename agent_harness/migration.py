@@ -36,6 +36,12 @@ class LegacyPaths:
     daemon_pid: Path
 
 
+@dataclass(frozen=True)
+class DestinationBackup:
+    root: Path
+    had_database: bool
+
+
 def legacy_paths(root: Path) -> LegacyPaths:
     resolved = root.expanduser().resolve()
     return LegacyPaths(
@@ -52,12 +58,16 @@ def legacy_paths(root: Path) -> LegacyPaths:
 
 
 def stop_legacy_processes(source: LegacyPaths) -> None:
-    candidates = _legacy_processes(source.root)
-    daemon_pid = _read_pid(source.daemon_pid)
+    _stop_managed_processes(source.root, source.daemon_pid)
+
+
+def _stop_managed_processes(root: Path, pid_path: Path) -> None:
+    candidates = _legacy_processes(root)
+    daemon_pid = _read_pid(pid_path)
     if daemon_pid is not None:
         candidates.add(daemon_pid)
     for pid in sorted(candidates):
-        if not _is_managed_legacy_process(pid, source.root):
+        if not _is_managed_legacy_process(pid, root):
             continue
         try:
             os.kill(pid, signal.SIGTERM)
@@ -68,7 +78,7 @@ def stop_legacy_processes(source: LegacyPaths) -> None:
         remaining = {
             pid
             for pid in candidates
-            if _is_managed_legacy_process(pid, source.root)
+            if _is_managed_legacy_process(pid, root)
         }
         if not remaining:
             return
@@ -87,20 +97,54 @@ def migrate_state(
     _validate_roots(source, destination)
     stop_legacy_processes(source)
     _require_quiescent(source)
+    _stop_managed_processes(
+        destination.state_dir,
+        destination.daemon_pid,
+    )
+    _require_root_quiescent(destination.state_dir)
     prepare_paths(destination)
     _require_headroom(source.root, destination.state_dir)
     source_store = StateStore(source.database)
     moved: list[tuple[Path, Path, Path]] = []
+    backup = _create_destination_backup(destination)
     try:
         source_inventory = _inventory(source_store, source)
-        _copy_database(source_store, destination)
-        _copy_tree(source.blobs, destination.blobs)
-        _copy_tree(source.exports, destination.exports)
-        _copy_tree(source.logs, destination.logs)
-        _copy_tree(source.secrets, destination.token.parent)
         destination_store = StateStore(destination.database)
         try:
+            destination_inventory = _inventory(
+                destination_store,
+                destination,
+            )
+            preserved = {
+                session.session_id: destination_store.portable_session(
+                    session.session_id
+                )
+                for session in destination_store.list_sessions(
+                    include_archived=True
+                )
+            }
+            records = [
+                source_store.portable_session(session.session_id)
+                for session in source_store.list_sessions(
+                    include_archived=True
+                )
+            ]
+            destination_store.merge_portable(
+                records,
+                source_store.portable_global(),
+            )
             destination_store.clear_runtime_state()
+            _copy_tree_verified(source.blobs, destination.blobs)
+            _copy_tree_verified(source.exports, destination.exports)
+            _copy_tree_verified(
+                source.logs,
+                destination.logs / "legacy",
+            )
+            if not destination.token.exists():
+                _copy_tree_verified(
+                    source.secrets,
+                    destination.token.parent,
+                )
             _move_worktrees(
                 source_store,
                 source,
@@ -112,15 +156,26 @@ def migrate_state(
                 source.worktrees,
                 destination.worktrees,
             )
-            destination_inventory = _inventory(
+            merged_inventory = _inventory(
                 destination_store,
                 destination,
             )
-            _verify_inventory(
+            _verify_merged_inventory(
                 source_inventory,
                 destination_inventory,
+                merged_inventory,
                 source.worktrees,
                 destination.worktrees,
+            )
+            _verify_source_sessions(
+                destination_store,
+                records,
+                source.worktrees,
+                destination.worktrees,
+            )
+            _verify_preserved_sessions(
+                destination_store,
+                preserved,
             )
             materialize_all(destination, destination_store)
             _verify_portable_round_trip(
@@ -136,10 +191,11 @@ def migrate_state(
             destination_store.close()
     except BaseException:
         _rollback_worktrees(moved)
-        _clear_failed_destination(destination)
+        _restore_destination_backup(destination, backup)
         raise
     finally:
         source_store.close()
+    _remove_destination_backup(backup)
     trashed = ""
     if trash_source:
         trashed = str(_trash_source(source.root))
@@ -170,84 +226,129 @@ def _validate_roots(
     )
     if git.returncode != 0:
         raise ValueError("destination is not a Git repository")
-    _require_empty_managed_destination(destination)
-    if destination.database.exists():
-        existing = StateStore(destination.database)
-        try:
-            if existing.list_sessions(include_archived=True):
-                raise ValueError("destination already contains sessions")
-        finally:
-            existing.close()
 
 
-def _require_empty_managed_destination(
+def _create_destination_backup(
     destination: HarnessPaths,
-) -> None:
-    managed = (
-        destination.sessions,
-        destination.blobs,
-        destination.exports,
-    )
-    for directory in managed:
-        if directory.is_dir() and any(directory.iterdir()):
-            raise ValueError(
-                "destination already contains managed chat data"
-            )
-    global_record = destination.state_dir / "global.gpt.json"
-    if global_record.exists():
-        raise ValueError(
-            "destination already contains managed chat data"
+) -> DestinationBackup:
+    root = destination.runtime / "migration-rollback"
+    if root.exists():
+        raise RuntimeError(
+            "an incomplete destination migration backup already exists"
         )
+    root.mkdir(parents=True, mode=0o700)
+    had_database = destination.database.is_file()
+    if had_database:
+        source = sqlite3.connect(destination.database)
+        target = sqlite3.connect(root / "state.sqlite3")
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+    directories = {
+        "sessions": destination.sessions,
+        "blobs": destination.blobs,
+        "exports": destination.exports,
+        "logs": destination.logs,
+        "secrets": destination.token.parent,
+    }
+    for name, source_path in directories.items():
+        if source_path.is_dir():
+            shutil.copytree(source_path, root / name)
+    files = {
+        "global.gpt.json": destination.state_dir / "global.gpt.json",
+        "sync-status.json": destination.sync_status,
+    }
+    for name, source_path in files.items():
+        if source_path.is_file():
+            shutil.copy2(source_path, root / name)
+    return DestinationBackup(root=root, had_database=had_database)
 
 
-def _clear_failed_destination(destination: HarnessPaths) -> None:
-    directories = (
-        destination.sessions,
-        destination.blobs,
-        destination.exports,
-        destination.logs,
-        destination.token.parent,
-        destination.worktrees,
-    )
-    for directory in directories:
-        if directory.is_dir():
-            shutil.rmtree(directory)
-    files = (
-        destination.state_dir / "global.gpt.json",
+def _restore_destination_backup(
+    destination: HarnessPaths,
+    backup: DestinationBackup,
+) -> None:
+    directories = {
+        "sessions": destination.sessions,
+        "blobs": destination.blobs,
+        "exports": destination.exports,
+        "logs": destination.logs,
+        "secrets": destination.token.parent,
+    }
+    for name, destination_path in directories.items():
+        if destination_path.is_dir():
+            shutil.rmtree(destination_path)
+        source_path = backup.root / name
+        if source_path.is_dir():
+            shutil.copytree(source_path, destination_path)
+    database_files = (
         destination.database,
         Path(str(destination.database) + "-shm"),
         Path(str(destination.database) + "-wal"),
-        destination.sync_lock,
-        destination.sync_status,
     )
-    for path in files:
+    for path in database_files:
         if path.exists():
             path.unlink()
+    if backup.had_database:
+        shutil.copy2(
+            backup.root / "state.sqlite3",
+            destination.database,
+        )
+    files = {
+        "global.gpt.json": destination.state_dir / "global.gpt.json",
+        "sync-status.json": destination.sync_status,
+    }
+    for name, destination_path in files.items():
+        if destination_path.exists():
+            destination_path.unlink()
+        source_path = backup.root / name
+        if source_path.is_file():
+            destination_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+                mode=0o700,
+            )
+            shutil.copy2(source_path, destination_path)
+    _remove_destination_backup(backup)
 
 
-def _copy_database(
-    source_store: StateStore,
-    destination: HarnessPaths,
-) -> None:
-    temporary = destination.database.with_name(
-        destination.database.name + ".migrating"
-    )
-    if temporary.exists():
-        temporary.unlink()
-    source_store.backup(temporary)
-    os.replace(temporary, destination.database)
-    os.chmod(destination.database, 0o600)
+def _remove_destination_backup(backup: DestinationBackup) -> None:
+    if backup.root.is_dir():
+        shutil.rmtree(backup.root)
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
+def _copy_tree_verified(source: Path, destination: Path) -> None:
     if not source.is_dir():
         return
-    shutil.copytree(
-        source,
-        destination,
-        dirs_exist_ok=True,
-        copy_function=shutil.copy2,
-    )
+    for source_path in sorted(source.rglob("*")):
+        relative = source_path.relative_to(source)
+        destination_path = destination / relative
+        if source_path.is_dir():
+            destination_path.mkdir(
+                parents=True,
+                exist_ok=True,
+                mode=0o700,
+            )
+            continue
+        if source_path.is_symlink():
+            raise RuntimeError(
+                "migration source contains an unsupported symlink"
+            )
+        destination_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+            mode=0o700,
+        )
+        if destination_path.exists():
+            if _file_digest(source_path) != _file_digest(destination_path):
+                raise RuntimeError(
+                    "migration file conflicts with destination: "
+                    + str(relative)
+                )
+            continue
+        shutil.copy2(source_path, destination_path)
 
 
 def _move_worktrees(
@@ -370,24 +471,34 @@ def _inventory(
     }
 
 
-def _verify_inventory(
+def _verify_merged_inventory(
     source: dict[str, Any],
-    destination: dict[str, Any],
+    destination_before: dict[str, Any],
+    destination_after: dict[str, Any],
     source_worktrees: Path,
     destination_worktrees: Path,
 ) -> None:
-    if source["sessions"] != destination["sessions"]:
+    expected_sessions = (
+        int(source["sessions"])
+        + int(destination_before["sessions"])
+    )
+    if expected_sessions != destination_after["sessions"]:
         raise RuntimeError("session count changed during migration")
-    if source["events"] != destination["events"]:
+    expected_events = (
+        int(source["events"])
+        + int(destination_before["events"])
+    )
+    if expected_events != destination_after["events"]:
         raise RuntimeError("event count changed during migration")
-    if source["blob_hashes"] != destination["blob_hashes"]:
-        raise RuntimeError("blob content changed during migration")
     source_sessions = source["session_values"]
-    destination_sessions = destination["session_values"]
+    destination_sessions = destination_before["session_values"]
+    merged_sessions = destination_after["session_values"]
     if not isinstance(source_sessions, list):
         raise RuntimeError("source inventory is invalid")
     if not isinstance(destination_sessions, list):
         raise RuntimeError("destination inventory is invalid")
+    if not isinstance(merged_sessions, list):
+        raise RuntimeError("merged inventory is invalid")
     normalized_source = _normalize_inventory_worktrees(
         source_sessions,
         source_worktrees,
@@ -398,8 +509,71 @@ def _verify_inventory(
         destination_worktrees,
         destination_worktrees,
     )
-    if normalized_source != normalized_destination:
+    normalized_merged = _normalize_inventory_worktrees(
+        merged_sessions,
+        destination_worktrees,
+        destination_worktrees,
+    )
+    expected_values = sorted(
+        normalized_source + normalized_destination,
+        key=lambda item: str(item.get("session_id", "")),
+    )
+    if expected_values != normalized_merged:
         raise RuntimeError("session content changed during migration")
+    merged_blobs = destination_after["blob_hashes"]
+    if not isinstance(merged_blobs, dict):
+        raise RuntimeError("merged blob inventory is invalid")
+    for inventory in (
+        source["blob_hashes"],
+        destination_before["blob_hashes"],
+    ):
+        if not isinstance(inventory, dict):
+            raise RuntimeError("source blob inventory is invalid")
+        for name, digest in inventory.items():
+            if merged_blobs.get(name) != digest:
+                raise RuntimeError("blob content changed during migration")
+
+
+def _verify_source_sessions(
+    store: StateStore,
+    records: list[dict[str, Any]],
+    source_worktrees: Path,
+    destination_worktrees: Path,
+) -> None:
+    source_text = str(source_worktrees.resolve())
+    destination_text = str(destination_worktrees.resolve())
+    for record in records:
+        expected = json.loads(json.dumps(record))
+        tables = expected.get("tables", {})
+        if not isinstance(tables, dict):
+            raise RuntimeError("portable source tables are invalid")
+        sessions = tables.get("sessions", [])
+        if not isinstance(sessions, list) or len(sessions) != 1:
+            raise RuntimeError("portable source session is invalid")
+        session = sessions[0]
+        if not isinstance(session, dict):
+            raise RuntimeError("portable source session is invalid")
+        worktree = str(session.get("worktree", ""))
+        if worktree.startswith(source_text + os.sep):
+            session["worktree"] = (
+                destination_text + worktree[len(source_text) :]
+            )
+        session_id = str(record.get("session_id", ""))
+        if store.portable_session(session_id) != expected:
+            raise RuntimeError(
+                "portable source session changed during migration"
+            )
+
+
+def _verify_preserved_sessions(
+    store: StateStore,
+    preserved: dict[str, dict[str, Any]],
+) -> None:
+    for session_id, expected in preserved.items():
+        if store.portable_session(session_id) != expected:
+            raise RuntimeError(
+                "destination session changed during migration"
+            )
 
 
 def _normalize_inventory_worktrees(
@@ -454,10 +628,14 @@ def _verify_portable_round_trip(
 
 
 def _require_quiescent(source: LegacyPaths) -> None:
+    _require_root_quiescent(source.root)
+
+
+def _require_root_quiescent(root: Path) -> None:
     active = {
         pid
-        for pid in _legacy_processes(source.root)
-        if _is_managed_legacy_process(pid, source.root)
+        for pid in _legacy_processes(root)
+        if _is_managed_legacy_process(pid, root)
     }
     if active:
         raise RuntimeError("legacy harness state is still in use")
@@ -531,8 +709,12 @@ def _file_hashes(root: Path) -> dict[str, str]:
         if not item.is_file() or item.is_symlink():
             continue
         relative = str(item.relative_to(root))
-        result[relative] = hashlib.sha256(item.read_bytes()).hexdigest()
+        result[relative] = _file_digest(item)
     return result
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _digest(value: dict[str, Any]) -> str:

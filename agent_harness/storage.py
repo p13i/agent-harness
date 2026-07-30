@@ -1888,6 +1888,33 @@ class StateStore:
     ) -> None:
         if self.list_sessions(include_archived=True):
             raise ConflictError("portable import requires an empty store")
+        self._apply_portable(records, global_record, merge_global=False)
+
+    def merge_portable(
+        self,
+        records: list[dict[str, Any]],
+        global_record: dict[str, Any],
+    ) -> None:
+        for record in records:
+            session_id = str(record.get("session_id", ""))
+            with self._lock:
+                existing = self._connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            if existing is not None:
+                raise ConflictError(
+                    "portable session UUID already exists: " + session_id
+                )
+        self._apply_portable(records, global_record, merge_global=True)
+
+    def _apply_portable(
+        self,
+        records: list[dict[str, Any]],
+        global_record: dict[str, Any],
+        *,
+        merge_global: bool,
+    ) -> None:
         table_rows: dict[str, list[dict[str, Any]]] = {
             table: [] for table in PORTABLE_SESSION_TABLES
         }
@@ -1916,10 +1943,12 @@ class StateStore:
         global_ui = global_tables.get("ui_state", [])
         if not isinstance(global_ui, list):
             raise ValueError("global ui_state must be a list")
-        for row in global_ui:
-            table_rows["ui_state"].append(
-                _require_object(row, "ui_state row")
-            )
+        validated_global_ui = [
+            _require_object(row, "ui_state row")
+            for row in global_ui
+        ]
+        if not merge_global:
+            table_rows["ui_state"].extend(validated_global_ui)
         with self.transaction() as connection:
             for table in PORTABLE_SESSION_TABLES:
                 self._insert_portable_rows(
@@ -1927,18 +1956,32 @@ class StateStore:
                     table,
                     table_rows[table],
                 )
+            if merge_global:
+                self._merge_portable_rows(
+                    connection,
+                    "ui_state",
+                    validated_global_ui,
+                )
             for table in PORTABLE_GLOBAL_TABLES:
                 rows = global_tables.get(table, [])
                 if not isinstance(rows, list):
                     raise ValueError(table + " must be a list")
-                self._insert_portable_rows(
-                    connection,
-                    table,
-                    [
-                        _require_object(row, table + " row")
-                        for row in rows
-                    ],
-                )
+                validated = [
+                    _require_object(row, table + " row")
+                    for row in rows
+                ]
+                if merge_global:
+                    self._merge_portable_rows(
+                        connection,
+                        table,
+                        validated,
+                    )
+                else:
+                    self._insert_portable_rows(
+                        connection,
+                        table,
+                        validated,
+                    )
 
     def _portable_rows(
         self,
@@ -1998,6 +2041,42 @@ class StateStore:
                 + ")",
                 tuple(row[column] for column in columns),
             )
+
+    def _merge_portable_rows(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        primary_key = [
+            str(row["name"])
+            for row in sorted(
+                connection.execute(
+                    "PRAGMA table_info(" + table + ")"
+                ).fetchall(),
+                key=lambda row: int(row["pk"]),
+            )
+            if int(row["pk"]) > 0
+        ]
+        if not primary_key:
+            raise RuntimeError(
+                "portable merge table lacks a primary key: " + table
+            )
+        for row in rows:
+            condition = " AND ".join(
+                column + " = ?" for column in primary_key
+            )
+            existing = connection.execute(
+                "SELECT * FROM " + table + " WHERE " + condition,
+                tuple(row[column] for column in primary_key),
+            ).fetchone()
+            if existing is None:
+                self._insert_portable_rows(connection, table, [row])
+                continue
+            if dict(existing) != row:
+                raise ConflictError(
+                    "portable global row conflicts in " + table
+                )
 
     def export_session(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)

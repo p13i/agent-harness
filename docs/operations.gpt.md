@@ -79,9 +79,12 @@ npx --yes @bazel/bazelisk run //cmd:agent-harness -- \
 ```
 
 Migration stops only harness-managed processes using the
-source root, takes a SQLite backup, verifies session, event,
+source or destination root. Existing destination sessions
+are retained through a collision-checked portable merge and
+rollback snapshot. The command verifies session, event,
 blob, portable-record, and Git-worktree fidelity, pushes the
-destination, and only then moves the old root to Trash.
+combined destination, and only then moves the old root to
+Trash.
 
 ```sh
 make doctor

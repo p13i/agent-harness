@@ -556,6 +556,22 @@ def test_legacy_migration_preserves_resume_state_and_git_worktree(
     remote = tmp_path / "remote.git"
     destination_root = tmp_path / "chats"
     _chat_repository(destination_root, remote)
+    destination_paths = paths(destination_root)
+    prepare_paths(destination_paths)
+    existing_store = StateStore(destination_paths.database)
+    existing = session(tmp_path / "existing")
+    existing_store.create_session(existing)
+    existing_store.append_event(
+        existing.session_id,
+        "agent.message",
+        role="assistant",
+        text="preserve destination state",
+    )
+    existing = existing_store.get_session(existing.session_id)
+    assert publish_all(destination_paths, existing_store)["state"] == (
+        "synced"
+    )
+    existing_store.close()
 
     result = migrate_state(
         source_root,
@@ -566,7 +582,6 @@ def test_legacy_migration_preserves_resume_state_and_git_worktree(
     assert result["sessions"] == 1
     assert result["events"] == 1
     assert result["worktrees"] == 1
-    destination_paths = paths(destination_root)
     destination_store = StateStore(destination_paths.database)
     migrated = destination_store.get_session(created.session_id)
     assert migrated.session_id == created.session_id
@@ -576,6 +591,11 @@ def test_legacy_migration_preserves_resume_state_and_git_worktree(
     assert destination_store.all_events(created.session_id)[0].text == (
         "resume after migration"
     )
+    assert destination_store.get_session(existing.session_id) == existing
+    assert destination_store.all_events(existing.session_id)[0].text == (
+        "preserve destination state"
+    )
+    assert len(destination_store.list_sessions()) == 2
     assert not worktree.exists()
     assert Path(migrated.worktree).is_dir()
     assert _git(Path(migrated.worktree), "status", "--porcelain=v1") == ""
@@ -604,6 +624,21 @@ def test_failed_migration_restores_worktree_and_remains_retryable(
     remote = tmp_path / "remote.git"
     destination_root = tmp_path / "chats"
     _chat_repository(destination_root, remote)
+    destination_paths = paths(destination_root)
+    prepare_paths(destination_paths)
+    destination_store = StateStore(destination_paths.database)
+    existing = session(tmp_path / "existing")
+    destination_store.create_session(existing)
+    destination_store.append_event(
+        existing.session_id,
+        "agent.message",
+        role="assistant",
+        text="keep on rollback",
+    )
+    assert publish_all(destination_paths, destination_store)["state"] == (
+        "synced"
+    )
+    destination_store.close()
     monkeypatch.setattr(
         migration_module,
         "sync_repository",
@@ -619,7 +654,15 @@ def test_failed_migration_restores_worktree_and_remains_retryable(
 
     assert worktree.is_dir()
     assert _git(worktree, "status", "--porcelain=v1") == ""
-    assert not paths(destination_root).database.exists()
+    restored_destination = StateStore(destination_paths.database)
+    assert len(restored_destination.list_sessions()) == 1
+    assert restored_destination.get_session(existing.session_id).session_id == (
+        existing.session_id
+    )
+    assert restored_destination.all_events(existing.session_id)[0].text == (
+        "keep on rollback"
+    )
+    restored_destination.close()
     retry_store = StateStore(source_root / "state.sqlite3")
     assert retry_store.get_session(created.session_id).worktree == str(
         worktree
@@ -650,15 +693,11 @@ def test_migration_validation_rejects_unsafe_roots_and_low_space(
             paths(destination),
         )
 
-    remote = tmp_path / "remote.git"
-    _chat_repository(destination, remote, create=False)
-    managed = destination / "sessions"
-    managed.mkdir()
-    (managed / "unexpected").write_text("data", encoding="utf-8")
-    with pytest.raises(ValueError, match="managed chat data"):
+    _workspace_repository(source, create=False)
+    with pytest.raises(ValueError, match="must differ"):
         migration_module._validate_roots(
             migration_module.legacy_paths(source),
-            paths(destination),
+            paths(source),
         )
 
     monkeypatch.setattr(
