@@ -17,6 +17,22 @@ The durable service starts on demand. Closing the TUI leaves
 workers running. The following commands provide non-TUI
 control:
 
+The session sidebar starts in a focused view that retains
+the current session, attention-required sessions, and five
+recent idle sessions. `/sessions all` exposes complete
+unarchived history, and `/sessions focused` restores the
+bounded view. Drag the divider beside the session list or
+press `Ctrl+Shift+Left` and `Ctrl+Shift+Right` to resize it.
+`/sidebar reset` restores the default width. The width is
+restored with the session and inherited by new chats in the
+same workspace.
+
+The transcript reconciles streamed deltas with the provider
+final message. Provider protocol lifecycle events remain
+hidden unless `/events on` activates the diagnostic view.
+`/theme system` tracks the host appearance; `/theme light`
+and `/theme dark` select an explicit appearance.
+
 Health responses carry a control protocol version and a
 build fingerprint derived from the harness Python package.
 Before opening chat, a new CLI replaces an older managed
@@ -70,9 +86,10 @@ role bias, provider affinity, queue share, quality, and
 context-transfer cost.
 
 Inside chat, `/usage` displays the current profile,
-envelope, exact or estimated accounting, provider headroom,
-recovery stage, and guard reason. `/budget` shows the same
-state. These commands extend one future envelope:
+envelope, provider-reported input and output, estimated
+harness context, provider headroom, recovery stage, and
+guard reason. `/budget` shows the same state. These commands
+extend one future envelope:
 
 ```text
 /budget extend 300 10000 Finish bounded validation

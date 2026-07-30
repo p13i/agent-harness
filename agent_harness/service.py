@@ -105,6 +105,7 @@ class HarnessService:
 
     def recover_workers(self) -> None:
         for session in self.store.list_sessions():
+            session = self._name_session_from_history(session)
             if session.lifecycle not in {
                 Lifecycle.PAUSED,
                 Lifecycle.STARTING,
@@ -113,11 +114,24 @@ class HarnessService:
                 continue
             self.workers.ensure(session.session_id)
 
+    def _name_session_from_history(self, session: Session) -> Session:
+        if not _automatic_session_name(session):
+            return session
+        for event in self.store.events(session.session_id, limit=100):
+            if event.event_type != "user.message" or not event.text.strip():
+                continue
+            return self.store.update_session(
+                session.session_id,
+                name=_message_session_name(event.text),
+            )
+        return session
+
     def create_session(self, payload: dict[str, Any]) -> Session:
         workspace_text = str(payload.get("workspace", "")).strip()
         if not workspace_text:
             raise ValueError("workspace is required")
         workspace = Path(workspace_text).expanduser().resolve()
+        inherited_ui_state = self._workspace_ui_state(str(workspace))
         direct = bool(payload.get("direct", False))
         session_id = new_uuid()
         worktree = create_worktree(
@@ -153,6 +167,11 @@ class HarnessService:
             updated_at=now,
         )
         self.store.create_session(session)
+        if inherited_ui_state:
+            self.store.set_ui_state(
+                "session:" + session_id,
+                inherited_ui_state,
+            )
         execution_profile = validate_profile(
             str(payload.get("execution_profile", UNATTENDED))
         )
@@ -213,6 +232,12 @@ class HarnessService:
             idempotency_key,
         )
         if receipt.status == CommandStatus.QUEUED:
+            session = self.store.get_session(session_id)
+            if _automatic_session_name(session):
+                self.store.update_session(
+                    session_id,
+                    name=_message_session_name(text),
+                )
             self.store.append_event(
                 session_id,
                 "user.message",
@@ -454,8 +479,11 @@ class HarnessService:
             "active_pane",
             "composer",
             "effort",
+            "events",
             "model",
             "provider",
+            "session_filter",
+            "sidebar_width",
             "theme",
         }
         unknown = set(payload) - allowed
@@ -476,6 +504,26 @@ class HarnessService:
             state[name] = value
         self.store.set_ui_state("session:" + session_id, state)
         return state
+
+    def _workspace_ui_state(self, workspace: str) -> dict[str, Any]:
+        inherited_fields = {
+            "events",
+            "session_filter",
+            "sidebar_width",
+            "theme",
+        }
+        for session in self.store.list_sessions():
+            if session.workspace != workspace:
+                continue
+            state = self.store.get_ui_state(
+                "session:" + session.session_id
+            )
+            return {
+                name: value
+                for name, value in state.items()
+                if name in inherited_fields
+            }
+        return {}
 
     def command(
         self,
@@ -901,6 +949,19 @@ def _export_digests(exported: dict[str, Any]) -> set[str]:
                 if digest:
                     digests.add(digest)
     return digests
+
+
+def _automatic_session_name(session: Session) -> bool:
+    expected = Path(session.workspace).name + " " + session.session_id[:8]
+    return session.name == expected
+
+
+def _message_session_name(text: str) -> str:
+    value = " ".join(text.split())
+    maximum = 72
+    if len(value) <= maximum:
+        return value
+    return value[: maximum - 1].rstrip() + "…"
 
 
 def _optional_number(value: object) -> float | None:

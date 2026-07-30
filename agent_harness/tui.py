@@ -17,6 +17,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.containers import Vertical
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.timer import Timer
 from textual.widgets import Button
 from textual.widgets import Footer
@@ -29,6 +30,67 @@ from textual.widgets import Static
 
 from agent_harness.client import HarnessClient
 from agent_harness.ids import new_uuid
+
+
+SIDEBAR_DEFAULT_WIDTH = 31
+SIDEBAR_MIN_WIDTH = 24
+SIDEBAR_MAIN_RESERVE = 48
+SIDEBAR_WIDTH_STEP = 4
+FOCUSED_IDLE_SESSION_LIMIT = 5
+
+
+class ConversationLog(RichLog):
+    """A transcript that keeps short conversations beside the composer."""
+
+    def render_line(self, y: int) -> Strip:
+        viewport_height = self.scrollable_content_region.height
+        content_height = len(self.lines)
+        top_padding = max(0, viewport_height - content_height)
+        if y < top_padding:
+            return Strip.blank(
+                self.scrollable_content_region.width,
+                self.rich_style,
+            )
+        return super().render_line(y - top_padding)
+
+
+class SidebarResizeHandle(Static):
+    """Mouse-draggable divider for the session sidebar."""
+
+    can_focus = True
+
+    def on_mount(self) -> None:
+        self.tooltip = (
+            "Drag to resize sessions. "
+            "Ctrl+Shift+Left/Right also adjusts the width."
+        )
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button != 1:
+            return
+        self.capture_mouse()
+        event.prevent_default()
+        event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self.app.mouse_captured is not self:
+            return
+        application = self.app
+        if not isinstance(application, HarnessApp):
+            return
+        application._resize_sidebar_to(event.screen_x)
+        event.prevent_default()
+        event.stop()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self.app.mouse_captured is not self:
+            return
+        application = self.app
+        self.release_mouse()
+        if isinstance(application, HarnessApp):
+            application._finish_sidebar_resize()
+        event.prevent_default()
+        event.stop()
 
 
 class ApprovalScreen(ModalScreen[str]):
@@ -118,10 +180,22 @@ class HarnessApp(App[None]):
     }
     #sidebar {
         width: 31;
-        min-width: 26;
+        min-width: 24;
         padding: 1;
         background: #0d131c;
-        border-right: solid #27364a;
+    }
+    #sidebar-resize-handle {
+        width: 1;
+        min-width: 1;
+        height: 1fr;
+        content-align: center middle;
+        color: #526176;
+        background: #111823;
+    }
+    #sidebar-resize-handle:hover,
+    #sidebar-resize-handle:focus {
+        color: #e0f2fe;
+        background: #25638a;
     }
     .eyebrow {
         height: 1;
@@ -155,8 +229,7 @@ class HarnessApp(App[None]):
         border: none;
     }
     #session-list ListItem {
-        height: 4;
-        margin-bottom: 1;
+        height: 3;
         padding: 0 1;
         color: #aeb9c9;
         background: #111923;
@@ -171,12 +244,19 @@ class HarnessApp(App[None]):
         background: #18344d;
         border-left: tall #38bdf8;
     }
+    #session-list ListItem.active-session {
+        color: #ffffff;
+        background: #16405d;
+        border-left: tall #7dd3fc;
+        text-style: bold;
+    }
     #sessions-help {
         height: 2;
         color: #64748b;
     }
     #main {
         width: 1fr;
+        min-width: 40;
         background: #0a0e14;
     }
     #inspector {
@@ -219,6 +299,9 @@ class HarnessApp(App[None]):
         height: 1fr;
         padding: 1 3;
         background: #0a0e14;
+        overflow-x: hidden;
+        scrollbar-size: 1 1;
+        scrollbar-background: #0a0e14;
         scrollbar-color: #30445f;
         scrollbar-color-hover: #3b82a8;
         scrollbar-color-active: #38bdf8;
@@ -262,6 +345,9 @@ class HarnessApp(App[None]):
     Screen.narrow #sidebar {
         display: none;
     }
+    Screen.narrow #sidebar-resize-handle {
+        display: none;
+    }
     Screen.narrow #transcript {
         padding-left: 1;
         padding-right: 1;
@@ -275,50 +361,73 @@ class HarnessApp(App[None]):
         color: #1e293b;
     }
     Screen.light #topbar {
-        background: #e7eef7;
-        border-bottom: solid #b8c6d8;
+        background: #e2e8f0;
+        border-bottom: solid #94a3b8;
     }
     Screen.light #brand {
-        color: #0369a1;
+        color: #075985;
     }
     Screen.light #product-promise {
-        color: #64748b;
+        color: #475569;
+    }
+    Screen.light #connection-state {
+        color: #166534;
     }
     Screen.light #sidebar,
     Screen.light #inspector {
-        background: #edf2f8;
+        background: #f1f5f9;
     }
-    Screen.light #sidebar {
-        border-right: solid #b8c6d8;
+    Screen.light #sidebar-resize-handle {
+        color: #64748b;
+        background: #e2e8f0;
+    }
+    Screen.light #sidebar-resize-handle:hover,
+    Screen.light #sidebar-resize-handle:focus {
+        color: #ffffff;
+        background: #0369a1;
     }
     Screen.light #inspector {
-        border-left: solid #b8c6d8;
+        border-left: solid #94a3b8;
+    }
+    Screen.light .eyebrow,
+    Screen.light #session-heading,
+    Screen.light #inspector-heading {
+        color: #475569;
     }
     Screen.light #workspace-summary,
     Screen.light #inspector-content {
-        color: #334155;
+        color: #1e293b;
     }
     Screen.light #session-list ListItem {
-        color: #475569;
-        background: #f8fafc;
-        border-left: tall #c4cfdd;
+        color: #334155;
+        background: #ffffff;
+        border-left: tall #94a3b8;
     }
     Screen.light #session-list ListItem:hover {
         color: #0f172a;
-        background: #e2e8f0;
+        background: #dbeafe;
     }
     Screen.light #session-list ListItem.-highlight {
-        color: #0c4a6e;
-        background: #dbeafe;
+        color: #082f49;
+        background: #bfdbfe;
         border-left: tall #0284c7;
+    }
+    Screen.light #session-list ListItem.active-session {
+        color: #082f49;
+        background: #bae6fd;
+        border-left: tall #0369a1;
+    }
+    Screen.light #sessions-help,
+    Screen.light #composer-help {
+        color: #475569;
     }
     Screen.light #main,
     Screen.light #transcript {
-        background: #f4f7fb;
+        background: #ffffff;
     }
     Screen.light #session-bar {
         background: #f8fafc;
-        border-bottom: solid #c4cfdd;
+        border-bottom: solid #94a3b8;
     }
     Screen.light #session-title {
         color: #0f172a;
@@ -327,14 +436,23 @@ class HarnessApp(App[None]):
         color: #475569;
     }
     Screen.light #resume-token {
-        color: #8290a3;
+        color: #64748b;
     }
     Screen.light #composer-shell {
         background: #ffffff;
-        border: round #94a3b8;
+        border: round #64748b;
     }
     Screen.light #composer {
         color: #0f172a;
+    }
+    Screen.light #composer-label {
+        color: #075985;
+    }
+    Screen.light #transcript {
+        scrollbar-background: #ffffff;
+        scrollbar-color: #94a3b8;
+        scrollbar-color-hover: #64748b;
+        scrollbar-color-active: #0369a1;
     }
     """
     BINDINGS = [
@@ -346,6 +464,18 @@ class HarnessApp(App[None]):
         Binding("ctrl+k", "checkpoint", "Checkpoint"),
         Binding("ctrl+b", "toggle_sessions", "Sessions"),
         Binding("ctrl+o", "toggle_inspector", "Inspector"),
+        Binding(
+            "ctrl+shift+left",
+            "sidebar_narrower",
+            "Narrow sessions",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+shift+right",
+            "sidebar_wider",
+            "Widen sessions",
+            priority=True,
+        ),
         Binding("f1", "show_help", "Help"),
     ]
 
@@ -364,6 +494,8 @@ class HarnessApp(App[None]):
         self.permission_mode = permission_mode
         self.sequence = 0
         self._sessions: list[dict[str, Any]] = []
+        self._visible_sessions: list[dict[str, Any]] = []
+        self._session_list_signature = ""
         self._session: dict[str, Any] = {}
         self._goal: dict[str, Any] | None = None
         self._safety: dict[str, Any] = {}
@@ -372,7 +504,12 @@ class HarnessApp(App[None]):
         self._provider_override = ""
         self._model_override = ""
         self._effort_override = ""
+        self._transcript_events: list[dict[str, Any]] = []
+        self._transcript_notices: list[str] = []
         self._saved_composer = ""
+        self._saved_sidebar_width = SIDEBAR_DEFAULT_WIDTH
+        self._saved_session_filter = "focused"
+        self._saved_show_events = False
         self._last_approval_id = ""
         self._provider_poll = 0
         self._theme_poll = 0
@@ -380,6 +517,9 @@ class HarnessApp(App[None]):
         self._theme_preference = "system"
         self._sidebar_requested = True
         self._inspector_requested = True
+        self._sidebar_width = SIDEBAR_DEFAULT_WIDTH
+        self._session_filter = "focused"
+        self._show_events = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="topbar"):
@@ -405,9 +545,10 @@ class HarnessApp(App[None]):
                 yield Label("SESSIONS", id="session-heading")
                 yield ListView(id="session-list")
                 yield Static(
-                    "↑↓ select  ·  Enter open\nCtrl+R synchronize",
+                    "↑↓ select · Enter open\n/sessions all for history",
                     id="sessions-help",
                 )
+            yield SidebarResizeHandle("│", id="sidebar-resize-handle")
             with Vertical(id="main"):
                 with Vertical(id="session-bar"):
                     yield Static("Starting…", id="session-title")
@@ -416,11 +557,13 @@ class HarnessApp(App[None]):
                         id="session-meta",
                     )
                     yield Static("", id="resume-token")
-                yield RichLog(
+                yield ConversationLog(
                     id="transcript",
                     markup=True,
                     wrap=True,
-                    highlight=True,
+                    highlight=False,
+                    min_width=1,
+                    max_lines=5000,
                 )
                 with Vertical(id="composer-shell"):
                     yield Label("MESSAGE", id="composer-label")
@@ -442,6 +585,7 @@ class HarnessApp(App[None]):
 
     async def on_mount(self) -> None:
         self._apply_responsive_layout(self.size.width)
+        self._apply_sidebar_width()
         await self._sync_system_theme(force=True)
         await self._load_sessions()
         if self.session_id:
@@ -459,6 +603,7 @@ class HarnessApp(App[None]):
 
     def on_resize(self, event: events.Resize) -> None:
         self._apply_responsive_layout(event.size.width)
+        self._apply_sidebar_width()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "new-session":
@@ -473,6 +618,7 @@ class HarnessApp(App[None]):
         if text.startswith("/"):
             await self._slash(text)
             return
+        self._transcript_notices = []
         await self.client.request(
             "POST",
             "/v1/sessions/" + self.session_id + "/messages",
@@ -493,9 +639,11 @@ class HarnessApp(App[None]):
         index = event.list_view.index
         if index is None:
             return
-        if index < 0 or index >= len(self._sessions):
+        if index < 0 or index >= len(self._visible_sessions):
             return
-        session_id = str(self._sessions[index].get("session_id", ""))
+        session_id = str(
+            self._visible_sessions[index].get("session_id", "")
+        )
         if session_id:
             await self._open_session(session_id)
 
@@ -517,13 +665,25 @@ class HarnessApp(App[None]):
 
     def action_toggle_sessions(self) -> None:
         sidebar = self.query_one("#sidebar", Vertical)
+        handle = self.query_one(
+            "#sidebar-resize-handle",
+            SidebarResizeHandle,
+        )
         self._sidebar_requested = not self._sidebar_requested
         sidebar.display = self._sidebar_requested
+        handle.display = self._sidebar_requested
 
     def action_toggle_inspector(self) -> None:
         inspector = self.query_one("#inspector", Vertical)
         self._inspector_requested = not self._inspector_requested
         inspector.display = self._inspector_requested
+        self._apply_sidebar_width()
+
+    def action_sidebar_narrower(self) -> None:
+        self._adjust_sidebar_width(-SIDEBAR_WIDTH_STEP)
+
+    def action_sidebar_wider(self) -> None:
+        self._adjust_sidebar_width(SIDEBAR_WIDTH_STEP)
 
     def action_show_help(self) -> None:
         self._write_help()
@@ -563,14 +723,34 @@ class HarnessApp(App[None]):
         if theme not in {"system", "light", "dark"}:
             theme = "system"
         self._theme_preference = theme
+        sidebar_width = _positive_integer(
+            ui_state.get("sidebar_width"),
+        )
+        if sidebar_width is not None:
+            self._sidebar_width = sidebar_width
+        session_filter = str(
+            ui_state.get("session_filter", "focused")
+        )
+        if session_filter not in {"focused", "all"}:
+            session_filter = "focused"
+        self._session_filter = session_filter
+        self._show_events = (
+            str(ui_state.get("events", "off")).casefold() == "on"
+        )
+        self._saved_sidebar_width = self._sidebar_width
+        self._saved_session_filter = self._session_filter
+        self._saved_show_events = self._show_events
+        self._apply_sidebar_width()
         await self._sync_system_theme(force=True)
         composer = str(ui_state.get("composer", ""))
         self._saved_composer = composer
         self.query_one("#composer", Input).value = composer
         self._last_approval_id = ""
-        transcript = self.query_one("#transcript", RichLog)
-        transcript.clear()
-        transcript.write(self._welcome_message())
+        self._transcript_events = []
+        self._transcript_notices = []
+        self._render_transcript()
+        self._session_list_signature = ""
+        await self._render_session_list()
         await self._poll()
 
     async def _load_sessions(self) -> None:
@@ -581,16 +761,56 @@ class HarnessApp(App[None]):
         self._sessions = [
             item for item in sessions if isinstance(item, dict)
         ]
+        self._session_list_signature = ""
+        await self._render_session_list()
+
+    async def _render_session_list(self) -> None:
+        visible, hidden_count = _visible_sessions(
+            self._sessions,
+            self.session_id,
+            show_all=self._session_filter == "all",
+        )
+        signature = repr(
+            (
+                visible,
+                hidden_count,
+                self.session_id,
+                self._session_filter,
+            )
+        )
+        if signature == self._session_list_signature:
+            return
+        self._session_list_signature = signature
+        self._visible_sessions = visible
         view = self.query_one("#session-list", ListView)
         await view.clear()
-        for session in self._sessions:
-            name = str(session.get("name", "unnamed"))
-            provider = str(session.get("active_provider", ""))
-            lifecycle = str(session.get("lifecycle", ""))
-            detail = name + "\n" + lifecycle
-            if provider:
-                detail += " · " + provider
-            await view.append(ListItem(Label(detail)))
+        active_index: int | None = None
+        for index, session in enumerate(visible):
+            session_id = str(session.get("session_id", ""))
+            classes = ""
+            if session_id == self.session_id:
+                classes = "active-session"
+                active_index = index
+            await view.append(
+                ListItem(
+                    Label(_session_list_label(session, self.session_id)),
+                    classes=classes,
+                )
+            )
+        if active_index is not None:
+            view.index = active_index
+        heading = "SESSIONS · " + self._session_filter.upper()
+        self.query_one("#session-heading", Label).update(heading)
+        help_text = "↑↓ select · Enter open"
+        if hidden_count:
+            help_text += (
+                "\n"
+                + str(hidden_count)
+                + " hidden · /sessions all"
+            )
+        else:
+            help_text += "\n/sessions focused"
+        self.query_one("#sessions-help", Static).update(help_text)
 
     async def _poll(self) -> None:
         if not self._screen_is_running() or not self.session_id:
@@ -614,6 +834,7 @@ class HarnessApp(App[None]):
             return
         session = _object(state.get("session"))
         self._session = session
+        await self._synchronize_active_session(session)
         self._safety = _object(state.get("safety"))
         goal = state.get("goal")
         self._goal = None
@@ -637,6 +858,7 @@ class HarnessApp(App[None]):
             self._theme_poll = 0
         lifecycle = str(session.get("lifecycle", "starting"))
         attention = str(session.get("attention", "idle"))
+        display_lifecycle = _display_lifecycle(lifecycle, attention)
         provider = str(session.get("active_provider", ""))
         if not provider:
             provider = "automatic routing"
@@ -650,7 +872,7 @@ class HarnessApp(App[None]):
         )
         meta = (
             "[bold]"
-            + escape(lifecycle.upper())
+            + escape(display_lifecycle.upper())
             + "[/bold]"
             + "  ·  "
             + escape(attention)
@@ -676,16 +898,39 @@ class HarnessApp(App[None]):
         events = result.get("events", [])
         if not isinstance(events, list):
             return
-        transcript = self.query_one("#transcript", RichLog)
+        transcript_changed = False
         for event in events:
             if not isinstance(event, dict):
                 continue
             sequence = int(event.get("sequence", 0))
             self.sequence = max(self.sequence, sequence)
-            rendered = _render_event(event)
-            if rendered:
-                transcript.write(rendered)
+            self._transcript_events.append(event)
+            transcript_changed = True
+        if transcript_changed:
+            self._render_transcript()
         self._present_approval()
+
+    async def _synchronize_active_session(
+        self,
+        session: dict[str, Any],
+    ) -> None:
+        session_id = str(session.get("session_id", ""))
+        if not session_id:
+            return
+        replaced = False
+        for index, item in enumerate(self._sessions):
+            if str(item.get("session_id", "")) != session_id:
+                continue
+            if item != session:
+                self._sessions[index] = session
+                replaced = True
+            break
+        else:
+            self._sessions.insert(0, session)
+            replaced = True
+        if replaced:
+            self._session_list_signature = ""
+            await self._render_session_list()
 
     def _screen_is_running(self) -> bool:
         if not self.is_running:
@@ -732,7 +977,7 @@ class HarnessApp(App[None]):
                 "/v1/sessions/" + self.session_id + "/export",
                 payload={},
             )
-            self.query_one("#transcript", RichLog).write(
+            self._write_notice(
                 "[bold]Export[/bold] " + str(result.get("path", ""))
             )
             return
@@ -751,6 +996,32 @@ class HarnessApp(App[None]):
             await self._open_session(
                 str(session.get("session_id", ""))
             )
+            return
+        if command == "/sessions" and len(parts) == 2:
+            session_filter = parts[1].casefold()
+            if session_filter not in {"focused", "all"}:
+                self._write_notice(
+                    "[red]Sessions must be focused or all[/red]"
+                )
+                return
+            self._session_filter = session_filter
+            self._session_list_signature = ""
+            await self._render_session_list()
+            await self._save_ui_state(force=True)
+            return
+        if command == "/events" and len(parts) == 2:
+            value = parts[1].casefold()
+            if value not in {"on", "off"}:
+                self._write_notice("[red]Events must be on or off[/red]")
+                return
+            self._show_events = value == "on"
+            self._render_transcript()
+            await self._save_ui_state(force=True)
+            return
+        if command == "/sidebar" and parts[1:] == ["reset"]:
+            self._sidebar_width = SIDEBAR_DEFAULT_WIDTH
+            self._apply_sidebar_width()
+            await self._save_ui_state(force=True)
             return
         if command in {"/provider", "/model", "/effort", "/theme"}:
             if len(parts) != 2:
@@ -871,7 +1142,7 @@ class HarnessApp(App[None]):
                 payload={"decision": parts[2]},
             )
             return
-        self.query_one("#transcript", RichLog).write(
+        self._write_notice(
             "[red]Unknown harness command.[/red] Use /help."
         )
 
@@ -891,8 +1162,18 @@ class HarnessApp(App[None]):
         if not self.session_id:
             return
         composer = self.query_one("#composer", Input).value
-        if not force and composer == self._saved_composer:
-            return
+        if not force:
+            unchanged = (
+                composer == self._saved_composer
+                and self._sidebar_width == self._saved_sidebar_width
+                and self._session_filter == self._saved_session_filter
+                and self._show_events == self._saved_show_events
+            )
+            if unchanged:
+                return
+        events_value = "off"
+        if self._show_events:
+            events_value = "on"
         await self.client.request(
             "PUT",
             "/v1/sessions/" + self.session_id + "/ui-state",
@@ -902,9 +1183,15 @@ class HarnessApp(App[None]):
                 "model": self._model_override,
                 "effort": self._effort_override,
                 "theme": self._theme_preference,
+                "sidebar_width": str(self._sidebar_width),
+                "session_filter": self._session_filter,
+                "events": events_value,
             },
         )
         self._saved_composer = composer
+        self._saved_sidebar_width = self._sidebar_width
+        self._saved_session_filter = self._session_filter
+        self._saved_show_events = self._show_events
 
     async def _load_providers(self) -> None:
         try:
@@ -958,15 +1245,44 @@ class HarnessApp(App[None]):
             limits = _object(envelope.get("limits"))
             accounting = "estimated"
             if bool(consumption.get("exact_tokens", False)):
-                accounting = "exact"
+                accounting = "provider-reported"
+            lines.append(
+                "State      "
+                + escape(str(envelope.get("state", "")))
+            )
+            if "input_tokens" in consumption:
+                lines.append(
+                    "Input      "
+                    + _format_number(consumption.get("input_tokens", 0))
+                )
+                cached_tokens = int(
+                    consumption.get("cached_input_tokens", 0)
+                )
+                if cached_tokens:
+                    lines[-1] += (
+                        " · "
+                        + _format_number(cached_tokens)
+                        + " cached"
+                    )
             lines.extend(
                 [
-                    "State      "
-                    + escape(str(envelope.get("state", ""))),
-                    "Tokens     "
-                    + escape(str(consumption.get("total_tokens", 0)))
+                    "Output     "
+                    + _format_number(
+                        consumption.get("output_tokens", 0)
+                    ),
+                    "Harness    "
+                    + _format_number(
+                        consumption.get("context_tokens", 0)
+                    )
+                    + " context est.",
+                    "Total      "
+                    + _format_number(
+                        consumption.get("total_tokens", 0)
+                    )
                     + " / "
-                    + escape(str(limits.get("max_total_tokens", 0))),
+                    + _format_number(
+                        limits.get("max_total_tokens", 0)
+                    ),
                     "Time       "
                     + escape(
                         str(round(float(
@@ -1035,6 +1351,7 @@ class HarnessApp(App[None]):
                 "[bold cyan]SHORTCUTS[/bold cyan]",
                 "Ctrl+B  sessions",
                 "Ctrl+O  inspector",
+                "Ctrl+Shift+←/→  resize sessions",
                 "Ctrl+K  checkpoint",
                 "F1      command help",
             ]
@@ -1044,7 +1361,7 @@ class HarnessApp(App[None]):
         )
 
     def _write_help(self) -> None:
-        self.query_one("#transcript", RichLog).write(
+        self._write_notice(
             "\n[bold cyan]HARNESS COMMANDS[/bold cyan]\n"
             "[bold]Session[/bold]  /new · /checkpoint · "
             "/fork [name] · /export\n"
@@ -1053,7 +1370,10 @@ class HarnessApp(App[None]):
             "[bold]Route[/bold]    /provider <auto|claude|codex> · "
             "/model <auto|id>\n"
             "         /effort <auto|level> · /route · /providers\n"
-            "[bold]Display[/bold]  /theme <system|light|dark>\n"
+            "[bold]Display[/bold]  /theme <system|light|dark> · "
+            "/sessions <focused|all>\n"
+            "         /events <on|off> · /sidebar reset · "
+            "Ctrl+Shift+←/→ resize\n"
             "[bold]Safety[/bold]   /usage · /budget · "
             "/budget extend <seconds> <tokens> <reason> · "
             "/budget xhigh <reason>\n"
@@ -1079,6 +1399,40 @@ class HarnessApp(App[None]):
             self.screen.add_class("narrow")
         else:
             self.screen.remove_class("narrow")
+
+    def _apply_sidebar_width(self) -> None:
+        sidebar = self.query_one("#sidebar", Vertical)
+        sidebar.styles.width = self._bounded_sidebar_width(
+            self._sidebar_width
+        )
+
+    def _bounded_sidebar_width(self, width: int) -> int:
+        reserve = SIDEBAR_MAIN_RESERVE
+        if self.size.width >= 118 and self._inspector_requested:
+            reserve += 36
+        maximum = self.size.width - reserve - 1
+        if maximum < SIDEBAR_MIN_WIDTH:
+            maximum = SIDEBAR_MIN_WIDTH
+        if width < SIDEBAR_MIN_WIDTH:
+            return SIDEBAR_MIN_WIDTH
+        if width > maximum:
+            return maximum
+        return width
+
+    def _resize_sidebar_to(self, width: int) -> None:
+        self._sidebar_width = self._bounded_sidebar_width(width)
+        self._apply_sidebar_width()
+
+    def _finish_sidebar_resize(self) -> None:
+        self.run_worker(
+            self._save_ui_state(force=True),
+            group="sidebar-ui-state",
+            exclusive=True,
+        )
+
+    def _adjust_sidebar_width(self, delta: int) -> None:
+        self._resize_sidebar_to(self._sidebar_width + delta)
+        self._finish_sidebar_resize()
 
     async def _sync_system_theme(self, *, force: bool = False) -> None:
         if self._theme_preference == "dark":
@@ -1162,25 +1516,89 @@ class HarnessApp(App[None]):
             )
         await self._poll()
 
+    def _render_transcript(self) -> None:
+        transcript = self.query_one("#transcript", ConversationLog)
+        transcript.clear()
+        transcript.write(self._welcome_message())
+        for rendered in _render_transcript_events(
+            self._transcript_events,
+            show_events=self._show_events,
+        ):
+            transcript.write(rendered)
+        for notice in self._transcript_notices:
+            transcript.write(notice)
+
     def _write_notice(self, value: str) -> None:
-        self.query_one("#transcript", RichLog).write(value)
+        self._transcript_notices.append(value)
+        self._render_transcript()
 
 
-def _render_event(event: dict[str, Any]) -> str:
-    event_type = escape(str(event.get("event_type", "event")))
+def _render_transcript_events(
+    events: list[dict[str, Any]],
+    *,
+    show_events: bool,
+) -> list[str]:
+    final_turns = {
+        str(event.get("turn_id", ""))
+        for event in events
+        if event.get("event_type") == "agent.message"
+        and str(event.get("turn_id", ""))
+    }
+    live_deltas: dict[str, list[str]] = {}
+    for event in events:
+        if event.get("event_type") != "agent.message.delta":
+            continue
+        turn_id = str(event.get("turn_id", ""))
+        if turn_id in final_turns:
+            continue
+        live_deltas.setdefault(turn_id, []).append(
+            str(event.get("text", ""))
+        )
+    emitted_deltas: set[str] = set()
+    rendered: list[str] = []
+    for event in events:
+        event_type = str(event.get("event_type", ""))
+        if event_type == "agent.message.delta":
+            turn_id = str(event.get("turn_id", ""))
+            if turn_id in final_turns or turn_id in emitted_deltas:
+                continue
+            emitted_deltas.add(turn_id)
+            projected = dict(event)
+            projected["event_type"] = "agent.message"
+            projected["text"] = "".join(live_deltas.get(turn_id, []))
+            value = _render_event(projected, show_events=show_events)
+        else:
+            value = _render_event(event, show_events=show_events)
+        if value:
+            rendered.append(value)
+    return rendered
+
+
+def _render_event(
+    event: dict[str, Any],
+    *,
+    show_events: bool = False,
+) -> str:
+    event_type = str(event.get("event_type", "event"))
     text = escape(str(event.get("text", "")))
     if event_type in {"user.message", "user.steer"}:
-        return (
-            "\n[bold cyan]YOU[/bold cyan]\n" + text + "\n"
-        )
+        return "\n[bold cyan]YOU[/bold cyan]\n" + text + "\n"
     if event_type in {"agent.message", "agent.message.delta"}:
-        return (
-            "\n[bold green]AGENT[/bold green]\n" + text + "\n"
-        )
+        return "\n[bold green]AGENT[/bold green]\n" + text + "\n"
+    if event_type.casefold() in {
+        "tool.usermessage.started",
+        "tool.usermessage.completed",
+        "tool.user_message.started",
+        "tool.user_message.completed",
+    }:
+        return ""
     if event_type.startswith("tool."):
+        label = event_type.removeprefix("tool.").replace(".", " ")
+        if not text and not show_events:
+            return ""
         return (
-            "\n[bold yellow]"
-            + event_type.upper()
+            "\n[bold yellow]TOOL · "
+            + escape(label)
             + "[/bold yellow]\n"
             + text
             + "\n"
@@ -1207,15 +1625,116 @@ def _render_event(event: dict[str, Any]) -> str:
             + escape(str(metadata.get("action", "pause")))
             + "\n"
         )
-    if event_type in {
-        "routing.selected",
-        "routing.failover",
-        "checkpoint.created",
-        "goal.completed",
-        "turn.failed",
+    metadata = _object(event.get("metadata"))
+    if event_type == "routing.selected":
+        provider = str(metadata.get("provider", "provider"))
+        model = str(metadata.get("model", "default"))
+        return (
+            "[dim]Routed to "
+            + escape(provider)
+            + " · "
+            + escape(model)
+            + "[/dim]"
+        )
+    if event_type == "routing.failover":
+        provider = str(metadata.get("excluded_provider", "provider"))
+        return "[dim]Failing over from " + escape(provider) + "[/dim]"
+    if event_type == "checkpoint.created":
+        return "[dim]Checkpoint saved[/dim]"
+    if event_type == "goal.completed":
+        return "[dim]Goal completed[/dim]"
+    if event_type == "turn.failed":
+        return "[bold red]Turn failed[/bold red]\n" + text
+    if show_events and event_type not in {
+        "usage.updated",
+        "usage.reserved",
     }:
-        return "[dim]" + event_type + " " + text + "[/dim]"
+        return "[dim]EVENT · " + escape(event_type) + "[/dim]"
     return ""
+
+
+def _visible_sessions(
+    sessions: list[dict[str, Any]],
+    active_session_id: str,
+    *,
+    show_all: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    if show_all:
+        return (list(sessions), 0)
+    visible: list[dict[str, Any]] = []
+    idle_sessions = 0
+    for session in sessions:
+        session_id = str(session.get("session_id", ""))
+        attention = str(session.get("attention", "idle"))
+        lifecycle = str(session.get("lifecycle", ""))
+        important = (
+            session_id == active_session_id
+            or attention != "idle"
+            or lifecycle == "paused"
+        )
+        if important:
+            visible.append(session)
+            continue
+        if lifecycle not in {"starting", "running"}:
+            continue
+        if idle_sessions >= FOCUSED_IDLE_SESSION_LIMIT:
+            continue
+        visible.append(session)
+        idle_sessions += 1
+    return (visible, len(sessions) - len(visible))
+
+
+def _session_list_label(
+    session: dict[str, Any],
+    active_session_id: str,
+) -> str:
+    session_id = str(session.get("session_id", ""))
+    marker = "  "
+    if session_id == active_session_id:
+        marker = "● "
+    name = str(session.get("name", "Untitled session"))
+    provider = str(session.get("active_provider", ""))
+    lifecycle = str(session.get("lifecycle", "starting"))
+    attention = str(session.get("attention", "idle"))
+    status = _session_status(lifecycle, attention)
+    detail = marker + escape(name) + "\n  " + escape(status)
+    if provider:
+        detail += " · " + escape(provider)
+    return detail
+
+
+def _session_status(lifecycle: str, attention: str) -> str:
+    if attention == "working":
+        return "working"
+    if attention in {"needs-input", "needs-reconciliation"}:
+        return "action needed"
+    if attention == "failed":
+        return "needs attention"
+    return _display_lifecycle(lifecycle, attention)
+
+
+def _display_lifecycle(lifecycle: str, attention: str) -> str:
+    if attention == "idle" and lifecycle in {"starting", "running"}:
+        return "ready"
+    return lifecycle.replace("-", " ")
+
+
+def _positive_integer(value: object) -> int | None:
+    try:
+        result = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    if result <= 0:
+        return None
+    return result
+
+
+def _format_number(value: object) -> str:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return escape(str(value))
+    return f"{number:,}"
 
 
 def _status_glyph(attention: str) -> str:

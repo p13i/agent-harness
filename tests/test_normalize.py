@@ -100,6 +100,11 @@ def test_codex_protocol_surface_normalizes() -> None:
             "tool.mcp_call.started",
         ),
         (
+            "item/started",
+            {"item": {"type": "userMessage", "text": "prompt"}},
+            "provider.event",
+        ),
+        (
             "item/agentMessage/delta",
             {"delta": "stream"},
             "agent.message.delta",

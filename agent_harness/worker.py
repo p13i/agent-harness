@@ -13,7 +13,6 @@ from typing import Any
 
 from agent_harness.blobs import BlobStore
 from agent_harness.context import compile_context
-from agent_harness.context import workspace_instructions
 from agent_harness.errors import HarnessError
 from agent_harness.errors import ProviderExhaustedError
 from agent_harness.errors import ProviderUnavailableError
@@ -118,11 +117,15 @@ class SessionWorker:
                 continue
             command = self.store.claim_command(self.session_id)
             if command is None:
-                self.store.update_session(
-                    self.session_id,
-                    lifecycle=Lifecycle.RUNNING,
-                    attention=Attention.IDLE,
-                )
+                if (
+                    session.lifecycle != Lifecycle.RUNNING
+                    or session.attention != Attention.IDLE
+                ):
+                    self.store.update_session(
+                        self.session_id,
+                        lifecycle=Lifecycle.RUNNING,
+                        attention=Attention.IDLE,
+                    )
                 await asyncio.sleep(0.2)
                 continue
             if command.command_type == "message":
@@ -953,9 +956,6 @@ class SessionWorker:
             self.store.events(self.session_id, limit=5000),
             goal=goal,
             evidence=evidence,
-            instructions=workspace_instructions(
-                Path(session.worktree)
-            ),
             workspace_summary=summary,
             max_input_tokens=(
                 limits.max_context_tokens

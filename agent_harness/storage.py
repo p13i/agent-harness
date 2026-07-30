@@ -1149,6 +1149,8 @@ class StateStore:
         now = utc_now()
         consumption = {
             "context_tokens": 0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
             "output_tokens": 0,
             "total_tokens": 0,
             "tool_calls": 0,

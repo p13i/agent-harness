@@ -4,10 +4,21 @@ from pathlib import Path
 import pytest
 from textual.containers import Vertical
 from textual.widgets import Input
+from textual.widgets import ListView
 from textual.widgets import Static
 
+from agent_harness.tui import ConversationLog
 from agent_harness.tui import HarnessApp
+from agent_harness.tui import _display_lifecycle
 from agent_harness.tui import _native_command
+from agent_harness.tui import _render_transcript_events
+from agent_harness.tui import _visible_sessions
+
+
+def test_idle_session_lifecycle_is_presented_as_ready() -> None:
+    assert _display_lifecycle("starting", "idle") == "ready"
+    assert _display_lifecycle("running", "idle") == "ready"
+    assert _display_lifecycle("starting", "working") == "starting"
 
 
 class Client:
@@ -15,6 +26,11 @@ class Client:
         self.theme = theme
         self.ui_updates = []
         self.requests = []
+        self.ui_state = {
+            "composer": "unfinished",
+            "provider": "codex",
+            "theme": self.theme,
+        }
 
     async def request(
         self,
@@ -24,11 +40,15 @@ class Client:
         payload=None,
         idempotency_key: str = "",
     ):
-        del method
         del idempotency_key
         self.requests.append((path, payload))
-        if payload is not None and path.endswith("/ui-state"):
+        if (
+            method == "PUT"
+            and payload is not None
+            and path.endswith("/ui-state")
+        ):
             self.ui_updates.append(payload)
+            self.ui_state = dict(payload)
         if path == "/v1/sessions":
             return {
                 "sessions": [
@@ -41,13 +61,7 @@ class Client:
                 ]
             }
         if path.endswith("/ui-state"):
-            return {
-                "ui_state": {
-                    "composer": "unfinished",
-                    "provider": "codex",
-                    "theme": self.theme,
-                }
-            }
+            return {"ui_state": dict(self.ui_state)}
         if path.startswith("/v1/providers"):
             return {
                 "providers": {
@@ -92,8 +106,12 @@ class Client:
                             },
                             "consumption": {
                                 "total_tokens": 1200,
+                                "input_tokens": 1120,
+                                "cached_input_tokens": 100,
+                                "context_tokens": 800,
                                 "elapsed_seconds": 12.4,
                                 "tool_calls": 3,
+                                "output_tokens": 80,
                                 "exact_tokens": False,
                             },
                         }
@@ -131,10 +149,94 @@ def test_textual_workspace_restores_draft_and_inspector(
             assert "codex" in str(inspector.render())
             assert "SAFETY ENVELOPE" in str(inspector.render())
             assert "interactive" in str(inspector.render())
-            assert "1200 / 300000" in str(inspector.render())
+            assert "1,200 / 300,000" in str(inspector.render())
+            assert "1,120 · 100 cached" in str(inspector.render())
+            assert "800 context est." in str(inspector.render())
             assert "estimated" in str(inspector.render())
+            session_list = app.query_one("#session-list", ListView)
+            assert session_list.children[0].has_class("active-session")
 
     asyncio.run(scenario())
+
+
+def test_transcript_reconciles_streaming_and_hides_protocol_noise() -> None:
+    events = [
+        {
+            "sequence": 1,
+            "event_type": "tool.userMessage.started",
+            "text": "",
+            "turn_id": "turn-1",
+        },
+        {
+            "sequence": 2,
+            "event_type": "agent.message.delta",
+            "text": "Hi",
+            "turn_id": "turn-1",
+        },
+        {
+            "sequence": 3,
+            "event_type": "agent.message.delta",
+            "text": "!",
+            "turn_id": "turn-1",
+        },
+        {
+            "sequence": 4,
+            "event_type": "agent.message",
+            "text": "Hi!",
+            "turn_id": "turn-1",
+        },
+    ]
+
+    rendered = _render_transcript_events(events, show_events=False)
+
+    assert len(rendered) == 1
+    assert rendered[0].count("AGENT") == 1
+    assert "Hi!" in rendered[0]
+    assert "USERMESSAGE" not in rendered[0]
+
+
+def test_focused_sessions_keep_attention_and_bound_idle_clutter() -> None:
+    sessions = []
+    for index in range(9):
+        sessions.append(
+            {
+                "session_id": "session-" + str(index),
+                "lifecycle": "running",
+                "attention": "idle",
+            }
+        )
+    sessions.append(
+        {
+            "session_id": "paused",
+            "lifecycle": "paused",
+            "attention": "needs-input",
+        }
+    )
+    sessions.append(
+        {
+            "session_id": "stopped",
+            "lifecycle": "stopped",
+            "attention": "idle",
+        }
+    )
+
+    visible, hidden = _visible_sessions(
+        sessions,
+        "session-8",
+        show_all=False,
+    )
+
+    assert {item["session_id"] for item in visible} >= {
+        "session-8",
+        "paused",
+    }
+    assert len(visible) == 7
+    assert hidden == 4
+    assert _visible_sessions(
+        sessions,
+        "session-8",
+        show_all=True,
+    ) == (sessions, 0)
 
 
 def test_textual_workspace_theme_and_responsive_visual_contract(
@@ -164,6 +266,9 @@ def test_textual_workspace_theme_and_responsive_visual_contract(
             await pilot.pause()
             light_svg = app.export_screenshot()
             assert light_svg != dark_svg
+            assert "#ffffff" in light_svg
+            assert "#bae6fd" in light_svg
+            assert "#0369a1" in light_svg
             assert app.screen.has_class("light")
             assert client.ui_updates[-1]["theme"] == "light"
 
@@ -176,6 +281,84 @@ def test_textual_workspace_theme_and_responsive_visual_contract(
             await pilot.pause()
             assert app.screen.has_class("narrow")
             assert not app.query_one("#sidebar", Vertical).display
+
+    asyncio.run(scenario())
+
+
+def test_sidebar_resize_is_keyboard_pointer_and_resume_persistent(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client = Client()
+        app = HarnessApp(
+            client,
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            sidebar = app.query_one("#sidebar", Vertical)
+            initial_width = sidebar.outer_size.width
+
+            await pilot.press("ctrl+shift+right")
+            await pilot.pause()
+            assert sidebar.outer_size.width == initial_width + 4
+
+            await pilot.mouse_down(
+                "#sidebar-resize-handle",
+                offset=(0, 5),
+            )
+            await pilot.mouse_up(offset=(48, 8))
+            await pilot.pause()
+            assert app._sidebar_width == 48
+            assert sidebar.outer_size.width == 48
+            assert client.ui_updates[-1]["sidebar_width"] == "48"
+
+        restored = HarnessApp(
+            client,
+            tmp_path,
+            session_id="session-1",
+        )
+        async with restored.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            assert restored.query_one(
+                "#sidebar",
+                Vertical,
+            ).outer_size.width == 48
+
+            await restored._slash("/sidebar reset")
+            await pilot.pause()
+            assert restored.query_one(
+                "#sidebar",
+                Vertical,
+            ).outer_size.width == 31
+
+    asyncio.run(scenario())
+
+
+def test_short_transcript_is_anchored_above_composer(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        app = HarnessApp(
+            Client(),
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            transcript = app.query_one("#transcript", ConversationLog)
+            assert len(transcript.lines) < (
+                transcript.scrollable_content_region.height
+            )
+            assert transcript.render_line(0).text.strip() == ""
+            padding = (
+                transcript.scrollable_content_region.height
+                - len(transcript.lines)
+            )
+            assert "Durable session ready" in (
+                transcript.render_line(padding).text
+            )
 
     asyncio.run(scenario())
 

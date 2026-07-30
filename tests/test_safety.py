@@ -186,7 +186,11 @@ def test_guard_shares_context_and_usage_across_attempts() -> None:
     )
 
     assert guard.violation() == "output-tokens"
-    assert guard.snapshot()["consumption"]["exact_tokens"] is True
+    consumption = guard.snapshot()["consumption"]
+    assert consumption["exact_tokens"] is True
+    assert consumption["input_tokens"] == 15_000
+    assert consumption["cached_input_tokens"] == 0
+    assert consumption["output_tokens"] == 6_000
 
 
 def test_guard_trips_repeated_tool_pair() -> None:

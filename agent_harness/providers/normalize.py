@@ -189,6 +189,8 @@ def _codex_item(
         if not text:
             return []
         return [ProviderEvent("agent.message", text=text, raw=raw)]
+    if item_type in {"user_message", "userMessage"}:
+        return [ProviderEvent("provider.event", raw=raw)]
     if item_type in {"command_execution", "commandExecution"}:
         command = payload_text(item.get("command"))
         output = payload_text(item.get("aggregated_output"))
@@ -338,4 +340,3 @@ def _selected(
         if field in value:
             result[field] = value[field]
     return result
-

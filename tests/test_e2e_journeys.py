@@ -6,10 +6,12 @@ import asyncio
 from collections.abc import Callable
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import agent_harness.safety as safety_module
 from agent_harness.blobs import BlobStore
 from agent_harness.config import paths
 from agent_harness.config import prepare_paths
@@ -30,6 +32,17 @@ from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
 from agent_harness.worker import SessionWorker
 from tests.test_support import session
+
+
+@pytest.fixture(autouse=True)
+def stable_state_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        safety_module.shutil,
+        "disk_usage",
+        lambda unused: SimpleNamespace(free=10 * 1024**3),
+    )
 
 
 class ScriptedAdapter(ProviderAdapter):
@@ -320,6 +333,11 @@ async def test_e2e_provider_resume_and_cross_provider_continuity(
     rig = JourneyRig(tmp_path)
     rig.prime_capacity()
     try:
+        instructions = Path(rig.session.worktree) / "AGENTS.md"
+        instructions.write_text(
+            "UNIQUE_PROVIDER_NATIVE_INSTRUCTION",
+            encoding="utf-8",
+        )
         first = await rig.message("Implement the parser.", provider="codex")
         second = await rig.message("Now add tests.", provider="codex")
         third = await rig.message(
@@ -334,14 +352,50 @@ async def test_e2e_provider_resume_and_cross_provider_continuity(
         assert second.status == "complete"
         assert third.status == "complete"
         assert codex.native_inputs == ["", "codex-native-session"]
+        assert "UNIQUE_PROVIDER_NATIVE_INSTRUCTION" not in codex.prompts[0]
         assert codex.prompts[1] == "Now add tests."
         assert claude.native_inputs == [""]
         assert "# Harness session" in claude.prompts[0]
         assert "Implement the parser." in claude.prompts[0]
         assert "codex completed the turn" in claude.prompts[0]
         assert "# Next instruction" in claude.prompts[0]
+        assert "UNIQUE_PROVIDER_NATIVE_INSTRUCTION" not in claude.prompts[0]
         assert len(rig.store.checkpoints(rig.session.session_id)) == 3
     finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_worker_does_not_reorder_session_history(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    before = rig.store.get_session(rig.session.session_id).updated_at
+    worker_task = asyncio.create_task(rig.worker.run())
+    try:
+        await asyncio.sleep(0.35)
+        first_idle = rig.store.get_session(
+            rig.session.session_id
+        ).updated_at
+        await asyncio.sleep(0.35)
+        second_idle = rig.store.get_session(
+            rig.session.session_id
+        ).updated_at
+
+        assert first_idle == before
+        assert second_idle == first_idle
+
+        stopped = rig.store.enqueue_command(
+            rig.session.session_id,
+            "stop",
+            {},
+            new_uuid(),
+        )
+        await asyncio.wait_for(worker_task, timeout=2)
+        assert rig.store.get_command(stopped.command_id).status == "complete"
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()
         rig.close()
 
 

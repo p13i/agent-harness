@@ -47,6 +47,8 @@ class SafetyLimits:
 @dataclass
 class SafetyConsumption:
     context_tokens: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
     tool_calls: int = 0
@@ -298,6 +300,8 @@ class TurnGuard:
         self._warning_sent = False
         self._attempt_estimated_total = 0
         self._attempt_estimated_output = 0
+        self._attempt_exact_input = 0
+        self._attempt_exact_cached_input = 0
 
     def begin_attempt(self, context_tokens: int) -> str:
         self.consumption.attempts += 1
@@ -305,6 +309,8 @@ class TurnGuard:
         self.consumption.context_tokens += submitted
         self._attempt_estimated_total = submitted
         self._attempt_estimated_output = 0
+        self._attempt_exact_input = 0
+        self._attempt_exact_cached_input = 0
         self._refresh_total()
         return self.violation()
 
@@ -409,6 +415,18 @@ class TurnGuard:
             + int(normalized["output_tokens"])
             - self._attempt_estimated_output,
         )
+        self.consumption.input_tokens = max(
+            0,
+            self.consumption.input_tokens
+            + int(normalized["input_tokens"])
+            - self._attempt_exact_input,
+        )
+        self.consumption.cached_input_tokens = max(
+            0,
+            self.consumption.cached_input_tokens
+            + int(normalized["cached_input_tokens"])
+            - self._attempt_exact_cached_input,
+        )
         provider_total = int(normalized["total_tokens"])
         self.consumption.total_tokens = max(
             0,
@@ -420,6 +438,10 @@ class TurnGuard:
             normalized["output_tokens"]
         )
         self._attempt_estimated_total = provider_total
+        self._attempt_exact_input = int(normalized["input_tokens"])
+        self._attempt_exact_cached_input = int(
+            normalized["cached_input_tokens"]
+        )
         self.consumption.exact_tokens = True
 
     def _refresh_total(self) -> None:

@@ -15,6 +15,17 @@ from agent_harness.errors import SafetyGuardError
 from agent_harness.service import HarnessService
 
 
+@pytest.fixture(autouse=True)
+def stable_state_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        safety_module.shutil,
+        "disk_usage",
+        lambda unused: SimpleNamespace(free=10 * 1024**3),
+    )
+
+
 class Workers:
     def __init__(self) -> None:
         self.started: list[str] = []
@@ -384,7 +395,10 @@ async def test_api_creates_session_and_accepts_message(
             headers=headers,
             json={
                 "composer": "unfinished message",
+                "events": "off",
                 "provider": "codex",
+                "session_filter": "focused",
+                "sidebar_width": "48",
             },
         )
         assert saved_ui.status == 200
@@ -394,7 +408,10 @@ async def test_api_creates_session_and_accepts_message(
         )
         assert (await restored_ui.json())["ui_state"] == {
             "composer": "unfinished message",
+            "events": "off",
             "provider": "codex",
+            "session_filter": "focused",
+            "sidebar_width": "48",
         }
 
         checkpoint = await client.post(
@@ -461,6 +478,98 @@ async def test_api_creates_session_and_accepts_message(
             },
         )
         assert finalized.status == 200
+    finally:
+        await client.close()
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_new_chat_is_named_from_prompt_and_inherits_workspace_ui(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    repository(workspace)
+    workers = Workers()
+    service = HarnessService(
+        paths(tmp_path / "state"),
+        worker_manager=workers,
+    )
+    app = create_app(service, "test-token")
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    headers = {"Authorization": "Bearer test-token"}
+    try:
+        first_response = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"workspace": str(workspace)},
+        )
+        first = (await first_response.json())["session"]
+        await client.put(
+            "/v1/sessions/" + first["session_id"] + "/ui-state",
+            headers=headers,
+            json={
+                "events": "off",
+                "session_filter": "focused",
+                "sidebar_width": "52",
+                "theme": "system",
+            },
+        )
+
+        second_response = await client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"workspace": str(workspace)},
+        )
+        second = (await second_response.json())["session"]
+        inherited = await client.get(
+            "/v1/sessions/" + second["session_id"] + "/ui-state",
+            headers=headers,
+        )
+        assert (await inherited.json())["ui_state"] == {
+            "events": "off",
+            "session_filter": "focused",
+            "sidebar_width": "52",
+            "theme": "system",
+        }
+
+        message = await client.post(
+            "/v1/sessions/" + second["session_id"] + "/messages",
+            headers={
+                **headers,
+                "Idempotency-Key": "name-session",
+            },
+            json={
+                "text": (
+                    "Investigate the provider routing regression "
+                    "and repair its tests."
+                )
+            },
+        )
+        assert message.status == 202
+        detail = await client.get(
+            "/v1/sessions/" + second["session_id"],
+            headers=headers,
+        )
+        assert (await detail.json())["session"]["name"] == (
+            "Investigate the provider routing regression and repair "
+            "its tests."
+        )
+
+        legacy = service.create_session(
+            {"workspace": str(workspace)}
+        )
+        service.store.append_event(
+            legacy.session_id,
+            "user.message",
+            role="user",
+            text="Resume the durable migration.",
+            status="accepted",
+        )
+        service.recover_workers()
+        assert service.store.get_session(legacy.session_id).name == (
+            "Resume the durable migration."
+        )
     finally:
         await client.close()
         service.close()
