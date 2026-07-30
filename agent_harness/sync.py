@@ -199,6 +199,7 @@ def _sync_locked(
             "origin",
             "HEAD:main",
             check=False,
+            timeout=180,
         )
         if pushed.returncode == 0:
             return _write_status(
@@ -279,17 +280,23 @@ def _git(
     root: Path,
     *arguments: str,
     check: bool = True,
+    timeout: int = 30,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment["GIT_TERMINAL_PROMPT"] = "0"
-    completed = subprocess.run(
-        ["git", "-C", str(root), *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-        env=environment,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            "chat repository Git operation timed out"
+        ) from error
     if check and completed.returncode != 0:
         raise RuntimeError("chat repository Git operation failed")
     return completed

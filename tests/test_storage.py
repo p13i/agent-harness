@@ -442,6 +442,7 @@ def test_portable_records_reject_missing_blobs_and_bad_documents(
 
 def test_sync_status_and_unreachable_remote_fail_closed(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness_paths = paths(tmp_path / "chats")
     prepare_paths(harness_paths)
@@ -463,6 +464,15 @@ def test_sync_status_and_unreachable_remote_fail_closed(
     assert result["state"] == "pending"
     assert result["detail"] == "git-fetch"
     store.close()
+
+    def time_out(*unused_args, **unused_kwargs):
+        del unused_args
+        del unused_kwargs
+        raise subprocess.TimeoutExpired(["git"], 1)
+
+    monkeypatch.setattr(sync_module.subprocess, "run", time_out)
+    with pytest.raises(RuntimeError, match="timed out"):
+        sync_module._git(tmp_path, "status")
 
 
 def test_runtime_state_is_cleared_and_worktrees_are_rewritten(
