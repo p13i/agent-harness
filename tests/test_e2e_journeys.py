@@ -265,6 +265,55 @@ class JourneyRig:
 
 
 @pytest.mark.asyncio
+async def test_e2e_paused_session_resumes_and_stops(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.store.update_session(
+        rig.session.session_id,
+        lifecycle="paused",
+        attention="idle",
+    )
+    resumed = rig.store.enqueue_command(
+        rig.session.session_id,
+        "resume",
+        {},
+        new_uuid(),
+    )
+    worker_task = asyncio.create_task(rig.worker.run())
+    try:
+        for unused in range(100):
+            del unused
+            current = rig.store.get_command(resumed.command_id)
+            if current.status == "complete":
+                break
+            await asyncio.sleep(0.01)
+        assert current.status == "complete"
+        assert (
+            rig.store.get_session(rig.session.session_id).lifecycle
+            == "running"
+        )
+
+        stopped = rig.store.enqueue_command(
+            rig.session.session_id,
+            "stop",
+            {},
+            new_uuid(),
+        )
+        await asyncio.wait_for(worker_task, timeout=2)
+
+        assert rig.store.get_command(stopped.command_id).status == "complete"
+        assert (
+            rig.store.get_session(rig.session.session_id).lifecycle
+            == "stopped"
+        )
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_provider_resume_and_cross_provider_continuity(
     tmp_path: Path,
 ) -> None:

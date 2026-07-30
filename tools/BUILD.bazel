@@ -25,6 +25,7 @@ py_binary(
 py_binary(
     name = "live_smoke",
     srcs = ["live_smoke.gpt.py"],
+    data = ["//cmd:agent-harness"],
     main = "live_smoke.gpt.py",
     deps = ["//agent_harness"],
 )
@@ -32,8 +33,15 @@ py_binary(
 py_test(
     name = "live_smoke_test",
     srcs = ["live_smoke_test.gpt.py"],
-    data = [":live_smoke"],
+    data = [
+        ":live_smoke",
+        "live_smoke.gpt.py",
+    ],
     main = "live_smoke_test.gpt.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
 )
 
 py_test(

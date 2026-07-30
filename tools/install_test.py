@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from tools.install import install
 from tools.install import launcher
 
@@ -17,3 +19,7 @@ def test_launcher_is_pinned_to_bazel_and_repo(
     assert content == launcher(repo)
     assert "@bazel/bazelisk" in content
     assert "//cmd:agent-harness" in content
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

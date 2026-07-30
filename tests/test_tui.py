@@ -215,6 +215,22 @@ def test_system_theme_tracks_host_appearance(
     asyncio.run(scenario())
 
 
+def test_poll_after_textual_teardown_is_noop(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        app = HarnessApp(
+            Client(),
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+        await app._poll()
+
+    asyncio.run(scenario())
+
+
 def test_native_attachment_uses_pinned_provider_packages() -> None:
     assert _native_command("codex", "full") == [
         "npx",

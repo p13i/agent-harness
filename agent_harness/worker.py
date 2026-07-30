@@ -40,12 +40,15 @@ from agent_harness.safety import apply_extension
 from agent_harness.safety import effective_effort
 from agent_harness.safety import limits_for
 from agent_harness.safety import lower_effort
+from agent_harness.safety import require_state_headroom
 from agent_harness.storage import StateStore
 from agent_harness.workspace import checkpoint_workspace
 from agent_harness.workspace import workspace_summary
 
 
-CONTROL_COMMANDS = frozenset({"interrupt", "pause", "stop", "steer"})
+CONTROL_COMMANDS = frozenset(
+    {"interrupt", "pause", "resume", "stop", "steer"}
+)
 
 
 class SessionWorker:
@@ -124,18 +127,6 @@ class SessionWorker:
                 continue
             if command.command_type == "message":
                 await self._message(command)
-                continue
-            if command.command_type == "resume":
-                self.store.update_session(
-                    self.session_id,
-                    lifecycle=Lifecycle.RUNNING,
-                    attention=Attention.IDLE,
-                )
-                self.store.resolve_command(
-                    command.command_id,
-                    CommandStatus.COMPLETE,
-                    {},
-                )
                 continue
             self.store.resolve_command(
                 command.command_id,
@@ -250,6 +241,13 @@ class SessionWorker:
             attention=Attention.WORKING,
         )
         try:
+            provider = str(payload.get("provider", "")).strip()
+            if not provider:
+                provider = "automatic-route"
+            require_state_headroom(
+                self.store.path.parent,
+                provider,
+            )
             result = await self._execute_with_failover(
                 command.command_id,
                 payload,
@@ -845,6 +843,12 @@ class SessionWorker:
             self.store.update_session(
                 self.session_id,
                 lifecycle=Lifecycle.PAUSED,
+                attention=Attention.IDLE,
+            )
+        elif command.command_type == "resume":
+            self.store.update_session(
+                self.session_id,
+                lifecycle=Lifecycle.RUNNING,
                 attention=Attention.IDLE,
             )
         elif command.command_type == "stop":

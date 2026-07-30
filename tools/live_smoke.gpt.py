@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -25,6 +26,13 @@ RESUME_PROMPT = (
 )
 
 
+def default_workspace() -> Path:
+    value = os.environ.get("BUILD_WORKING_DIRECTORY", "").strip()
+    if value:
+        return Path(value)
+    return Path.cwd()
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
@@ -33,7 +41,11 @@ def parser() -> argparse.ArgumentParser:
         )
     )
     value.add_argument("provider", choices=("claude", "codex"))
-    value.add_argument("--workspace", type=Path, default=Path.cwd())
+    value.add_argument(
+        "--workspace",
+        type=Path,
+        default=default_workspace(),
+    )
     value.add_argument("--state-dir", type=Path)
     value.add_argument(
         "--confirm-spend",

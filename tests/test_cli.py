@@ -14,6 +14,36 @@ from agent_harness.config import CONTROL_BUILD_ID
 from agent_harness.config import CONTROL_PROTOCOL_VERSION
 from agent_harness.config import paths as harness_paths_for
 from agent_harness.errors import HarnessError
+from agent_harness import runtime
+
+
+def test_launcher_prefers_current_source_build(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "agent-harness"
+    package = source_root / "agent_harness"
+    package.mkdir(parents=True)
+    launcher = source_root / "bazel-bin" / "cmd" / "agent-harness"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    stale_runfiles = tmp_path / "stale.runfiles"
+    stale_launcher = (
+        stale_runfiles / "_main" / "cmd" / "agent-harness"
+    )
+    stale_launcher.parent.mkdir(parents=True)
+    stale_launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    stale_launcher.chmod(0o755)
+
+    monkeypatch.setattr(
+        runtime,
+        "__file__",
+        str(package / "runtime.py"),
+    )
+    monkeypatch.setenv("RUNFILES_DIR", str(stale_runfiles))
+
+    assert runtime.launcher_command() == [str(launcher)]
 
 
 def test_chat_runs_textual_on_the_main_thread(

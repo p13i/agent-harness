@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from dataclasses import replace
 import hashlib
 import json
+from pathlib import Path
+import shutil
 import time
 from typing import Any
 
 from agent_harness.context import estimate_tokens
+from agent_harness.errors import SafetyGuardError
 from agent_harness.providers.base import ProviderEvent
 
 
@@ -18,6 +21,7 @@ INTERACTIVE = "interactive"
 UNATTENDED = "unattended"
 LIVE_SMOKE = "live-smoke"
 PROFILES = frozenset({INTERACTIVE, UNATTENDED, LIVE_SMOKE})
+MINIMUM_STATE_FREE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,23 @@ def validate_profile(value: str) -> str:
     if normalized not in PROFILES:
         raise ValueError("unsupported execution profile")
     return normalized
+
+
+def require_state_headroom(
+    path: Path,
+    provider: str,
+    *,
+    free_bytes: int | None = None,
+) -> int:
+    if free_bytes is None:
+        free_bytes = shutil.disk_usage(path).free
+    if free_bytes < MINIMUM_STATE_FREE_BYTES:
+        raise SafetyGuardError(
+            "state-volume-headroom",
+            provider,
+            recoverable=False,
+        )
+    return free_bytes
 
 
 def limits_for(profile: str, workload: str) -> SafetyLimits:
@@ -171,6 +192,7 @@ def lower_effort(value: str) -> str:
 
 
 def normalize_usage(value: object) -> dict[str, Any]:
+    value = _incremental_usage(value)
     totals = {
         "input_tokens": 0,
         "cached_input_tokens": 0,
@@ -184,6 +206,18 @@ def normalize_usage(value: object) -> dict[str, Any]:
         )
     totals["exact"] = totals["total_tokens"] > 0
     return totals
+
+
+def _incremental_usage(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    for raw_name, item in value.items():
+        name = str(raw_name).replace("-", "_").casefold()
+        if name in {"tokenusage", "token_usage"} and isinstance(item, dict):
+            last = item.get("last")
+            if isinstance(last, dict):
+                return last
+    return value
 
 
 def _collect_usage(value: object, totals: dict[str, int]) -> None:

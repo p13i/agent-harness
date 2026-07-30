@@ -1,10 +1,12 @@
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 from aiohttp.test_utils import TestClient
 from aiohttp.test_utils import TestServer
 import pytest
 
+import agent_harness.safety as safety_module
 from agent_harness.api import create_app
 from agent_harness.config import CONTROL_BUILD_ID
 from agent_harness.config import CONTROL_PROTOCOL_VERSION
@@ -300,6 +302,29 @@ async def test_api_creates_session_and_accepts_message(
         )
         assert missing_key.status == 400
         assert (await missing_key.json())["error"]["code"] == "E_INPUT"
+        with monkeypatch.context() as low_disk:
+            low_disk.setattr(
+                safety_module.shutil,
+                "disk_usage",
+                lambda unused: SimpleNamespace(free=0),
+            )
+            refused_message = await client.post(
+                "/v1/sessions/" + session_id + "/messages",
+                headers={
+                    **headers,
+                    "Idempotency-Key": "integration-low-disk",
+                },
+                json={
+                    "text": "must not be queued",
+                    "provider": "codex",
+                },
+            )
+            assert refused_message.status == 429
+            refused_value = await refused_message.json()
+            assert refused_value["error"]["code"] == "E_SAFETY_GUARD"
+            assert "state-volume-headroom" in (
+                refused_value["error"]["message"]
+            )
         accepted = await client.post(
             "/v1/sessions/" + session_id + "/messages",
             headers={
@@ -333,6 +358,13 @@ async def test_api_creates_session_and_accepts_message(
             json={},
         )
         assert paused.status == 202
+        service.store.update_session(
+            session_id,
+            lifecycle="paused",
+        )
+        workers.started.clear()
+        service.recover_workers()
+        assert workers.started == [session_id]
 
         configured = await client.patch(
             "/v1/sessions/" + session_id,

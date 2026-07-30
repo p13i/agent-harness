@@ -33,6 +33,7 @@ from agent_harness.scheduler import Scheduler
 from agent_harness.safety import UNATTENDED
 from agent_harness.safety import effective_effort
 from agent_harness.safety import limits_for
+from agent_harness.safety import require_state_headroom
 from agent_harness.safety import validate_profile
 from agent_harness.storage import StateStore
 from agent_harness.transfer import load_machine_keys
@@ -105,6 +106,7 @@ class HarnessService:
     def recover_workers(self) -> None:
         for session in self.store.list_sessions():
             if session.lifecycle not in {
+                Lifecycle.PAUSED,
                 Lifecycle.STARTING,
                 Lifecycle.RUNNING,
             }:
@@ -197,6 +199,10 @@ class HarnessService:
         idempotency_key: str,
     ) -> dict[str, Any]:
         require_uuid(session_id, "session_id")
+        provider = str(payload.get("provider", "")).strip()
+        if not provider:
+            provider = "automatic-route"
+        require_state_headroom(self.paths.state_dir, provider)
         text = str(payload.get("text", "")).strip()
         if not text:
             raise ValueError("message text is required")

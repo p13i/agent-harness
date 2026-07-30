@@ -8,6 +8,15 @@ import sys
 
 
 def launcher_command() -> list[str]:
+    source_root = Path(__file__).resolve().parent.parent
+    source_launcher = (
+        source_root / "bazel-bin" / "cmd" / "agent-harness"
+    )
+    if source_launcher.is_file() and os.access(
+        source_launcher,
+        os.X_OK,
+    ):
+        return [str(source_launcher)]
     runfiles_text = os.environ.get("RUNFILES_DIR", "")
     if runfiles_text:
         runfiles = Path(runfiles_text)

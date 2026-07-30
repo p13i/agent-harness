@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from agent_harness.errors import SafetyGuardError
 from agent_harness.providers.base import ProviderEvent
 from agent_harness.safety import INTERACTIVE
 from agent_harness.safety import LIVE_SMOKE
+from agent_harness.safety import MINIMUM_STATE_FREE_BYTES
 from agent_harness.safety import SafetyConsumption
 from agent_harness.safety import UNATTENDED
 from agent_harness.safety import TurnGuard
@@ -17,6 +20,7 @@ from agent_harness.safety import effective_effort
 from agent_harness.safety import limits_for
 from agent_harness.safety import lower_effort
 from agent_harness.safety import normalize_usage
+from agent_harness.safety import require_state_headroom
 from agent_harness.safety import validate_profile
 
 
@@ -59,6 +63,32 @@ def test_profiles_preserve_unattended_headroom() -> None:
     )
     with pytest.raises(ValueError, match="profile"):
         validate_profile("unbounded")
+
+
+def test_state_headroom_fails_closed_before_provider_use(
+    tmp_path: Path,
+) -> None:
+    available = MINIMUM_STATE_FREE_BYTES
+
+    assert (
+        require_state_headroom(
+            tmp_path,
+            "codex",
+            free_bytes=available,
+        )
+        == available
+    )
+    with pytest.raises(
+        SafetyGuardError,
+        match="state-volume-headroom",
+    ) as raised:
+        require_state_headroom(
+            tmp_path,
+            "claude",
+            free_bytes=available - 1,
+        )
+    assert raised.value.provider == "claude"
+    assert raised.value.recoverable is False
 
 
 def test_xhigh_requires_an_unattended_authorization() -> None:
@@ -110,6 +140,29 @@ def test_usage_normalization_accepts_both_provider_shapes() -> None:
         "cached_input_tokens": 1,
         "output_tokens": 3,
         "total_tokens": 5,
+        "exact": True,
+    }
+    incremental = normalize_usage(
+        {
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 18_527,
+                    "outputTokens": 11,
+                    "totalTokens": 18_538,
+                },
+                "total": {
+                    "inputTokens": 37_019,
+                    "outputTokens": 21,
+                    "totalTokens": 37_040,
+                },
+            }
+        }
+    )
+    assert incremental == {
+        "input_tokens": 18_527,
+        "cached_input_tokens": 0,
+        "output_tokens": 11,
+        "total_tokens": 18_538,
         "exact": True,
     }
 

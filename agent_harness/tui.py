@@ -12,10 +12,12 @@ from rich.markup import escape
 from textual import events
 from textual.app import App
 from textual.app import ComposeResult
+from textual.app import ScreenStackError
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.containers import Vertical
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Button
 from textual.widgets import Footer
 from textual.widgets import Input
@@ -374,6 +376,7 @@ class HarnessApp(App[None]):
         self._last_approval_id = ""
         self._provider_poll = 0
         self._theme_poll = 0
+        self._poll_timer: Timer | None = None
         self._theme_preference = "system"
         self._sidebar_requested = True
         self._inspector_requested = True
@@ -445,8 +448,14 @@ class HarnessApp(App[None]):
             await self._open_session(self.session_id)
         else:
             await self._new_session()
-        self.set_interval(0.5, self._poll)
+        self._poll_timer = self.set_interval(0.5, self._poll)
         self.query_one("#composer", Input).focus()
+
+    def on_unmount(self) -> None:
+        if self._poll_timer is None:
+            return
+        self._poll_timer.stop()
+        self._poll_timer = None
 
     def on_resize(self, event: events.Resize) -> None:
         self._apply_responsive_layout(event.size.width)
@@ -584,7 +593,7 @@ class HarnessApp(App[None]):
             await view.append(ListItem(Label(detail)))
 
     async def _poll(self) -> None:
-        if not self.session_id:
+        if not self._screen_is_running() or not self.session_id:
             return
         await self._save_ui_state()
         try:
@@ -600,6 +609,8 @@ class HarnessApp(App[None]):
                 + str(self.sequence),
             )
         except BaseException:
+            return
+        if not self._screen_is_running():
             return
         session = _object(state.get("session"))
         self._session = session
@@ -675,6 +686,14 @@ class HarnessApp(App[None]):
             if rendered:
                 transcript.write(rendered)
         self._present_approval()
+
+    def _screen_is_running(self) -> bool:
+        if not self.is_running:
+            return False
+        try:
+            return self.screen.is_running
+        except ScreenStackError:
+            return False
 
     async def _command(
         self,

@@ -82,3 +82,7 @@ def test_coverage_gate_rejects_invalid_or_missing_groups(
         )
         == 1
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
