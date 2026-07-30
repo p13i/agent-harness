@@ -417,7 +417,14 @@ def _message_exhausted(message: object) -> bool:
     if isinstance(message, RateLimitEvent):
         return message.rate_limit_info.status == "rejected"
     if isinstance(message, AssistantMessage):
-        return message.error == "rate_limit"
+        if message.error == "rate_limit":
+            return True
+        for block in message.content:
+            if not isinstance(block, TextBlock):
+                continue
+            if _looks_like_spend_limit(block.text):
+                return True
+        return False
     if isinstance(message, ResultMessage):
         if message.api_error_status in {429, 529}:
             return True
@@ -434,8 +441,23 @@ def _has_native_session(workspace: Path, session_id: str) -> bool:
 
 def _looks_exhausted(message: str) -> bool:
     lowered = message.casefold()
-    terms = ("rate limit", "usage limit", "quota", "capacity", "overage")
+    terms = (
+        "rate limit",
+        "usage limit",
+        "spend limit",
+        "quota",
+        "capacity",
+        "overage",
+    )
     return any(term in lowered for term in terms)
+
+
+def _looks_like_spend_limit(message: str) -> bool:
+    lowered = message.casefold()
+    return (
+        "monthly spend limit" in lowered
+        and "/usage-credits" in lowered
+    )
 
 
 def _bounded(value: str) -> str:

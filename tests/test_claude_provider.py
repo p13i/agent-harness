@@ -8,6 +8,7 @@ from claude_agent_sdk import ToolPermissionContext
 from agent_harness.providers.claude import CLAUDE_CODE_PACKAGE
 from agent_harness.providers.claude import NpxClaudeTransport
 from agent_harness.providers.claude import _approval_request
+from agent_harness.providers.claude import _message_exhausted
 from agent_harness.providers.claude import _message_events
 from agent_harness.providers.claude import _permission_result
 
@@ -92,3 +93,26 @@ def test_sdk_assistant_message_normalizes() -> None:
 
     assert events[0].event_type == "agent.message"
     assert events[0].text == "done"
+
+
+def test_monthly_spend_limit_requests_provider_failover() -> None:
+    message = AssistantMessage(
+        content=[
+            TextBlock(
+                text=(
+                    "You've hit your monthly spend limit. "
+                    "Run /usage-credits to manage your limit."
+                )
+            )
+        ],
+        model="fable",
+        session_id="native-session",
+    )
+    ordinary = AssistantMessage(
+        content=[TextBlock(text="The quota plan is healthy.")],
+        model="opus",
+        session_id="native-session",
+    )
+
+    assert _message_exhausted(message)
+    assert not _message_exhausted(ordinary)
