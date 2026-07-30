@@ -396,6 +396,12 @@ def test_portable_records_reject_missing_blobs_and_bad_documents(
     clean = StateStore(clean_paths.database)
     clean_session = session(tmp_path)
     clean.create_session(clean_session)
+    clean.record_context_delivery(
+        clean_session.session_id,
+        "codex",
+        "1" * 64,
+        "",
+    )
     published = publish_session(
         clean_paths,
         clean,

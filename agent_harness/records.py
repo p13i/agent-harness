@@ -117,31 +117,34 @@ def _table_rows(
     return result
 
 
-def _blob_digests(value: object) -> list[str]:
+def _blob_digests(record: dict[str, Any]) -> list[str]:
     found: set[str] = set()
-
-    def visit(item: object, field: str = "") -> None:
-        if isinstance(item, dict):
-            for name, child in item.items():
-                visit(child, str(name))
-            return
-        if isinstance(item, list):
-            for child in item:
-                visit(child, field)
-            return
-        if not field.endswith("digest"):
-            return
-        text = str(item)
-        if len(text) != 64:
-            return
-        try:
-            int(text, 16)
-        except ValueError:
-            return
-        found.add(text)
-
-    visit(value)
+    for event in _table_rows(record, "events"):
+        digest = str(event.get("blob_digest", ""))
+        if digest:
+            found.add(_require_blob_digest(digest))
+    for checkpoint in _table_rows(record, "checkpoints"):
+        for field in (
+            "patch_digest",
+            "untracked_digest",
+            "context_digest",
+        ):
+            digest = str(checkpoint.get(field, ""))
+            if digest:
+                found.add(_require_blob_digest(digest))
     return sorted(found)
+
+
+def _require_blob_digest(value: str) -> str:
+    if len(value) != 64:
+        raise ValueError("portable blob digest must be SHA-256")
+    try:
+        int(value, 16)
+    except ValueError as error:
+        raise ValueError(
+            "portable blob digest must be hexadecimal"
+        ) from error
+    return value
 
 
 def _blob_path(root: Path, digest: str) -> Path:
