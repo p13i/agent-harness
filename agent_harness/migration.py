@@ -140,11 +140,14 @@ def migrate_state(
                 source.logs,
                 destination.logs / "legacy",
             )
-            if not destination.token.exists():
-                _copy_tree_verified(
-                    source.secrets,
-                    destination.token.parent,
-                )
+            _copy_file_if_missing(
+                source.secrets / "api-token",
+                destination.token,
+            )
+            _copy_file_if_missing(
+                source.secrets / "machine-keys.json",
+                destination.machine_keys,
+            )
             _move_worktrees(
                 source_store,
                 source,
@@ -349,6 +352,17 @@ def _copy_tree_verified(source: Path, destination: Path) -> None:
                 )
             continue
         shutil.copy2(source_path, destination_path)
+
+
+def _copy_file_if_missing(source: Path, destination: Path) -> None:
+    if not source.is_file() or destination.exists():
+        return
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=0o700,
+    )
+    shutil.copy2(source, destination)
 
 
 def _move_worktrees(
