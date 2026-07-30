@@ -72,6 +72,11 @@ class Client:
                     }
                 }
             }
+        if path == "/v1/sync":
+            return {
+                "state_root": "/Users/test/my/chats",
+                "sync": {"state": "synced"},
+            }
         if path.endswith("/events?after=0"):
             return {"events": []}
         if path == "/v1/sessions/session-1":
@@ -153,6 +158,8 @@ def test_textual_workspace_restores_draft_and_inspector(
             assert "1,120 · 100 cached" in str(inspector.render())
             assert "800 context est." in str(inspector.render())
             assert "estimated" in str(inspector.render())
+            assert "CHAT STORAGE" in str(inspector.render())
+            assert "/Users/test/my/chats" in str(inspector.render())
             session_list = app.query_one("#session-list", ListView)
             assert session_list.children[0].has_class("active-session")
 

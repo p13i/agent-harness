@@ -203,7 +203,7 @@ def test_client_discovers_only_daemon_processes(
     tmp_path: Path,
 ) -> None:
     harness_paths = harness_paths_for(tmp_path / "state")
-    harness_paths.state_dir.mkdir()
+    harness_paths.daemon_pid.parent.mkdir(parents=True)
     harness_paths.daemon_pid.write_text("123\n", encoding="utf-8")
 
     def run(command, **kwargs):
@@ -248,6 +248,93 @@ def test_client_discovers_only_daemon_processes(
 
     monkeypatch.setattr(client_module.subprocess, "run", fallback)
     assert client_module._managed_daemon_pids(harness_paths) == (789,)
+
+
+def test_client_stops_a_managed_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness_paths = harness_paths_for(tmp_path / "state")
+    health = [True, False]
+    signals = []
+
+    async def fake_health(unused) -> bool:
+        del unused
+        return health.pop(0)
+
+    monkeypatch.setattr(
+        client_module.HarnessClient,
+        "health",
+        fake_health,
+    )
+    monkeypatch.setattr(
+        client_module,
+        "_managed_daemon_pids",
+        lambda unused: (321,),
+    )
+    monkeypatch.setattr(
+        client_module.os,
+        "kill",
+        lambda pid, value: signals.append((pid, value)),
+    )
+
+    assert asyncio.run(client_module.stop_daemon(harness_paths))
+    assert signals == [(321, signal.SIGTERM)]
+
+
+def test_cli_manages_sync_migration_and_service_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    migrated = []
+
+    def fake_publish(unused_paths, unused_store):
+        del unused_paths
+        del unused_store
+        return {"state": "synced"}
+
+    def fake_migrate(
+        source,
+        destination,
+        *,
+        trash_source,
+    ):
+        migrated.append((source, destination, trash_source))
+        return {"sessions": 2}
+
+    async def fake_stop(unused) -> bool:
+        del unused
+        return True
+
+    monkeypatch.setattr(cli, "publish_all", fake_publish)
+    monkeypatch.setattr(cli, "migrate_state", fake_migrate)
+    monkeypatch.setattr(cli, "stop_daemon", fake_stop)
+    state = tmp_path / "state"
+    source = tmp_path / "legacy"
+    destination = tmp_path / "chats"
+
+    commands = [
+        ["--state-dir", str(state), "sync"],
+        ["--state-dir", str(state), "sync-status"],
+        ["--state-dir", str(state), "service", "stop"],
+        [
+            "migrate-state",
+            "--from",
+            str(source),
+            "--to",
+            str(destination),
+            "--trash-source",
+        ],
+    ]
+    for arguments in commands:
+        parsed = cli.parser().parse_args(arguments)
+        assert asyncio.run(cli._run(parsed)) == 0
+
+    assert migrated == [(source, destination, True)]
+    output = capsys.readouterr().out
+    assert '"state": "synced"' in output
+    assert '"stopped": true' in output
 
 
 def test_cli_dispatches_every_session_control(

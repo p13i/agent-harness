@@ -1,6 +1,6 @@
 {
   "schema": "p13i/agent-harness/acceptance/v1",
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "journeys": [
     {
       "id": "AH-AC-001",
@@ -158,6 +158,21 @@
         "//tests:acceptance_test",
         "external://p13i/machines:agent_guard_test"
       ]
+    },
+    {
+      "id": "AH-AC-028",
+      "title": "Keep portable chat records in a configurable private repository",
+      "evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+    },
+    {
+      "id": "AH-AC-029",
+      "title": "Resume every session after verified legacy-state migration",
+      "evidence": ["//tests:unit_tests"]
+    },
+    {
+      "id": "AH-AC-030",
+      "title": "Synchronize chats without force-push or silent loss",
+      "evidence": ["//tests:unit_tests", "//tests:integration_tests"]
     }
   ]
 }

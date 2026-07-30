@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from agent_harness.blobs import BlobStore
+from agent_harness.config import HarnessPaths
 from agent_harness.context import compile_context
 from agent_harness.errors import HarnessError
 from agent_harness.errors import ProviderExhaustedError
@@ -41,6 +42,7 @@ from agent_harness.safety import limits_for
 from agent_harness.safety import lower_effort
 from agent_harness.safety import require_state_headroom
 from agent_harness.storage import StateStore
+from agent_harness.sync import publish_session
 from agent_harness.workspace import checkpoint_workspace
 from agent_harness.workspace import workspace_summary
 
@@ -58,12 +60,14 @@ class SessionWorker:
         scheduler: Scheduler,
         adapters: dict[str, ProviderAdapter],
         session_id: str,
+        paths: HarnessPaths | None = None,
     ) -> None:
         self.store = store
         self.blobs = blobs
         self.scheduler = scheduler
         self.adapters = adapters
         self.session_id = session_id
+        self.paths = paths
         self.incarnation = new_uuid()
         self._stopping = False
         self._active_adapter: ProviderAdapter | None = None
@@ -141,6 +145,18 @@ class SessionWorker:
             )
 
     async def _message(self, command: CommandReceipt) -> None:
+        try:
+            await self._execute_message(command)
+        finally:
+            if self.paths is not None:
+                await asyncio.to_thread(
+                    publish_session,
+                    self.paths,
+                    self.store,
+                    self.session_id,
+                )
+
+    async def _execute_message(self, command: CommandReceipt) -> None:
         payload = self.store.command_payload(command.command_id)
         text = str(payload.get("text", "")).strip()
         if not text:

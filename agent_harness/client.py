@@ -131,6 +131,36 @@ async def ensure_daemon(paths: HarnessPaths) -> HarnessClient:
     )
 
 
+async def stop_daemon(paths: HarnessPaths) -> bool:
+    client = HarnessClient(paths)
+    if not await client.health():
+        return False
+    pids = _managed_daemon_pids(paths)
+    if not pids:
+        raise HarnessError(
+            "E_DAEMON_STOP",
+            "the running harness daemon could not be identified",
+            retryable=True,
+            status=503,
+        )
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    for unused in range(150):
+        del unused
+        if not await client.health():
+            return True
+        await asyncio.sleep(0.1)
+    raise HarnessError(
+        "E_DAEMON_STOP",
+        "the harness daemon did not stop cleanly",
+        retryable=True,
+        status=503,
+    )
+
+
 def _compatible_health(value: dict[str, Any]) -> bool:
     if value.get("status") != "ok":
         return False

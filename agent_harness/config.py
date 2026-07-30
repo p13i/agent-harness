@@ -30,8 +30,10 @@ CONTROL_BUILD_ID = _control_build_id()
 @dataclass(frozen=True)
 class HarnessPaths:
     state_dir: Path
+    runtime: Path
     database: Path
     blobs: Path
+    sessions: Path
     worktrees: Path
     exports: Path
     logs: Path
@@ -39,13 +41,12 @@ class HarnessPaths:
     daemon_pid: Path
     token: Path
     machine_keys: Path
+    sync_lock: Path
+    sync_status: Path
 
 
 def default_state_dir() -> Path:
-    configured = os.environ.get("XDG_STATE_HOME", "")
-    if configured:
-        return Path(configured) / "p13i-agent-harness"
-    return Path.home() / ".local" / "state" / "p13i-agent-harness"
+    return Path.home() / "my" / "chats"
 
 
 def paths(state_dir: Path | None = None) -> HarnessPaths:
@@ -53,24 +54,31 @@ def paths(state_dir: Path | None = None) -> HarnessPaths:
     if root is None:
         root = default_state_dir()
     root = root.expanduser().resolve()
+    runtime = root / ".runtime"
     return HarnessPaths(
         state_dir=root,
-        database=root / "state.sqlite3",
+        runtime=runtime,
+        database=runtime / "state.sqlite3",
         blobs=root / "blobs",
-        worktrees=root / "worktrees",
+        sessions=root / "sessions",
+        worktrees=runtime / "worktrees",
         exports=root / "exports",
-        logs=root / "logs",
-        socket=root / "control.sock",
-        daemon_pid=root / "daemon.pid",
-        token=root / "secrets" / "api-token",
-        machine_keys=root / "secrets" / "machine-keys.json",
+        logs=runtime / "logs",
+        socket=runtime / "control.sock",
+        daemon_pid=runtime / "daemon.pid",
+        token=runtime / "secrets" / "api-token",
+        machine_keys=runtime / "secrets" / "machine-keys.json",
+        sync_lock=runtime / "sync.lock",
+        sync_status=runtime / "sync-status.json",
     )
 
 
 def prepare_paths(value: HarnessPaths) -> None:
     directories = (
         value.state_dir,
+        value.runtime,
         value.blobs,
+        value.sessions,
         value.worktrees,
         value.exports,
         value.logs,

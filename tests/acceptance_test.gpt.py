@@ -36,7 +36,7 @@ def main() -> int:
     if not isinstance(journeys, list):
         raise AssertionError("acceptance journeys must be an array")
     expected_ids = [
-        "AH-AC-" + str(index).zfill(3) for index in range(1, 28)
+        "AH-AC-" + str(index).zfill(3) for index in range(1, 31)
     ]
     actual_ids = [str(item.get("id", "")) for item in journeys]
     if actual_ids != expected_ids:

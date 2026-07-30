@@ -197,6 +197,11 @@ def test_typed_sdk_covers_the_complete_control_plane(
             return {"safety": {"session": {"profile": "unattended"}}}
         if path.endswith("/budget-extensions"):
             return {"safety": {"xhigh_authorizations": 1}}
+        if path == "/v1/sync":
+            return {
+                "state_root": str(tmp_path / "chats"),
+                "sync": {"state": "synced"},
+            }
         if path.endswith("/export"):
             return {"path": str(tmp_path / "export.json")}
         if path.startswith("/v1/commands/") or "/commands/" in path:
@@ -312,6 +317,8 @@ def test_typed_sdk_covers_the_complete_control_plane(
                 allow_xhigh_once=True,
             )
         )["xhigh_authorizations"] == 1
+        assert (await client.sync_status())["sync"]["state"] == "synced"
+        assert (await client.sync())["sync"]["state"] == "synced"
         assert await client.export("session-1") == (
             tmp_path / "export.json"
         )

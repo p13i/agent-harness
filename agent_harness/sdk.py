@@ -459,6 +459,16 @@ class AgentHarnessClient:
         result = await self.raw.request("GET", "/v1/leases")
         return _object_tuple(result.get("leases"))
 
+    async def sync_status(self) -> dict[str, Any]:
+        return await self.raw.request("GET", "/v1/sync")
+
+    async def sync(self) -> dict[str, Any]:
+        return await self.raw.request(
+            "POST",
+            "/v1/sync",
+            payload={},
+        )
+
     async def export(self, session_id: str) -> Path:
         result = await self.raw.request(
             "POST",

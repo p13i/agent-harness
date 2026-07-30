@@ -57,9 +57,7 @@ def test_configuration_generates_and_reuses_private_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
-    assert default_state_dir() == (
-        tmp_path / "xdg" / "p13i-agent-harness"
-    )
+    assert default_state_dir() == Path.home() / "my" / "chats"
     value = paths(tmp_path / "state")
     first = api_token(value)
     second = api_token(value)
@@ -67,9 +65,13 @@ def test_configuration_generates_and_reuses_private_token(
     assert first == second
     assert len(first) > 40
     assert value.token.stat().st_mode & 0o077 == 0
-
-    monkeypatch.delenv("XDG_STATE_HOME")
-    assert default_state_dir().name == "p13i-agent-harness"
+    assert value.database == (
+        tmp_path / "state" / ".runtime" / "state.sqlite3"
+    )
+    assert value.sessions == tmp_path / "state" / "sessions"
+    assert value.worktrees == (
+        tmp_path / "state" / ".runtime" / "worktrees"
+    )
 
 
 def test_identifier_and_error_contracts() -> None:

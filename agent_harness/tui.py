@@ -501,6 +501,8 @@ class HarnessApp(App[None]):
         self._safety: dict[str, Any] = {}
         self._approvals: tuple[dict[str, Any], ...] = ()
         self._providers: dict[str, Any] = {}
+        self._sync: dict[str, Any] = {}
+        self._state_root = ""
         self._provider_override = ""
         self._model_override = ""
         self._effort_override = ""
@@ -512,6 +514,7 @@ class HarnessApp(App[None]):
         self._saved_show_events = False
         self._last_approval_id = ""
         self._provider_poll = 0
+        self._sync_poll = 0
         self._theme_poll = 0
         self._poll_timer: Timer | None = None
         self._theme_preference = "system"
@@ -587,6 +590,7 @@ class HarnessApp(App[None]):
         self._apply_responsive_layout(self.size.width)
         self._apply_sidebar_width()
         await self._sync_system_theme(force=True)
+        await self._load_sync()
         await self._load_sessions()
         if self.session_id:
             await self._open_session(self.session_id)
@@ -595,11 +599,18 @@ class HarnessApp(App[None]):
         self._poll_timer = self.set_interval(0.5, self._poll)
         self.query_one("#composer", Input).focus()
 
-    def on_unmount(self) -> None:
-        if self._poll_timer is None:
+    async def on_unmount(self) -> None:
+        if self._poll_timer is not None:
+            self._poll_timer.stop()
+            self._poll_timer = None
+        try:
+            await self.client.request(
+                "POST",
+                "/v1/sync",
+                payload={},
+            )
+        except BaseException:
             return
-        self._poll_timer.stop()
-        self._poll_timer = None
 
     def on_resize(self, event: events.Resize) -> None:
         self._apply_responsive_layout(event.size.width)
@@ -852,6 +863,10 @@ class HarnessApp(App[None]):
         if not self._providers or self._provider_poll >= provider_limit:
             await self._load_providers()
             self._provider_poll = 0
+        self._sync_poll += 1
+        if self._sync_poll >= 20:
+            await self._load_sync()
+            self._sync_poll = 0
         self._theme_poll += 1
         if self._theme_poll >= 20:
             await self._sync_system_theme()
@@ -1203,6 +1218,14 @@ class HarnessApp(App[None]):
             return
         self._providers = _object(result.get("providers"))
 
+    async def _load_sync(self) -> None:
+        try:
+            result = await self.client.request("GET", "/v1/sync")
+        except BaseException:
+            return
+        self._sync = _object(result.get("sync"))
+        self._state_root = str(result.get("state_root", ""))
+
     def _render_inspector(self) -> None:
         lines = [
             "[bold cyan]ROUTING[/bold cyan]",
@@ -1215,7 +1238,19 @@ class HarnessApp(App[None]):
             "Permission "
             + escape(str(self._session.get("permission_mode", ""))),
             "Theme      " + escape(self._theme_preference),
+            "",
+            "[bold cyan]CHAT STORAGE[/bold cyan]",
+            "State      "
+            + escape(str(self._sync.get("state", "unknown"))),
+            "Root       " + escape(self._state_root or "unknown"),
         ]
+        sync_error = str(self._sync.get("error", ""))
+        if sync_error:
+            lines.append(
+                "[bold red]Sync       "
+                + escape(sync_error)
+                + "[/bold red]"
+            )
         if self._goal is not None:
             lines.extend(
                 [

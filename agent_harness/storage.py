@@ -27,6 +27,31 @@ from agent_harness.models import SessionEvent
 
 SCHEMA_VERSION = 2
 
+PORTABLE_SESSION_TABLES = (
+    "sessions",
+    "provider_attempts",
+    "turns",
+    "events",
+    "commands",
+    "goals",
+    "milestones",
+    "evidence",
+    "approvals",
+    "checkpoints",
+    "session_safety",
+    "command_envelopes",
+    "guard_incidents",
+    "context_deliveries",
+    "routing_decisions",
+    "transfers",
+    "registry_entries",
+    "ui_state",
+)
+PORTABLE_GLOBAL_TABLES = (
+    "usage_samples",
+    "mutation_receipts",
+)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -338,6 +363,37 @@ class StateStore:
         finally:
             target.close()
         os.chmod(destination, 0o600)
+
+    def clear_runtime_state(self) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM workers")
+            connection.execute("DELETE FROM process_leases")
+
+    def rewrite_worktree_prefix(
+        self,
+        source_prefix: str,
+        destination_prefix: str,
+    ) -> int:
+        changed = 0
+        boundary = source_prefix + os.sep
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT session_id, worktree FROM sessions"
+            ).fetchall()
+            for row in rows:
+                current = str(row["worktree"])
+                if not current.startswith(boundary):
+                    continue
+                rewritten = destination_prefix + current[len(source_prefix) :]
+                connection.execute(
+                    """
+                    UPDATE sessions SET worktree = ?
+                    WHERE session_id = ?
+                    """,
+                    (rewritten, row["session_id"]),
+                )
+                changed += 1
+        return changed
 
     def create_session(self, session: Session) -> Session:
         with self.transaction() as connection:
@@ -1701,6 +1757,247 @@ class StateStore:
         if row is None:
             return {}
         return _load_object(row["value_json"])
+
+    def portable_session(self, session_id: str) -> dict[str, Any]:
+        self.get_session(session_id)
+        with self._lock:
+            goals = self._portable_rows(
+                "goals",
+                "session_id = ?",
+                (session_id,),
+            )
+            goal_ids = tuple(str(item["goal_id"]) for item in goals)
+            tables = {
+                "sessions": self._portable_rows(
+                    "sessions",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "provider_attempts": self._portable_rows(
+                    "provider_attempts",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "turns": self._portable_rows(
+                    "turns",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "events": self._portable_rows(
+                    "events",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "commands": self._portable_rows(
+                    "commands",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "goals": goals,
+                "milestones": self._portable_rows_for_values(
+                    "milestones",
+                    "goal_id",
+                    goal_ids,
+                ),
+                "evidence": self._portable_rows_for_values(
+                    "evidence",
+                    "goal_id",
+                    goal_ids,
+                ),
+                "approvals": self._portable_rows(
+                    "approvals",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "checkpoints": self._portable_rows(
+                    "checkpoints",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "session_safety": self._portable_rows(
+                    "session_safety",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "command_envelopes": self._portable_rows(
+                    "command_envelopes",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "guard_incidents": self._portable_rows(
+                    "guard_incidents",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "context_deliveries": self._portable_rows(
+                    "context_deliveries",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "routing_decisions": self._portable_rows(
+                    "routing_decisions",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "transfers": self._portable_rows(
+                    "transfers",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "registry_entries": self._portable_rows(
+                    "registry_entries",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "ui_state": self._portable_rows(
+                    "ui_state",
+                    "key = ?",
+                    ("session:" + session_id,),
+                ),
+            }
+        return {
+            "schema": "p13i/agent-harness/chat-record/v1",
+            "database_schema_version": SCHEMA_VERSION,
+            "session_id": session_id,
+            "tables": tables,
+        }
+
+    def portable_global(self) -> dict[str, Any]:
+        with self._lock:
+            tables = {
+                "usage_samples": self._portable_rows("usage_samples"),
+                "mutation_receipts": self._portable_rows(
+                    "mutation_receipts"
+                ),
+                "ui_state": self._portable_rows(
+                    "ui_state",
+                    "key NOT LIKE ?",
+                    ("session:%",),
+                ),
+            }
+        return {
+            "schema": "p13i/agent-harness/chat-global/v1",
+            "database_schema_version": SCHEMA_VERSION,
+            "tables": tables,
+        }
+
+    def import_portable(
+        self,
+        records: list[dict[str, Any]],
+        global_record: dict[str, Any],
+    ) -> None:
+        if self.list_sessions(include_archived=True):
+            raise ConflictError("portable import requires an empty store")
+        table_rows: dict[str, list[dict[str, Any]]] = {
+            table: [] for table in PORTABLE_SESSION_TABLES
+        }
+        for record in records:
+            if record.get("schema") != (
+                "p13i/agent-harness/chat-record/v1"
+            ):
+                raise ValueError("portable chat record schema is unsupported")
+            tables = _require_object(record.get("tables"), "tables")
+            for table in PORTABLE_SESSION_TABLES:
+                rows = tables.get(table, [])
+                if not isinstance(rows, list):
+                    raise ValueError(table + " must be a list")
+                for row in rows:
+                    table_rows[table].append(
+                        _require_object(row, table + " row")
+                    )
+        if global_record.get("schema") != (
+            "p13i/agent-harness/chat-global/v1"
+        ):
+            raise ValueError("portable global schema is unsupported")
+        global_tables = _require_object(
+            global_record.get("tables"),
+            "global tables",
+        )
+        global_ui = global_tables.get("ui_state", [])
+        if not isinstance(global_ui, list):
+            raise ValueError("global ui_state must be a list")
+        for row in global_ui:
+            table_rows["ui_state"].append(
+                _require_object(row, "ui_state row")
+            )
+        with self.transaction() as connection:
+            for table in PORTABLE_SESSION_TABLES:
+                self._insert_portable_rows(
+                    connection,
+                    table,
+                    table_rows[table],
+                )
+            for table in PORTABLE_GLOBAL_TABLES:
+                rows = global_tables.get(table, [])
+                if not isinstance(rows, list):
+                    raise ValueError(table + " must be a list")
+                self._insert_portable_rows(
+                    connection,
+                    table,
+                    [
+                        _require_object(row, table + " row")
+                        for row in rows
+                    ],
+                )
+
+    def _portable_rows(
+        self,
+        table: str,
+        condition: str = "",
+        parameters: tuple[Any, ...] = (),
+    ) -> list[dict[str, Any]]:
+        columns = [
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(" + table + ")"
+            ).fetchall()
+        ]
+        statement = "SELECT * FROM " + table
+        if condition:
+            statement += " WHERE " + condition
+        statement += " ORDER BY " + ", ".join(columns)
+        return [
+            dict(row)
+            for row in self._connection.execute(
+                statement,
+                parameters,
+            ).fetchall()
+        ]
+
+    def _portable_rows_for_values(
+        self,
+        table: str,
+        column: str,
+        values: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        if not values:
+            return []
+        placeholders = ", ".join("?" for unused in values)
+        return self._portable_rows(
+            table,
+            column + " IN (" + placeholders + ")",
+            values,
+        )
+
+    def _insert_portable_rows(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        for row in rows:
+            columns = tuple(row)
+            placeholders = ", ".join("?" for unused in columns)
+            connection.execute(
+                "INSERT INTO "
+                + table
+                + " ("
+                + ", ".join(columns)
+                + ") VALUES ("
+                + placeholders
+                + ")",
+                tuple(row[column] for column in columns),
+            )
 
     def export_session(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)

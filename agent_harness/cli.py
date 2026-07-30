@@ -14,15 +14,19 @@ from agent_harness.api import run_daemon
 from agent_harness.blobs import BlobStore
 from agent_harness.client import HarnessClient
 from agent_harness.client import ensure_daemon
+from agent_harness.client import stop_daemon
 from agent_harness.client import wait_command
 from agent_harness.config import paths
 from agent_harness.config import prepare_paths
 from agent_harness.errors import HarnessError
 from agent_harness.ids import new_uuid
+from agent_harness.migration import migrate_state
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
 from agent_harness.scheduler import Scheduler
 from agent_harness.storage import StateStore
+from agent_harness.sync import publish_all
+from agent_harness.sync import read_sync_status
 from agent_harness.tui import run_tui
 from agent_harness.worker import SessionWorker
 
@@ -154,7 +158,7 @@ def parser() -> argparse.ArgumentParser:
     service = subcommands.add_parser("service")
     service.add_argument(
         "service_action",
-        choices=("run", "status"),
+        choices=("run", "status", "stop"),
     )
     service.add_argument("--tcp-host", default="")
     service.add_argument("--tcp-port", type=int, default=0)
@@ -165,6 +169,23 @@ def parser() -> argparse.ArgumentParser:
 
     worker = subcommands.add_parser("worker")
     worker.add_argument("session_id")
+
+    subcommands.add_parser("sync")
+    subcommands.add_parser("sync-status")
+    migrate = subcommands.add_parser("migrate-state")
+    migrate.add_argument(
+        "--from",
+        dest="source_root",
+        type=Path,
+        required=True,
+    )
+    migrate.add_argument(
+        "--to",
+        dest="destination_root",
+        type=Path,
+        required=True,
+    )
+    migrate.add_argument("--trash-source", action="store_true")
 
     subcommands.add_parser("doctor")
     return value
@@ -191,6 +212,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         print("E_INPUT: " + str(error), file=sys.stderr)
         return 2
+    except RuntimeError as error:
+        print("E_RUNTIME: " + str(error), file=sys.stderr)
+        return 1
 
 
 def _run_tui_command(arguments: argparse.Namespace) -> int:
@@ -217,6 +241,15 @@ def _run_tui_command(arguments: argparse.Namespace) -> int:
 
 
 async def _run(arguments: argparse.Namespace) -> int:
+    if arguments.command == "migrate-state":
+        result = await asyncio.to_thread(
+            migrate_state,
+            arguments.source_root,
+            arguments.destination_root,
+            trash_source=arguments.trash_source,
+        )
+        _print_json(result)
+        return 0
     harness_paths = paths(arguments.state_dir)
     prepare_paths(harness_paths)
     if arguments.command == "daemon":
@@ -234,6 +267,10 @@ async def _run(arguments: argparse.Namespace) -> int:
                 tcp_port=arguments.tcp_port,
             )
             return 0
+        if arguments.service_action == "stop":
+            stopped = await stop_daemon(harness_paths)
+            _print_json({"running": False, "stopped": stopped})
+            return 0
         client = HarnessClient(harness_paths)
         healthy = await client.health()
         _print_json({"running": healthy})
@@ -242,6 +279,33 @@ async def _run(arguments: argparse.Namespace) -> int:
         return 1
     if arguments.command == "worker":
         await _worker(harness_paths, arguments.session_id)
+        return 0
+    if arguments.command == "sync":
+        store = StateStore(harness_paths.database)
+        try:
+            result = await asyncio.to_thread(
+                publish_all,
+                harness_paths,
+                store,
+            )
+        finally:
+            store.close()
+        _print_json(
+            {
+                "state_root": str(harness_paths.state_dir),
+                "sync": result,
+            }
+        )
+        if result.get("state") == "synced":
+            return 0
+        return 1
+    if arguments.command == "sync-status":
+        _print_json(
+            {
+                "state_root": str(harness_paths.state_dir),
+                "sync": read_sync_status(harness_paths),
+            }
+        )
         return 0
     if arguments.command == "doctor":
         return await _doctor(harness_paths)
@@ -480,6 +544,7 @@ async def _worker(harness_paths: Any, session_id: str) -> None:
         scheduler,
         adapters,
         session_id,
+        paths=harness_paths,
     )
     try:
         await worker.run()
@@ -492,8 +557,11 @@ async def _doctor(harness_paths: Any) -> int:
         "npx": shutil.which("npx") is not None,
         "git": shutil.which("git") is not None,
         "state_directory": harness_paths.state_dir.is_dir(),
-        "private_state_mode": (
-            harness_paths.state_dir.stat().st_mode & 0o077
+        "git_state_repository": (
+            harness_paths.state_dir / ".git"
+        ).exists(),
+        "private_runtime_mode": (
+            harness_paths.runtime.stat().st_mode & 0o077
         )
         == 0,
     }
@@ -503,7 +571,14 @@ async def _doctor(harness_paths: Any) -> int:
         checks["sqlite"] = True
     finally:
         store.close()
-    _print_json({"checks": checks, "ok": all(checks.values())})
+    _print_json(
+        {
+            "checks": checks,
+            "ok": all(checks.values()),
+            "state_root": str(harness_paths.state_dir),
+            "sync": read_sync_status(harness_paths),
+        }
+    )
     if all(checks.values()):
         return 0
     return 1

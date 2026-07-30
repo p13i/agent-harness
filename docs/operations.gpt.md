@@ -39,6 +39,50 @@ Before opening chat, a new CLI replaces an older managed
 daemon when either value differs. This prevents a rebuilt
 client from silently using stale in-memory service code.
 
+## Chat data
+
+The default data root is `~/my/chats`, normally a symlink to
+the private `github.com/p13i/chats` submodule. Override it
+for an isolated invocation with the global
+`--state-dir <path>` option, or set `CHAT_STATE_DIR` for the
+Make targets in this repository.
+
+Each `sessions/<uuid>/` directory contains a deterministic
+machine record, JSONL event history, and readable Markdown
+transcript. Referenced blobs and retained exports are
+tracked beside those records. The `.runtime/` directory
+contains the SQLite database, worktrees, API token, socket,
+logs, locks, and sync status; it is private local state and
+is never committed.
+
+The daemon materializes and pushes portable records after a
+completed turn, every 30 seconds, and during clean shutdown.
+Synchronization is serialized, retries three times, never
+force-pushes, and leaves a visible pending or conflict state
+instead of discarding local work. The TUI inspector and
+these commands expose the same state:
+
+```sh
+npx --yes @bazel/bazelisk run //cmd:agent-harness -- \
+  sync-status
+npx --yes @bazel/bazelisk run //cmd:agent-harness -- sync
+```
+
+Move a legacy installation only while using the new binary:
+
+```sh
+npx --yes @bazel/bazelisk run //cmd:agent-harness -- \
+  migrate-state \
+  --from ~/.local/state/p13i-agent-harness \
+  --to ~/my/chats \
+  --trash-source
+```
+
+Migration stops only harness-managed processes using the
+source root, takes a SQLite backup, verifies session, event,
+blob, portable-record, and Git-worktree fidelity, pushes the
+destination, and only then moves the old root to Trash.
+
 ```sh
 make doctor
 npx --yes @bazel/bazelisk run //cmd:agent-harness -- status
@@ -106,7 +150,7 @@ the request under that key conflicts.
 
 The versioned contract is
 `contracts/openapi.gpt.yaml`. Local clients read the bearer
-token and Unix socket from the private state directory.
+token and Unix socket from the local `.runtime` directory.
 HTTP writes return durable command receipts. SSE accepts
 `Last-Event-ID` for lossless reconnection. Every response
 has an `X-Correlation-ID`; errors expose the same ID without

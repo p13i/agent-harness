@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: p13i agent harness
-  version: 1.1.0
+  version: 1.2.0
   description: >-
     Durable provider-neutral agent sessions, goals, events,
     approvals, routing, checkpoints, terminals, and fleet
@@ -20,6 +20,19 @@ paths:
   /readyz:
     get:
       operationId: ready
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sync:
+    get:
+      operationId: getChatSyncStatus
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+    post:
+      operationId: syncChats
+      requestBody:
+        $ref: "#/components/requestBodies/JsonObject"
       responses:
         "200":
           $ref: "#/components/responses/JsonResponse"

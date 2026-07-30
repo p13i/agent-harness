@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import hashlib
 import hmac
 import json
@@ -21,6 +22,8 @@ from agent_harness.config import api_token
 from agent_harness.errors import HarnessError
 from agent_harness.ids import new_uuid
 from agent_harness.service import HarnessService
+from agent_harness.sync import publish_all
+from agent_harness.sync import read_sync_status
 from agent_harness.terminal import terminal_socket
 
 
@@ -119,6 +122,8 @@ def create_app(
     app["service"] = service
     app.router.add_get("/healthz", _health)
     app.router.add_get("/readyz", _ready)
+    app.router.add_get("/v1/sync", _sync_status)
+    app.router.add_post("/v1/sync", _sync_now)
     app.router.add_get("/v1/sessions", _sessions)
     app.router.add_post("/v1/sessions", _create_session)
     app.router.add_get("/v1/sessions/{session_id}", _session)
@@ -210,6 +215,7 @@ async def run_daemon(
     unix_site = web.UnixSite(runner, str(paths.socket))
     await unix_site.start()
     _write_daemon_pid(paths.daemon_pid)
+    sync_task = asyncio.create_task(_sync_loop(service))
     try:
         tcp_site: web.TCPSite | None = None
         if tcp_host:
@@ -228,7 +234,15 @@ async def run_daemon(
                 continue
         await stopped.wait()
     finally:
+        sync_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sync_task
         service.workers.stop_all()
+        await asyncio.to_thread(
+            publish_all,
+            service.paths,
+            service.store,
+        )
         await runner.cleanup()
         service.close()
         if paths.socket.exists():
@@ -237,14 +251,51 @@ async def run_daemon(
 
 
 async def _health(request: web.Request) -> web.Response:
-    del request
+    service = _service(request)
     return web.json_response(
         {
             "status": "ok",
             "control_build_id": CONTROL_BUILD_ID,
             "control_protocol_version": CONTROL_PROTOCOL_VERSION,
+            "state_root": str(service.paths.state_dir),
+            "sync": read_sync_status(service.paths),
         }
     )
+
+
+async def _sync_status(request: web.Request) -> web.Response:
+    service = _service(request)
+    return web.json_response(
+        {
+            "state_root": str(service.paths.state_dir),
+            "sync": read_sync_status(service.paths),
+        }
+    )
+
+
+async def _sync_now(request: web.Request) -> web.Response:
+    service = _service(request)
+    result = await asyncio.to_thread(
+        publish_all,
+        service.paths,
+        service.store,
+    )
+    return web.json_response(
+        {
+            "state_root": str(service.paths.state_dir),
+            "sync": result,
+        }
+    )
+
+
+async def _sync_loop(service: HarnessService) -> None:
+    while True:
+        await asyncio.to_thread(
+            publish_all,
+            service.paths,
+            service.store,
+        )
+        await asyncio.sleep(30)
 
 
 async def _ready(request: web.Request) -> web.Response:

@@ -103,6 +103,17 @@ async def test_api_creates_session_and_accepts_message(
         assert health_value["control_protocol_version"] == (
             CONTROL_PROTOCOL_VERSION
         )
+        assert health_value["state_root"] == str(tmp_path / "state")
+        sync_status = await client.get("/v1/sync", headers=headers)
+        assert (await sync_status.json())["sync"]["state"] == "unknown"
+        synchronized = await client.post(
+            "/v1/sync",
+            headers=headers,
+            json={},
+        )
+        assert (await synchronized.json())["sync"]["state"] == (
+            "not-configured"
+        )
         ready = await client.get("/readyz", headers=headers)
         assert (await ready.json())["status"] == "ready"
         listed = await client.get("/v1/sessions", headers=headers)
