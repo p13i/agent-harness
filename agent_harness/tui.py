@@ -456,7 +456,7 @@ class HarnessApp(App[None]):
     }
     """
     BINDINGS = [
-        Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("ctrl+c", "interrupt", "Interrupt"),
         Binding("ctrl+p", "pause", "Pause"),
         Binding("ctrl+r", "refresh", "Refresh"),

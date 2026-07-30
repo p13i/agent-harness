@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 from pathlib import Path
 import pty
 import select
 import subprocess
+import tempfile
+import termios
 import time
 
 
 def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     _repository(workspace)
-    state = tmp_path / "state"
+    temporary_state = tempfile.TemporaryDirectory(
+        prefix="agent-harness-pty-",
+        dir="/tmp",
+    )
+    state = Path(temporary_state.name)
     launcher = _launcher()
     daemon = subprocess.Popen(
         [str(launcher), "--state-dir", str(state), "daemon"],
@@ -26,10 +33,18 @@ def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
     primary = -1
     replica = -1
     try:
-        _wait_for_socket(state / "control.sock", daemon)
+        _wait_for_socket(state / ".runtime" / "control.sock", daemon)
         primary, replica = pty.openpty()
+        terminal_attributes = termios.tcgetattr(replica)
+        terminal_attributes[0] &= ~termios.IXON
+        termios.tcsetattr(replica, termios.TCSANOW, terminal_attributes)
         environment = dict(os.environ)
         environment["TERM"] = "xterm-256color"
+
+        def configure_child_terminal() -> None:
+            os.setsid()
+            fcntl.ioctl(replica, termios.TIOCSCTTY, 0)
+
         chat = subprocess.Popen(
             [
                 str(launcher),
@@ -43,13 +58,23 @@ def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
             stdout=replica,
             stderr=replica,
             env=environment,
-            start_new_session=True,
+            preexec_fn=configure_child_terminal,
         )
+        output = _read_until(primary, b"P13I AGENT HARNESS", timeout=8)
+        terminal_attributes = termios.tcgetattr(replica)
+        terminal_attributes[0] &= ~termios.IXON
+        termios.tcsetattr(replica, termios.TCSANOW, terminal_attributes)
+        time.sleep(0.5)
+        os.write(primary, b"\x11")
+        return_code, trailing_output = _wait_for_exit(
+            chat,
+            primary,
+            timeout=5,
+        )
+        output += trailing_output
+        assert return_code == 0
         os.close(replica)
         replica = -1
-        output = _read_until(primary, b"P13I AGENT HARNESS", timeout=8)
-        os.write(primary, b"\x11")
-        assert chat.wait(timeout=5) == 0
         output += _read_available(primary)
         assert b"P13I AGENT HARNESS" in output
         assert b"Traceback" not in output
@@ -68,6 +93,7 @@ def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
         except subprocess.TimeoutExpired:
             daemon.kill()
             daemon.wait(timeout=5)
+        temporary_state.cleanup()
 
 
 def _launcher() -> Path:
@@ -138,6 +164,25 @@ def _read_available(descriptor: int) -> bytes:
             break
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _wait_for_exit(
+    process: subprocess.Popen[bytes],
+    descriptor: int,
+    *,
+    timeout: float,
+) -> tuple[int, bytes]:
+    deadline = time.monotonic() + timeout
+    output = b""
+    while time.monotonic() < deadline:
+        output += _read_available(descriptor)
+        return_code = process.poll()
+        if return_code is not None:
+            return return_code, output
+        time.sleep(0.02)
+    raise AssertionError(
+        "chat did not exit after Ctrl+Q: " + repr(output[-4000:])
+    )
 
 
 def _repository(path: Path) -> None:

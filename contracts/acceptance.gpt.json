@@ -5,174 +5,215 @@
     {
       "id": "AH-AC-001",
       "title": "Start chat from a product workspace",
-      "evidence": ["//tests:chat_pty_test", "//tests:unit_tests"]
+      "local_evidence": ["//tests:chat_pty_test", "//tests:unit_tests"]
     },
     {
       "id": "AH-AC-002",
       "title": "Create a durable session",
-      "evidence": ["//tests:integration_tests"]
+      "local_evidence": ["//tests:integration_tests"]
     },
     {
       "id": "AH-AC-003",
       "title": "Resume every user-visible state",
-      "evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+      "local_evidence": ["//tests:unit_tests", "//tests:integration_tests"]
     },
     {
       "id": "AH-AC-004",
       "title": "Continue on the same provider",
-      "evidence": ["//tests:e2e_tests"]
+      "local_evidence": ["//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-005",
       "title": "Continue after a provider switch",
-      "evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
     },
     {
       "id": "AH-AC-006",
       "title": "Route by capability, headroom, and intent",
-      "evidence": ["//tests:unit_tests"]
+      "local_evidence": ["//tests:unit_tests"]
     },
     {
       "id": "AH-AC-007",
       "title": "Show Claude usage without delaying chat",
-      "evidence": ["//tests:unit_tests"]
+      "local_evidence": ["//tests:unit_tests"]
     },
     {
       "id": "AH-AC-008",
       "title": "Fail over once on eligible capacity failure",
-      "evidence": ["//tests:e2e_tests"]
+      "local_evidence": ["//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-009",
       "title": "Stream messages and tool events",
-      "evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
     },
     {
       "id": "AH-AC-010",
       "title": "Request and resolve approval",
-      "evidence": [
-        "//tests:e2e_tests",
-        "external://cs/apps/web/wsl.trycopilot.dev:ui_test"
+      "local_evidence": ["//tests:e2e_tests"],
+      "external_evidence": [
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:ui_test",
+          "status": "pending"
+        }
       ]
     },
     {
       "id": "AH-AC-011",
       "title": "Control and steer active work",
-      "evidence": ["//tests:e2e_tests"]
+      "local_evidence": ["//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-012",
       "title": "Checkpoint, fork, and export",
-      "evidence": ["//tests:integration_tests", "//tests:unit_tests"]
+      "local_evidence": ["//tests:integration_tests", "//tests:unit_tests"]
     },
     {
       "id": "AH-AC-013",
       "title": "Complete work through formal evidence",
-      "evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
     },
     {
       "id": "AH-AC-014",
       "title": "Use normalized extensions and native escape hatches",
-      "evidence": ["//tests:parity_test", "//tests:unit_tests"]
+      "local_evidence": ["//tests:parity_test", "//tests:unit_tests"]
     },
     {
       "id": "AH-AC-015",
       "title": "Use authenticated API, SSE, and SDK clients",
-      "evidence": [
+      "local_evidence": [
         "//tests:integration_tests",
-        "//tests:unit_tests",
-        "external://cs/apps/web/wsl.trycopilot.dev:machines_client_test"
+        "//tests:unit_tests"
+      ],
+      "external_evidence": [
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:machines_client_test",
+          "status": "pending"
+        }
       ]
     },
     {
       "id": "AH-AC-016",
       "title": "Recover daemon and worker ownership",
-      "evidence": ["//tests:unit_tests", "//tests:e2e_tests"]
+      "local_evidence": ["//tests:unit_tests", "//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-017",
       "title": "Transfer a session between machines",
-      "evidence": ["//tests:unit_tests"]
+      "local_evidence": ["//tests:unit_tests"]
     },
     {
       "id": "AH-AC-018",
       "title": "Operate an adaptive, accessible terminal UI",
-      "evidence": ["//tests:unit_tests", "//tests:chat_pty_test"]
+      "local_evidence": ["//tests:unit_tests", "//tests:chat_pty_test"]
     },
     {
       "id": "AH-AC-019",
       "title": "Observe live sessions in the dashboard",
-      "evidence": [
-        "external://cs/apps/web/wsl.trycopilot.dev:operations_snapshot_test",
-        "external://cs/apps/web/wsl.trycopilot.dev:operations_hub_test",
-        "external://cs/apps/web/wsl.trycopilot.dev:machines_client_test",
-        "external://cs/apps/web/wsl.trycopilot.dev:ui_test"
+      "local_evidence": ["//tests:integration_tests"],
+      "external_evidence": [
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:operations_snapshot_test",
+          "status": "pending"
+        },
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:operations_hub_test",
+          "status": "pending"
+        },
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:machines_client_test",
+          "status": "pending"
+        },
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:ui_test",
+          "status": "pending"
+        }
       ]
     },
     {
       "id": "AH-AC-020",
       "title": "Control sessions safely from the dashboard",
-      "evidence": [
-        "external://cs/apps/web/wsl.trycopilot.dev:ui_test",
-        "external://cs/apps/web/wsl.trycopilot.dev:same_origin_gate_test",
-        "external://cs/apps/web/wsl.trycopilot.dev:machines_client_test"
+      "local_evidence": ["//tests:integration_tests"],
+      "external_evidence": [
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:ui_test",
+          "status": "pending"
+        },
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:same_origin_gate_test",
+          "status": "pending"
+        },
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:machines_client_test",
+          "status": "pending"
+        }
       ]
     },
     {
       "id": "AH-AC-021",
       "title": "Keep fleet and deployment health observable",
-      "evidence": [
-        "external://p13i/machines:test",
-        "external://cs/apps/web/wsl.trycopilot.dev:all"
+      "local_evidence": ["//tests:integration_tests"],
+      "external_evidence": [
+        {
+          "target": "external://p13i/machines:test",
+          "status": "pending"
+        },
+        {
+          "target": "external://cs/apps/web/wsl.trycopilot.dev:all",
+          "status": "pending"
+        }
       ]
     },
     {
       "id": "AH-AC-022",
       "title": "Reserve every turn under mandatory admission",
-      "evidence": ["//tests:acceptance_test", "//tests:e2e_tests"]
+      "local_evidence": ["//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-023",
       "title": "Interrupt runtime usage at its hard envelope",
-      "evidence": ["//tests:acceptance_test", "//tests:e2e_tests"]
+      "local_evidence": ["//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-024",
       "title": "Stop repeated context and tool cycles",
-      "evidence": ["//tests:acceptance_test", "//tests:unit_tests"]
+      "local_evidence": ["//tests:unit_tests"]
     },
     {
       "id": "AH-AC-025",
       "title": "Share one envelope across downgrade and failover",
-      "evidence": ["//tests:acceptance_test", "//tests:e2e_tests"]
+      "local_evidence": ["//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-026",
       "title": "Require explicit xhigh authorization",
-      "evidence": ["//tests:acceptance_test", "//tests:e2e_tests"]
+      "local_evidence": ["//tests:e2e_tests"]
     },
     {
       "id": "AH-AC-027",
       "title": "Lease every managed background provider process",
-      "evidence": [
-        "//tests:acceptance_test",
-        "external://p13i/machines:agent_guard_test"
+      "local_evidence": ["//tests:e2e_tests"],
+      "external_evidence": [
+        {
+          "target": "external://p13i/machines:agent_guard_test",
+          "status": "pending"
+        }
       ]
     },
     {
       "id": "AH-AC-028",
       "title": "Keep portable chat records in a configurable private repository",
-      "evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+      "local_evidence": ["//tests:unit_tests", "//tests:integration_tests"]
     },
     {
       "id": "AH-AC-029",
       "title": "Resume every session after verified legacy-state migration",
-      "evidence": ["//tests:unit_tests"]
+      "local_evidence": ["//tests:unit_tests"]
     },
     {
       "id": "AH-AC-030",
       "title": "Synchronize chats without force-push or silent loss",
-      "evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+      "local_evidence": ["//tests:unit_tests", "//tests:integration_tests"]
     }
   ]
 }

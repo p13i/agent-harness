@@ -1,5 +1,17 @@
 load("@rules_python//python:defs.bzl", "py_test")
 
+test_suite(
+    name = "local_acceptance",
+    tests = [
+        ":acceptance_test",
+        ":chat_pty_test",
+        ":e2e_tests",
+        ":integration_tests",
+        ":parity_test",
+        ":unit_tests",
+    ],
+)
+
 py_test(
     name = "style_test",
     srcs = ["style_test.py"],
@@ -52,9 +64,12 @@ py_test(
 
 py_test(
     name = "chat_pty_test",
-    srcs = ["test_chat_pty.py"],
+    srcs = [
+        "chat_pty_test_runner.py",
+        "test_chat_pty.py",
+    ],
     data = ["//cmd:agent-harness"],
-    main = "test_chat_pty.py",
+    main = "chat_pty_test_runner.py",
     deps = ["@agent_harness_pip//pytest"],
 )
 

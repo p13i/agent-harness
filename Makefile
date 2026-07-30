@@ -52,4 +52,4 @@ parity:
 	@$(BAZEL) test //tests:parity_test
 
 acceptance:
-	@$(BAZEL) test //tests:acceptance_test
+	@$(BAZEL) test //tests:local_acceptance

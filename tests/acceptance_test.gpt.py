@@ -20,6 +20,7 @@ LOCAL_TARGETS = frozenset(
     }
 )
 EXTERNAL_TARGET = re.compile(r"^external://[A-Za-z0-9_./:-]+$")
+EXTERNAL_STATES = frozenset({"pending", "passed", "failed"})
 
 
 def main() -> int:
@@ -55,17 +56,41 @@ def _validate_journey(journey: object) -> None:
     title = journey.get("title")
     if not isinstance(title, str) or not title.strip():
         raise AssertionError("acceptance journey title is required")
-    evidence = journey.get("evidence")
+    evidence = journey.get("local_evidence")
     if not isinstance(evidence, list) or not evidence:
-        raise AssertionError(str(journey.get("id")) + " lacks evidence")
+        raise AssertionError(
+            str(journey.get("id")) + " lacks local evidence"
+        )
     for target in evidence:
         if not isinstance(target, str):
             raise AssertionError("evidence target must be text")
         if target in LOCAL_TARGETS:
             continue
-        if EXTERNAL_TARGET.fullmatch(target):
-            continue
         raise AssertionError("unknown executable evidence " + target)
+    external = journey.get("external_evidence", [])
+    if not isinstance(external, list):
+        raise AssertionError("external evidence must be an array")
+    for declaration in external:
+        _validate_external_evidence(declaration)
+
+
+def _validate_external_evidence(declaration: object) -> None:
+    if not isinstance(declaration, dict):
+        raise AssertionError("external evidence must be an object")
+    target = declaration.get("target")
+    if not isinstance(target, str):
+        raise AssertionError("external evidence target must be text")
+    if not EXTERNAL_TARGET.fullmatch(target):
+        raise AssertionError("invalid external evidence target " + target)
+    status = declaration.get("status")
+    if status not in EXTERNAL_STATES:
+        raise AssertionError("invalid external evidence status")
+    if status == "passed":
+        run_id = declaration.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AssertionError(
+                "passed external evidence requires a run identifier"
+            )
 
 
 if __name__ == "__main__":
