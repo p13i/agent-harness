@@ -463,6 +463,44 @@ def test_sync_status_and_unreachable_remote_fail_closed(
 
     assert result["state"] == "pending"
     assert result["detail"] == "git-fetch"
+
+    def materialization_fails(*unused_args, **unused_kwargs):
+        del unused_args
+        del unused_kwargs
+        raise ValueError("invalid portable record")
+
+    monkeypatch.setattr(
+        sync_module,
+        "materialize_all",
+        materialization_fails,
+    )
+    result = sync_module.publish_all(harness_paths, store)
+    assert result["pending"] is True
+    assert result["detail"] == "record-materialization"
+
+    def materialization_succeeds(*unused_args, **unused_kwargs):
+        del unused_args
+        del unused_kwargs
+        return []
+
+    def synchronization_fails(*unused_args, **unused_kwargs):
+        del unused_args
+        del unused_kwargs
+        raise RuntimeError("remote unavailable")
+
+    monkeypatch.setattr(
+        sync_module,
+        "materialize_all",
+        materialization_succeeds,
+    )
+    monkeypatch.setattr(
+        sync_module,
+        "sync_repository",
+        synchronization_fails,
+    )
+    result = sync_module.publish_all(harness_paths, store)
+    assert result["pending"] is True
+    assert result["detail"] == "repository-synchronization"
     store.close()
 
     def time_out(*unused_args, **unused_kwargs):
