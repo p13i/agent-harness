@@ -13,6 +13,11 @@ py_library(
     deps = [":bundle_lib"],
 )
 
+py_library(
+    name = "coverage_gate_lib",
+    srcs = ["coverage_gate.py"],
+)
+
 py_binary(
     name = "install",
     srcs = [
@@ -29,19 +34,9 @@ py_binary(
     main = "bundle.py",
 )
 
-py_binary(
-    name = "ui_gallery",
-    srcs = ["ui_gallery.py"],
-    main = "ui_gallery.py",
-    deps = ["//agent_harness"],
-)
-
 py_test(
     name = "ui_gallery_test",
-    srcs = [
-        "ui_gallery.py",
-        "ui_gallery_test.py",
-    ],
+    srcs = ["ui_gallery_test.py"],
     main = "ui_gallery_test.py",
     deps = [
         "//agent_harness",
@@ -49,27 +44,11 @@ py_test(
     ],
 )
 
-py_binary(
-    name = "wsl_e2e",
-    srcs = ["wsl_e2e.py"],
-    main = "wsl_e2e.py",
-    deps = [
-        ":bundle_lib",
-        ":install_lib",
-        "//agent_harness",
-    ],
-)
-
 py_test(
     name = "wsl_e2e_test",
-    srcs = [
-        "wsl_e2e.py",
-        "wsl_e2e_test.py",
-    ],
+    srcs = ["wsl_e2e_test.py"],
     main = "wsl_e2e_test.py",
     deps = [
-        ":bundle_lib",
-        ":install_lib",
         "//agent_harness",
         "@agent_harness_pip//pytest",
     ],
@@ -77,12 +56,12 @@ py_test(
 
 py_test(
     name = "coverage_gate_test",
-    srcs = [
-        "coverage_gate.py",
-        "coverage_gate_test.py",
-    ],
+    srcs = ["coverage_gate_test.py"],
     main = "coverage_gate_test.py",
-    deps = ["@agent_harness_pip//pytest"],
+    deps = [
+        ":coverage_gate_lib",
+        "@agent_harness_pip//pytest",
+    ],
 )
 
 py_binary(

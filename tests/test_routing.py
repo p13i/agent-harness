@@ -18,6 +18,7 @@ from agent_harness.scheduler import _select_effort
 from agent_harness.scheduler import _select_model
 from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
+from test_support import session
 
 
 def candidate(
@@ -242,6 +243,115 @@ def test_scheduler_refreshes_usage_and_falls_back_on_model_failure(
         assert models["codex"][0].model_id == "default"
         status = await scheduler.status(tmp_path)
         assert not status["codex"]["usage_refreshing"]
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_scheduler_enforces_capacity_concurrency_model_and_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = UsageSnapshot(
+        provider="codex",
+        binding_percent=95.0,
+        credits_engaged=False,
+        payload={},
+    )
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        scheduler._usage_cache = {"codex": snapshot}
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        scheduler._model_cache = {
+            "codex": (
+                ProviderModel(
+                    "frontier",
+                    "Frontier",
+                    ("low",),
+                    100,
+                    default=True,
+                ),
+            )
+        }
+        current = session(tmp_path)
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                binding_ceiling=90,
+            )
+
+        scheduler._usage_cache = {
+            "codex": UsageSnapshot(
+                provider="codex",
+                binding_percent=10.0,
+                credits_engaged=False,
+                payload={},
+            )
+        }
+        monkeypatch.setattr(
+            store,
+            "active_unattended_provider_count",
+            lambda provider: 1,
+        )
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                execution_profile="unattended",
+                enforce_concurrency=True,
+            )
+        monkeypatch.setattr(
+            store,
+            "active_unattended_provider_count",
+            lambda provider: 0,
+        )
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                model="missing",
+            )
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                model="frontier",
+                effort="high",
+            )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_scheduler_reuses_active_status_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_usage() -> dict[str, UsageSnapshot]:
+        await asyncio.sleep(60)
+        return {}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr(
+            "agent_harness.scheduler.probe_all",
+            slow_usage,
+        )
+        scheduler = Scheduler(store, {"claude": SlowAdapter()})
+        await scheduler.status(tmp_path)
+        first = scheduler._status_refresh
+        await scheduler.status(tmp_path)
+        assert scheduler._status_refresh is first
+        assert first is not None
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
         store.close()
 
     asyncio.run(scenario())

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
+import sys
 
 import pytest
 
@@ -352,6 +354,125 @@ def test_bundle_manifest_without_physical_targets_and_cli(
     assert json.loads(capsys.readouterr().out)["build_id"] == "cli-bundle"
 
 
+def test_bundle_filesystem_error_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runfiles = tmp_path / "runfiles"
+    runfiles.mkdir()
+    manifest = runfiles / "MANIFEST"
+    manifest.write_text("logical target\n", encoding="utf-8")
+
+    def unreadable(
+        unused_path: Path,
+        *,
+        encoding: str,
+    ) -> str:
+        del unused_path, encoding
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with pytest.raises(BundleError, match="cannot be read"):
+        bundle_module._validate_source_manifest(runfiles)
+    monkeypatch.undo()
+
+    with pytest.raises(BundleError, match="cannot be resolved"):
+        bundle_module._copy_tree(
+            tmp_path / "missing",
+            tmp_path / "destination",
+            frozenset(),
+        )
+
+    broken_root = tmp_path / "broken"
+    broken_root.mkdir()
+    (broken_root / "link").symlink_to(tmp_path / "absent")
+    with pytest.raises(BundleError, match="cannot be resolved"):
+        bundle_module._copy_tree(
+            broken_root,
+            tmp_path / "broken-copy",
+            frozenset(),
+        )
+
+    special_root = tmp_path / "special"
+    special_root.mkdir()
+    os.mkfifo(special_root / "pipe")
+    with pytest.raises(BundleError, match="unsupported runfile type"):
+        bundle_module._copy_tree(
+            special_root,
+            tmp_path / "special-copy",
+            frozenset(),
+        )
+
+    source = tmp_path / "source-file"
+    source.write_text("content", encoding="utf-8")
+
+    def copy_failure(
+        unused_source: Path,
+        unused_destination: Path,
+        *,
+        follow_symlinks: bool,
+    ) -> None:
+        del unused_source, unused_destination, follow_symlinks
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(bundle_module.shutil, "copyfile", copy_failure)
+    with pytest.raises(BundleError, match="failed to copy"):
+        bundle_module._copy_regular_file(
+            source,
+            tmp_path / "copied-file",
+        )
+
+
+def test_bundle_walk_rejects_special_files_and_skips_manifest(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    linked_root = tmp_path / "linked-root"
+    linked_root.mkdir()
+    (linked_root / "directory").symlink_to(
+        external,
+        target_is_directory=True,
+    )
+    with pytest.raises(BundleError, match="symbolic link"):
+        bundle_module._walk_regular_files(linked_root)
+
+    special_root = tmp_path / "special-root"
+    special_root.mkdir()
+    os.mkfifo(special_root / "pipe")
+    with pytest.raises(BundleError, match="non-regular"):
+        bundle_module._walk_regular_files(special_root)
+
+    manifest_root = tmp_path / "manifest-root"
+    manifest_root.mkdir()
+    (manifest_root / BUNDLE_MANIFEST).write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    assert bundle_module._manifest_entries(manifest_root) == []
+
+
+def test_bundle_module_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_executable(tmp_path / "source", "entrypoint")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bundle",
+            "--executable",
+            str(source),
+            "--bundle-root",
+            str(tmp_path / "bundles"),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="0"):
+        runpy.run_module("tools.bundle", run_name="__main__")
+
+
 def test_install_upgrade_and_rollback_retain_bundles(
     tmp_path: Path,
 ) -> None:
@@ -477,6 +598,94 @@ def test_install_checkout_compatibility_and_cli(
         ]
     )
     assert status == 0
+
+
+def test_install_cli_argument_and_repo_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = tmp_path / "repo"
+    _source_executable(repo / "bazel-bin" / "cmd", "repo")
+    destination = tmp_path / "bin" / "agent-harness"
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "--destination",
+                str(destination),
+                "--bundle-root",
+                str(tmp_path / "bundles"),
+                "--build-id",
+                "repo-main",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["build_id"] == "repo-main"
+
+    with pytest.raises(SystemExit, match="2"):
+        main(
+            [
+                "--repo",
+                str(repo),
+                "--source-executable",
+                str(repo / "bazel-bin" / "cmd" / "agent-harness"),
+            ]
+        )
+    with pytest.raises(SystemExit, match="2"):
+        main([])
+
+    class CyclingArguments:
+        rollback = False
+        repo = None
+        destination = tmp_path / "unused"
+        bundle_root = tmp_path / "bundles"
+        build_id = ""
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def source_executable(self) -> Path | None:
+            self.reads += 1
+            if self.reads == 1:
+                return tmp_path / "source"
+            return None
+
+    monkeypatch.setattr(
+        install_module.argparse.ArgumentParser,
+        "parse_args",
+        lambda unused_self, unused_argv: CyclingArguments(),
+    )
+    with pytest.raises(AssertionError, match="checked above"):
+        main([])
+
+
+def test_install_selection_read_error_and_module_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "agent-harness"
+    destination.write_text("managed", encoding="utf-8")
+
+    def unreadable(
+        unused_path: Path,
+        *,
+        encoding: str,
+    ) -> str:
+        del unused_path, encoding
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with pytest.raises(InstallError, match="cannot be read"):
+        read_selection(destination)
+    monkeypatch.undo()
+
+    monkeypatch.setattr(sys, "argv", ["install"])
+    with pytest.raises(SystemExit, match="2"):
+        runpy.run_module("tools.install", run_name="__main__")
 
 
 def test_selector_contract_and_default_paths(tmp_path: Path) -> None:

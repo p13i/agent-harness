@@ -14,6 +14,7 @@ from agent_harness.config import default_state_dir
 from agent_harness.config import paths
 from agent_harness.context import compile_context
 from agent_harness.context import estimate_tokens
+from agent_harness.context import workspace_instructions
 from agent_harness.errors import ConflictError
 from agent_harness.errors import HarnessError
 from agent_harness.errors import NeedsReconciliationError
@@ -26,6 +27,7 @@ from agent_harness.ids import new_uuid
 from agent_harness.ids import require_identifier
 from agent_harness.ids import require_uuid
 from agent_harness.models import SessionEvent
+from agent_harness.models import RestartRecovery
 from agent_harness.projections import write_session_projections
 from agent_harness.transfer import MachineKeys
 from agent_harness.transfer import load_machine_keys
@@ -52,6 +54,23 @@ def test_blob_store_round_trip_and_validation(tmp_path: Path) -> None:
         store.get("0" * 64)
 
 
+def test_blob_store_removes_temporary_file_after_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = BlobStore(tmp_path / "blobs")
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        del source
+        del destination
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("agent_harness.blobs.os.replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        store.put(b"content")
+    assert not list((tmp_path / "blobs").glob("blob.*"))
+
+
 def test_configuration_generates_and_reuses_private_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -72,6 +91,24 @@ def test_configuration_generates_and_reuses_private_token(
     assert value.worktrees == (
         tmp_path / "state" / ".runtime" / "worktrees"
     )
+    assert paths().state_dir == default_state_dir().resolve()
+
+
+def test_context_bounds_large_workspace_instruction(
+    tmp_path: Path,
+) -> None:
+    content = "x" * 200_001
+    (tmp_path / "AGENTS.md").write_text(content, encoding="utf-8")
+    instructions = workspace_instructions(tmp_path)
+    assert len(instructions) == 1
+    assert len(instructions[0]) < len(content) + 20
+
+
+def test_restart_recovery_serializes_empty_collections() -> None:
+    assert RestartRecovery((), ()).as_dict() == {
+        "requeued_command_ids": [],
+        "reconciliations": [],
+    }
 
 
 def test_identifier_and_error_contracts() -> None:

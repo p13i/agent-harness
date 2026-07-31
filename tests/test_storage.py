@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sqlite3
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,489 @@ from agent_harness.sync import read_sync_status
 from agent_harness.sync import sync_repository
 from agent_harness.workspace import create_worktree
 from test_support import session
+
+
+def test_migration_copy_helpers_cover_conflicts_and_links(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    migration_module._copy_tree_verified(source, destination)
+
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "one.txt").write_text("one")
+    migration_module._copy_tree_verified(source, destination)
+    assert (destination / "nested" / "one.txt").read_text() == "one"
+    migration_module._copy_tree_verified(source, destination)
+
+    (source / "nested" / "one.txt").write_text("changed")
+    with pytest.raises(RuntimeError, match="conflicts"):
+        migration_module._copy_tree_verified(source, destination)
+    (source / "nested" / "one.txt").write_text("one")
+
+    linked = source / "linked"
+    linked.symlink_to(source / "nested", target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symlink"):
+        migration_module._copy_tree_verified(source, destination)
+
+    missing = tmp_path / "missing"
+    target = tmp_path / "target" / "value"
+    migration_module._copy_file_if_missing(missing, target)
+    source_file = tmp_path / "source-file"
+    source_file.write_text("value")
+    migration_module._copy_file_if_missing(source_file, target)
+    assert target.read_text() == "value"
+    migration_module._copy_file_if_missing(source_file, target)
+
+
+def test_migration_inventory_validation_boundaries(
+    tmp_path: Path,
+) -> None:
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir()
+    base = {
+        "sessions": 0,
+        "events": 0,
+        "session_values": [],
+        "blob_hashes": {},
+    }
+    migration_module._verify_merged_inventory(
+        base,
+        base,
+        base,
+        worktrees,
+        worktrees,
+    )
+
+    cases = [
+        ({**base, "sessions": 1}, base, base, "session count"),
+        ({**base, "events": 1}, base, base, "event count"),
+        ({**base, "session_values": {}}, base, base, "source inventory"),
+        (base, {**base, "session_values": {}}, base, "destination inventory"),
+        (base, base, {**base, "session_values": {}}, "merged inventory"),
+        (
+            {
+                **base,
+                "sessions": 1,
+                "session_values": [{"session_id": "one"}],
+            },
+            base,
+            {**base, "sessions": 1, "session_values": []},
+            "session content",
+        ),
+        (base, base, {**base, "blob_hashes": []}, "merged blob"),
+        ({**base, "blob_hashes": []}, base, base, "source blob"),
+        (
+            {**base, "blob_hashes": {"one": "digest"}},
+            base,
+            base,
+            "blob content",
+        ),
+    ]
+    for source, before, after, message in cases:
+        with pytest.raises(RuntimeError, match=message):
+            migration_module._verify_merged_inventory(
+                source,
+                before,
+                after,
+                worktrees,
+                worktrees,
+            )
+
+
+def test_migration_source_and_preserved_session_validation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+
+    class Store:
+        values: dict[str, dict[str, object]] = {}
+
+        def portable_session(self, session_id: str) -> dict[str, object]:
+            return self.values[session_id]
+
+    store = Store()
+    malformed = [
+        {"session_id": "one", "tables": []},
+        {"session_id": "one", "tables": {"sessions": []}},
+        {"session_id": "one", "tables": {"sessions": ["invalid"]}},
+    ]
+    for record in malformed:
+        with pytest.raises(RuntimeError, match="portable source"):
+            migration_module._verify_source_sessions(
+                store,  # type: ignore[arg-type]
+                [record],
+                source,
+                destination,
+            )
+
+    record = {
+        "session_id": "one",
+        "tables": {
+            "sessions": [
+                {
+                    "session_id": "one",
+                    "worktree": str(source / "one"),
+                }
+            ]
+        },
+    }
+    expected = copy.deepcopy(record)
+    expected["tables"]["sessions"][0]["worktree"] = str(
+        destination / "one"
+    )
+    store.values["one"] = expected
+    migration_module._verify_source_sessions(
+        store,  # type: ignore[arg-type]
+        [record],
+        source,
+        destination,
+    )
+    store.values["one"] = {}
+    with pytest.raises(RuntimeError, match="changed"):
+        migration_module._verify_source_sessions(
+            store,  # type: ignore[arg-type]
+            [record],
+            source,
+            destination,
+        )
+    with pytest.raises(RuntimeError, match="destination session"):
+        migration_module._verify_preserved_sessions(
+            store,  # type: ignore[arg-type]
+            {"one": {"expected": True}},
+        )
+
+
+def test_migration_process_and_pid_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "legacy"
+    completed = subprocess.CompletedProcess(
+        [],
+        0,
+        stdout=(
+            "invalid\n"
+            "abc " + str(root) + " agent-harness daemon\n"
+            "12 unrelated\n"
+            "13 "
+            + str(root)
+            + " unrelated\n"
+            "14 "
+            + str(root)
+            + " agent-harness daemon\n"
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(migration_module, "_run", lambda *args, **kwargs: completed)
+    assert migration_module._legacy_processes(root) == {14}
+    assert migration_module._is_managed_legacy_process(14, root)
+    completed.returncode = 1
+    assert not migration_module._is_managed_legacy_process(14, root)
+
+    pid_path = tmp_path / "pid"
+    assert migration_module._read_pid(pid_path) is None
+    pid_path.write_text("invalid")
+    assert migration_module._read_pid(pid_path) is None
+    pid_path.write_text("1")
+    assert migration_module._read_pid(pid_path) is None
+    pid_path.write_text("42")
+    assert migration_module._read_pid(pid_path) == 42
+
+
+def test_migration_hash_trash_and_quiescence_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "tree"
+    assert migration_module._file_hashes(root) == {}
+    root.mkdir()
+    (root / "file").write_text("content")
+    (root / "link").symlink_to(root / "file")
+    hashes = migration_module._file_hashes(root)
+    assert set(hashes) == {"file"}
+    assert migration_module._file_digest(root / "file") == hashes["file"]
+
+    monkeypatch.setattr(
+        migration_module,
+        "_legacy_processes",
+        lambda value: {42},
+    )
+    monkeypatch.setattr(
+        migration_module,
+        "_is_managed_legacy_process",
+        lambda pid, value: True,
+    )
+    with pytest.raises(RuntimeError, match="still in use"):
+        migration_module._require_root_quiescent(root)
+
+    trash = tmp_path / ".Trash"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        migration_module.time,
+        "strftime",
+        lambda value: "stamp",
+    )
+    source = tmp_path / "legacy-source"
+    source.mkdir()
+    destination = migration_module._trash_source(source)
+    assert destination == trash / "p13i-agent-harness-stamp"
+    duplicate = tmp_path / "legacy-source-two"
+    duplicate.mkdir()
+    with pytest.raises(RuntimeError, match="already exists"):
+        migration_module._trash_source(duplicate)
+
+
+def test_migration_stop_processes_and_root_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "legacy"
+    root.mkdir()
+    pid_path = root / "daemon.pid"
+    pid_path.write_text("43")
+    monkeypatch.setattr(
+        migration_module,
+        "_legacy_processes",
+        lambda value: {41, 42},
+    )
+    checks = {41: False, 42: True, 43: True}
+
+    def managed(pid: int, value: Path) -> bool:
+        del value
+        result = checks.get(pid, False)
+        checks[pid] = False
+        return result
+
+    killed: list[int] = []
+
+    def kill(pid: int, sig: int) -> None:
+        del sig
+        if pid == 43:
+            raise ProcessLookupError
+        killed.append(pid)
+
+    monkeypatch.setattr(
+        migration_module,
+        "_is_managed_legacy_process",
+        managed,
+    )
+    monkeypatch.setattr(migration_module.os, "kill", kill)
+    migration_module._stop_managed_processes(root, pid_path)
+    assert killed == [42]
+
+    monkeypatch.setattr(
+        migration_module,
+        "_legacy_processes",
+        lambda value: {42},
+    )
+    monkeypatch.setattr(
+        migration_module,
+        "_is_managed_legacy_process",
+        lambda pid, value: True,
+    )
+    times = iter([0.0, 0.0, 16.0])
+    monkeypatch.setattr(
+        migration_module.time,
+        "monotonic",
+        lambda: next(times),
+    )
+    monkeypatch.setattr(migration_module.time, "sleep", lambda value: None)
+    with pytest.raises(RuntimeError, match="did not stop"):
+        migration_module._stop_managed_processes(
+            root,
+            tmp_path / "missing-pid",
+        )
+
+    source = migration_module.legacy_paths(root)
+    destination = paths(tmp_path / "missing-destination")
+    (root / "state.sqlite3").write_text("")
+    with pytest.raises(ValueError, match="does not exist"):
+        migration_module._validate_roots(source, destination)
+
+
+def test_migration_backup_and_worktree_failure_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = paths(tmp_path / "destination")
+    destination.runtime.mkdir(parents=True)
+    backup_root = destination.runtime / "migration-rollback"
+    backup_root.mkdir()
+    with pytest.raises(RuntimeError, match="incomplete"):
+        migration_module._create_destination_backup(destination)
+
+    source = migration_module.legacy_paths(tmp_path / "legacy")
+    source.worktrees.mkdir(parents=True)
+    destination.worktrees.mkdir(parents=True)
+
+    class Store:
+        current: list[object] = []
+
+        def list_sessions(self, *, include_archived: bool) -> list[object]:
+            assert include_archived
+            return self.current
+
+    store = Store()
+    outside = tmp_path / "outside" / "one"
+    store.current = [
+        SimpleNamespace(
+            worktree=str(outside),
+            workspace=str(tmp_path),
+            session_id="outside",
+        )
+    ]
+    moved: list[tuple[Path, Path, Path]] = []
+    migration_module._move_worktrees(
+        store,  # type: ignore[arg-type]
+        source,
+        destination,
+        moved,
+    )
+    assert not moved
+
+    missing = source.worktrees / "missing"
+    store.current = [
+        SimpleNamespace(
+            worktree=str(missing),
+            workspace=str(tmp_path),
+            session_id="missing",
+        )
+    ]
+    with pytest.raises(RuntimeError, match="missing"):
+        migration_module._move_worktrees(
+            store,  # type: ignore[arg-type]
+            source,
+            destination,
+            moved,
+        )
+
+    current = source.worktrees / "occupied"
+    current.mkdir()
+    (destination.worktrees / "occupied").mkdir()
+    store.current = [
+        SimpleNamespace(
+            worktree=str(current),
+            workspace=str(tmp_path),
+            session_id="occupied",
+        )
+    ]
+    with pytest.raises(RuntimeError, match="already exists"):
+        migration_module._move_worktrees(
+            store,  # type: ignore[arg-type]
+            source,
+            destination,
+            moved,
+        )
+
+    failing = source.worktrees / "repair"
+    failing.mkdir()
+    store.current = [
+        SimpleNamespace(
+            worktree=str(failing),
+            workspace=str(tmp_path),
+            session_id="repair",
+        )
+    ]
+    monkeypatch.setattr(
+        migration_module,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr="",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="repair failed"):
+        migration_module._move_worktrees(
+            store,  # type: ignore[arg-type]
+            source,
+            destination,
+            moved,
+        )
+    assert failing.is_dir()
+
+    original = source.worktrees / "rollback"
+    relocated = destination.worktrees / "rollback"
+    original.mkdir()
+    migration_module._rollback_worktrees(
+        [(original, relocated, tmp_path)]
+    )
+
+
+def test_migration_portable_round_trip_detects_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = paths(tmp_path / "destination")
+    destination.runtime.mkdir(parents=True)
+    verification = destination.runtime / "portable-verify.sqlite3"
+    verification.write_text("stale")
+    session_value = SimpleNamespace(session_id="session-1")
+
+    class SourceStore:
+        global_value: dict[str, object] = {}
+
+        def list_sessions(self, *, include_archived: bool) -> list[object]:
+            assert include_archived
+            return [session_value]
+
+        def portable_session(self, session_id: str) -> dict[str, object]:
+            del session_id
+            return {"source": True}
+
+        def portable_global(self) -> dict[str, object]:
+            return self.global_value
+
+    class RestoredStore:
+        global_value: dict[str, object] = {}
+
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def import_portable(
+            self,
+            records: object,
+            global_record: object,
+        ) -> None:
+            del records
+            del global_record
+
+        def portable_session(self, session_id: str) -> dict[str, object]:
+            del session_id
+            return {}
+
+        def portable_global(self) -> dict[str, object]:
+            return self.global_value
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr(
+        migration_module,
+        "load_portable_records",
+        lambda value: ([], {}),
+    )
+    monkeypatch.setattr(migration_module, "StateStore", RestoredStore)
+    with pytest.raises(RuntimeError, match="round trip changed session"):
+        migration_module._verify_portable_round_trip(
+            destination,
+            SourceStore(),  # type: ignore[arg-type]
+        )
+
+    RestoredStore.portable_session = (
+        lambda self, session_id: {"source": True}
+    )
+    SourceStore.global_value = {"source": True}
+    with pytest.raises(RuntimeError, match="global state"):
+        migration_module._verify_portable_round_trip(
+            destination,
+            SourceStore(),  # type: ignore[arg-type]
+        )
 
 
 def test_store_round_trip_and_idempotent_command(tmp_path: Path) -> None:
@@ -566,6 +1050,26 @@ def test_dispatch_recovery_requeues_before_boundary_and_barriers_after(
     assert failed.result["code"] == "E_NEEDS_RECONCILIATION"
     assert store.pending_reconciliations(created.session_id) == [record]
     assert store.reconciliation(record.reconciliation_id) == record
+    with store.transaction() as connection:
+        command_row = connection.execute(
+            "SELECT * FROM commands WHERE command_id = ?",
+            (ambiguous.command_id,),
+        ).fetchone()
+        dispatch_row = connection.execute(
+            "SELECT * FROM command_dispatches WHERE command_id = ?",
+            (ambiguous.command_id,),
+        ).fetchone()
+        assert (
+            store._create_reconciliation(
+                connection,
+                command_row,
+                dispatch_row,
+                "digest-current",
+                "summary-current",
+                utc_now(),
+            )
+            == record
+        )
 
     queued = store.enqueue_command(
         created.session_id,
@@ -592,6 +1096,18 @@ def test_dispatch_recovery_requeues_before_boundary_and_barriers_after(
             "stale",
             {},
         )
+    with pytest.raises(NotFoundError):
+        store.begin_reconciliation_resolution(
+            "missing",
+            "stop",
+            "digest-current",
+        )
+    with pytest.raises(ConflictError):
+        store.begin_reconciliation_resolution(
+            record.reconciliation_id,
+            "stop",
+            "stale",
+        )
     resolving = store.begin_reconciliation_resolution(
         record.reconciliation_id,
         "stop",
@@ -608,6 +1124,13 @@ def test_dispatch_recovery_requeues_before_boundary_and_barriers_after(
             record.reconciliation_id,
             "accept-current",
             "digest-current",
+        )
+    with pytest.raises(ConflictError):
+        store.resolve_reconciliation_record(
+            record.reconciliation_id,
+            "accept-current",
+            "digest-current",
+            {},
         )
     resolved = store.resolve_reconciliation_record(
         record.reconciliation_id,
@@ -998,6 +1521,49 @@ def test_portable_records_reject_missing_blobs_and_bad_documents(
     clean.close()
 
 
+def test_portable_record_validation_boundaries(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="tables"):
+        records_module._table_rows({"tables": []}, "events")
+    with pytest.raises(ValueError, match="table"):
+        records_module._table_rows(
+            {"tables": {"events": {}}},
+            "events",
+        )
+    with pytest.raises(ValueError, match="row"):
+        records_module._table_rows(
+            {"tables": {"events": ["invalid"]}},
+            "events",
+        )
+    with pytest.raises(ValueError, match="SHA-256"):
+        records_module._require_blob_digest("short")
+    with pytest.raises(ValueError, match="hexadecimal"):
+        records_module._require_blob_digest("z" * 64)
+    digest = "1" * 64
+    assert records_module._blob_digests(
+        {
+            "tables": {
+                "events": [{"blob_digest": digest}],
+                "checkpoints": [],
+            }
+        }
+    ) == [digest]
+    with pytest.raises(ValueError, match="one session"):
+        records_module._transcript(
+            {"tables": {"sessions": []}},
+            [],
+        )
+
+    harness_paths = paths(tmp_path / "state")
+    prepare_paths(harness_paths)
+    (harness_paths.state_dir / "global.gpt.json").write_text(
+        '{"schema":"invalid"}'
+    )
+    with pytest.raises(ValueError, match="global"):
+        load_portable_records(harness_paths)
+
+
 def test_sync_status_and_unreachable_remote_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1068,6 +1634,87 @@ def test_sync_status_and_unreachable_remote_fail_closed(
 
     monkeypatch.setattr(sync_module.subprocess, "run", time_out)
     with pytest.raises(RuntimeError, match="timed out"):
+        sync_module._git(tmp_path, "status")
+
+
+def test_sync_locked_failure_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness_paths = paths(tmp_path / "state")
+    prepare_paths(harness_paths)
+    monkeypatch.setattr(sync_module, "_head", lambda root: "head")
+    monkeypatch.setattr(sync_module.time, "sleep", lambda value: None)
+
+    def completed(returncode: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            [],
+            returncode,
+            stdout="",
+            stderr="",
+        )
+
+    def run_case(
+        returncodes: list[int],
+        attempts: int = 1,
+    ) -> dict[str, object]:
+        values = list(returncodes)
+
+        def git(*args, **kwargs):
+            del args
+            del kwargs
+            return completed(values.pop(0))
+
+        monkeypatch.setattr(sync_module, "_git", git)
+        return sync_module._sync_locked(harness_paths, attempts)
+
+    assert run_case([0, 2])["detail"] == "git-index"
+    assert run_case([0, 1, 1])["detail"] == "git-commit"
+    assert run_case([0, 0, 1, 1], attempts=2)["detail"] == "git-fetch"
+    conflict = run_case([0, 0, 0, 1, 0])
+    assert conflict["state"] == "conflict"
+    assert run_case(
+        [0, 0, 0, 0, 1, 0, 0, 1],
+        attempts=2,
+    )["detail"] == "git-push"
+
+
+def test_sync_repository_and_git_error_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sync_module,
+        "_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=str(tmp_path),
+            stderr="",
+        ),
+    )
+
+    def unavailable(self: Path, *args, **kwargs) -> Path:
+        del self
+        del args
+        del kwargs
+        raise OSError
+
+    monkeypatch.setattr(Path, "resolve", unavailable)
+    assert not sync_module._is_repository(tmp_path)
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        sync_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr="",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="failed"):
         sync_module._git(tmp_path, "status")
 
 
@@ -1143,6 +1790,7 @@ def test_git_sync_commits_and_pushes_portable_records(
 
 def test_legacy_migration_preserves_resume_state_and_git_worktree(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     _workspace_repository(workspace)
@@ -1185,15 +1833,23 @@ def test_legacy_migration_preserves_resume_state_and_git_worktree(
     )
     existing_store.close()
 
+    trash_path = tmp_path / "trashed-source"
+    monkeypatch.setattr(
+        migration_module,
+        "_trash_source",
+        lambda unused: trash_path,
+    )
     result = migrate_state(
         source_root,
         destination_root,
-        trash_source=False,
+        trash_source=True,
     )
 
     assert result["sessions"] == 1
     assert result["events"] == 1
     assert result["worktrees"] == 1
+    assert result["source_trashed"]
+    assert result["trash_path"] == str(trash_path)
     destination_store = StateStore(destination_paths.database)
     migrated = destination_store.get_session(created.session_id)
     assert migrated.session_id == created.session_id
@@ -1213,6 +1869,43 @@ def test_legacy_migration_preserves_resume_state_and_git_worktree(
     assert _git(Path(migrated.worktree), "status", "--porcelain=v1") == ""
     assert read_sync_status(destination_paths)["state"] == "synced"
     destination_store.close()
+
+
+def test_migration_rejects_invalid_moved_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_paths = migration_module.legacy_paths(source_root)
+    source_paths.worktrees.mkdir(parents=True)
+    current = source_paths.worktrees / "session-worktree"
+    current.mkdir()
+    store = StateStore(source_paths.database)
+    created = replace(
+        session(tmp_path / "workspace"),
+        worktree=str(current),
+    )
+    store.create_session(created)
+    destination = paths(tmp_path / "destination")
+    prepare_paths(destination)
+    results = [
+        subprocess.CompletedProcess([], 0, "", ""),
+        subprocess.CompletedProcess([], 1, "", "invalid"),
+    ]
+    monkeypatch.setattr(
+        migration_module,
+        "_run",
+        lambda *unused, **unused_values: results.pop(0),
+    )
+
+    with pytest.raises(RuntimeError, match="migrated worktree"):
+        migration_module._move_worktrees(
+            store,
+            source_paths,
+            destination,
+            [],
+        )
+    store.close()
 
 
 def test_failed_migration_restores_worktree_and_remains_retryable(

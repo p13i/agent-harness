@@ -25,6 +25,7 @@ from agent_harness.ids import new_uuid
 from agent_harness.ids import require_uuid
 from agent_harness.ids import utc_now
 from agent_harness.models import Attention
+from agent_harness.models import CommandStatus
 from agent_harness.models import Lifecycle
 from agent_harness.models import PermissionMode
 from agent_harness.models import Session

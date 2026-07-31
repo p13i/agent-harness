@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ from agent_harness.blobs import BlobStore
 from agent_harness.config import paths
 from agent_harness.config import prepare_paths
 from agent_harness.errors import ProviderExhaustedError
+from agent_harness.errors import ProviderUnavailableError
+from agent_harness.errors import SafetyGuardError
 from agent_harness.errors import ConflictError
 from agent_harness.errors import HarnessError
 from agent_harness.goals import create_goal
@@ -38,6 +41,8 @@ from agent_harness.providers.base import ProviderStatus
 from agent_harness.scheduler import Scheduler
 from agent_harness.reconciliation import ReconciliationManager
 from agent_harness.reconciliation import inspect_workspace
+from agent_harness.safety import TurnGuard
+from agent_harness.safety import limits_for
 from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
 from agent_harness.worker import SessionWorker
@@ -306,7 +311,7 @@ async def test_e2e_paused_session_resumes_and_stops(
     )
     worker_task = asyncio.create_task(rig.worker.run())
     try:
-        for unused in range(100):
+        for unused in range(1000):
             del unused
             current = rig.store.get_command(resumed.command_id)
             if current.status == "complete":
@@ -819,6 +824,241 @@ async def test_worker_guard_interrupt_cleanup_is_bounded(
         assert waiting.cancelled()
         assert worker_module._optional_number(True) is None
         assert worker_module._optional_number(7) == 7.0
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_message_publish_and_failover_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    try:
+        queued = rig.store.enqueue_command(
+            rig.session.session_id,
+            "message",
+            {"text": "queued"},
+            new_uuid(),
+        )
+
+        async def stop_after_message(command: CommandReceipt) -> None:
+            assert command.command_id == queued.command_id
+            rig.worker._stopping = True
+
+        monkeypatch.setattr(rig.worker, "_message", stop_after_message)
+        monkeypatch.setattr(
+            rig.store,
+            "heartbeat_worker",
+            lambda unused_session, unused_incarnation: True,
+        )
+        await rig.worker._loop()
+        assert rig.worker._stopping
+
+        rig.worker._stopping = False
+        rig.store.enqueue_command(
+            rig.session.session_id,
+            "message",
+            {"text": "publish"},
+            new_uuid(),
+        )
+        claimed = rig.store.claim_command(rig.session.session_id)
+        assert claimed is not None
+        published: list[str] = []
+
+        async def execute(unused: CommandReceipt) -> None:
+            return
+
+        monkeypatch.setattr(rig.worker, "_execute_message", execute)
+        monkeypatch.setattr(
+            worker_module,
+            "publish_session",
+            lambda unused_paths, unused_store, session_id: published.append(
+                session_id
+            ),
+        )
+        rig.worker.paths = paths(tmp_path / "publish-state")
+        await SessionWorker._message(rig.worker, claimed)
+        assert published == [rig.session.session_id]
+
+        guard = TurnGuard(limits_for("interactive", "implementation"))
+
+        async def safety_failure(*unused: object, **values: object) -> object:
+            del unused, values
+            raise SafetyGuardError(
+                "stagnation",
+                "codex",
+                recoverable=True,
+            )
+
+        monkeypatch.setattr(rig.worker, "_execute_attempt", safety_failure)
+        with pytest.raises(SafetyGuardError):
+            await rig.worker._execute_with_failover(
+                "command",
+                {"provider": "codex", "effort": "low"},
+                "message",
+                guard,
+            )
+
+        async def unavailable(*unused: object, **values: object) -> object:
+            del unused, values
+            raise ProviderUnavailableError("codex")
+
+        monkeypatch.setattr(rig.worker, "_execute_attempt", unavailable)
+        with pytest.raises(ProviderUnavailableError):
+            await rig.worker._execute_with_failover(
+                "command",
+                {"provider": "codex"},
+                "message",
+                TurnGuard(limits_for("interactive", "implementation")),
+            )
+
+        empty_guard = TurnGuard(
+            replace(
+                limits_for("interactive", "implementation"),
+                max_attempts=0,
+            )
+        )
+        with pytest.raises(ProviderUnavailableError, match="all providers"):
+            await rig.worker._execute_with_failover(
+                "command",
+                {},
+                "message",
+                empty_guard,
+            )
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_attempt_guard_event_lease_and_failure_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FileAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            event_handler = values["event_handler"]
+            await event_handler(ProviderEvent("file.change.completed"))
+            return await super().run_turn(**values)
+
+    file_adapter = FileAdapter("codex")
+    file_root = tmp_path / "file"
+    file_root.mkdir()
+    rig = JourneyRig(file_root, codex=file_adapter)
+    try:
+        rig.prime_capacity(claude=95, codex=10)
+        result = await rig.message("change a file", provider="codex")
+        assert result.status == "complete"
+
+        limited = SimpleNamespace(
+            limits=limits_for("interactive", "implementation"),
+            begin_attempt=lambda unused: "context-tokens",
+        )
+        with pytest.raises(SafetyGuardError, match="context-tokens"):
+            await rig.worker._execute_attempt(
+                "command",
+                {"provider": "codex"},
+                "message",
+                frozenset(),
+                limited,  # type: ignore[arg-type]
+                0,
+                enforce_concurrency=True,
+            )
+    finally:
+        rig.close()
+
+    class LeaseAdapter(ScriptedAdapter):
+        def process_identity(self) -> tuple[int, str]:
+            return 123, "start"
+
+    lease_adapter = LeaseAdapter("codex", turn_delay=0.2)
+    lease_root = tmp_path / "lease"
+    lease_root.mkdir()
+    lease_rig = JourneyRig(lease_root, codex=lease_adapter)
+    try:
+        lease_rig.store.set_session_safety(
+            lease_rig.session.session_id,
+            "unattended",
+        )
+        lease_rig.prime_capacity(claude=95, codex=10)
+        tick = [0.0]
+
+        def monotonic() -> float:
+            tick[0] += 20.0
+            return tick[0]
+
+        monkeypatch.setattr(
+            worker_module,
+            "time",
+            SimpleNamespace(monotonic=monotonic),
+        )
+        result = await lease_rig.message("leased turn", provider="codex")
+        assert result.status == "complete"
+        event_types = {
+            event.event_type
+            for event in lease_rig.store.all_events(
+                lease_rig.session.session_id
+            )
+        }
+        assert "lease.attached" in event_types
+        assert "lease.released" in event_types
+    finally:
+        lease_rig.close()
+
+    class ResultUsageAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            del values
+            return ProviderResult(
+                provider="codex",
+                native_session_id="native",
+                native_turn_id="turn",
+                status="complete",
+                usage={"output_tokens": 1_000_000},
+            )
+
+    usage_root = tmp_path / "result-usage"
+    usage_root.mkdir()
+    usage_rig = JourneyRig(
+        usage_root,
+        codex=ResultUsageAdapter("codex"),
+    )
+    try:
+        usage_rig.prime_capacity(claude=95, codex=10)
+        result = await usage_rig.message("large result", provider="codex")
+        assert result.status == "failed"
+    finally:
+        usage_rig.close()
+
+    class RuntimeAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            del values
+            raise RuntimeError("adapter failure")
+
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    runtime_rig = JourneyRig(
+        runtime_root,
+        codex=RuntimeAdapter("codex"),
+    )
+    try:
+        runtime_rig.prime_capacity(claude=95, codex=10)
+        with pytest.raises(RuntimeError, match="adapter failure"):
+            await runtime_rig.message("fail", provider="codex")
+    finally:
+        runtime_rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_approval_timeout_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    try:
+        monkeypatch.setattr(worker_module, "APPROVAL_POLL_LIMIT", 0)
+        assert await rig.worker._approval("", "tool", {}) == {
+            "decision": "decline"
+        }
     finally:
         rig.close()
 

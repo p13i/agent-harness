@@ -51,6 +51,7 @@ from agent_harness.workspace import workspace_summary
 CONTROL_COMMANDS = frozenset(
     {"interrupt", "pause", "resume", "stop", "steer"}
 )
+APPROVAL_POLL_LIMIT = 3600
 
 
 class SessionWorker:
@@ -880,7 +881,7 @@ class SessionWorker:
             metadata={"approval_id": approval_id, "method": method},
             turn_id=turn_id,
         )
-        for unused in range(3600):
+        for unused in range(APPROVAL_POLL_LIMIT):
             del unused
             decision = self.store.approval_decision(approval_id)
             if decision is not None:

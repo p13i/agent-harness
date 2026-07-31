@@ -63,6 +63,10 @@ class GalleryClient:
             if payload is not None:
                 self.ui_state = dict(payload)
             return {"ui_state": dict(self.ui_state)}
+        if method == "PATCH" and path == "/v1/sessions/gallery-session":
+            return {"session": self._session()}
+        if method == "POST" and path == "/v1/sync":
+            return {"sync": {"state": "synced"}}
         if path in {"/v1/sessions", "/v1/sessions?archived=1"}:
             return {"sessions": self._sessions()}
         if path == "/v1/sync":
@@ -101,10 +105,6 @@ class GalleryClient:
             return {"safety": self._safety()}
         if path == "/v1/sessions/gallery-session":
             return self._session_snapshot()
-        if method == "PATCH" and path == "/v1/sessions/gallery-session":
-            return {"session": self._session()}
-        if method == "POST" and path == "/v1/sync":
-            return {"sync": {"state": "synced"}}
         return {}
 
     def _session(self) -> dict[str, Any]:
@@ -579,6 +579,11 @@ def _validate_layout(app: HarnessApp) -> None:
 
 
 def _self_contained_svg(content: str) -> str:
+    value = re.sub(
+        r"terminal-\d+",
+        "terminal-gallery",
+        content,
+    )
     value = re.sub(
         r"\s*@font-face\s*\{.*?\}\s*",
         "\n",

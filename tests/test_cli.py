@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
+import runpy
 import signal
 import subprocess
 import threading
@@ -19,6 +21,18 @@ from agent_harness.errors import HarnessError
 from agent_harness.service_manager import ServiceStatus
 from agent_harness.service_manager import DiagnosticProbe
 from agent_harness import runtime
+
+
+def test_executable_launcher_delegates_to_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runfiles = Path(os.environ["TEST_SRCDIR"])
+    workspace = os.environ.get("TEST_WORKSPACE", "_main")
+    launcher = runfiles / workspace / "cmd" / "agent_harness.py"
+    monkeypatch.setattr(cli, "main", lambda: 23)
+
+    with pytest.raises(SystemExit, match="23"):
+        runpy.run_path(str(launcher), run_name="__main__")
 
 
 def test_launcher_prefers_current_source_build(
@@ -571,6 +585,90 @@ def test_client_stops_a_managed_daemon(
     ]
 
 
+def test_client_daemon_timeouts_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness_paths = harness_paths_for(tmp_path / "state")
+    harness_paths.logs.mkdir(parents=True)
+
+    async def never_healthy(unused) -> bool:
+        del unused
+        return False
+
+    async def always_healthy(unused) -> bool:
+        del unused
+        return True
+
+    async def no_sleep(value: float) -> None:
+        del value
+
+    class Process:
+        def __init__(self, *args, **kwargs) -> None:
+            del args
+            del kwargs
+
+    monkeypatch.setattr(
+        client_module.HarnessClient,
+        "health",
+        never_healthy,
+    )
+    monkeypatch.setattr(client_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(client_module.subprocess, "Popen", Process)
+    monkeypatch.setattr(
+        client_module,
+        "launcher_command",
+        lambda: ["agent-harness"],
+    )
+    with pytest.raises(HarnessError, match="did not become ready"):
+        asyncio.run(client_module.ensure_daemon(harness_paths))
+
+    monkeypatch.setattr(
+        client_module.HarnessClient,
+        "health",
+        always_healthy,
+    )
+    monkeypatch.setattr(
+        client_module,
+        "_managed_daemon_pids",
+        lambda value: (4321,),
+    )
+    monkeypatch.setattr(client_module.os, "kill", lambda *args: None)
+    with pytest.raises(HarnessError, match="did not stop cleanly"):
+        asyncio.run(client_module.stop_daemon(harness_paths))
+
+    client = client_module.HarnessClient(harness_paths)
+
+    async def compatible() -> dict[str, object]:
+        return {"status": "ok"}
+
+    monkeypatch.setattr(client, "_health_payload", compatible)
+    with pytest.raises(HarnessError, match="did not stop cleanly"):
+        asyncio.run(
+            client_module._stop_incompatible_daemon(
+                harness_paths,
+                client,
+            )
+        )
+
+
+def test_client_filter_ignores_unrelated_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module.os, "getpid", lambda: 999)
+    monkeypatch.setattr(
+        client_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="python unrelated.py",
+            stderr="",
+        ),
+    )
+    assert client_module._filter_managed_daemon_pids({123}) == ()
+
+
 def test_cli_manages_sync_migration_and_service_stop(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -719,6 +817,7 @@ def test_cli_dispatches_every_session_control(
         [*base, "status"],
         [*base, "status", "session-1"],
         [*base, "--cwd", str(tmp_path), "providers"],
+        [*base, "capabilities"],
         [*base, "usage", "session-1"],
         [
             *base,
@@ -997,6 +1096,252 @@ def test_service_status_and_stop_preserve_local_daemon_behavior(
     assert len(stopped) == 1
 
 
+def test_cli_main_reports_bounded_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failures = [
+        (KeyboardInterrupt(), 130, ""),
+        (
+            HarnessError(
+                "E_TEST",
+                "bounded",
+                correlation_id="correlation-1",
+            ),
+            1,
+            "E_TEST: bounded [correlation correlation-1]",
+        ),
+        (ValueError("invalid"), 2, "E_INPUT: invalid"),
+        (RuntimeError("failed"), 1, "E_RUNTIME: failed"),
+    ]
+
+    for error, status, message in failures:
+        def fail(unused: object, selected: BaseException = error) -> int:
+            del unused
+            raise selected
+
+        monkeypatch.setattr(cli, "_run_tui_command", fail)
+        assert cli.main(["chat"]) == status
+        assert message in capsys.readouterr().err
+
+    async def run(unused: object) -> int:
+        del unused
+        return 9
+
+    monkeypatch.setattr(cli, "_run", run)
+    assert cli.main(["paths"]) == 9
+
+
+def test_cli_resume_validation_and_legacy_resume_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness_paths = object()
+    observed: list[str] = []
+
+    monkeypatch.setattr(cli, "paths", lambda unused: harness_paths)
+    monkeypatch.setattr(cli, "prepare_paths", lambda unused: None)
+
+    async def client(unused: object) -> object:
+        del unused
+        return object()
+
+    def run_tui(
+        unused_client: object,
+        unused_workspace: Path,
+        *,
+        session_id: str,
+        permission_mode: str,
+    ) -> None:
+        del unused_client
+        del unused_workspace
+        del permission_mode
+        observed.append(session_id)
+
+    monkeypatch.setattr(cli, "ensure_daemon", client)
+    monkeypatch.setattr(cli, "run_tui", run_tui)
+    missing = cli.parser().parse_args(
+        ["--cwd", str(tmp_path), "chat", "resume"]
+    )
+    with pytest.raises(ValueError, match="session UUID"):
+        cli._run_tui_command(missing)
+
+    chat_resume = cli.parser().parse_args(
+        ["--cwd", str(tmp_path), "chat", "resume", "session-2"]
+    )
+    assert cli._run_tui_command(chat_resume) == 0
+
+    resumed = cli.parser().parse_args(
+        ["--cwd", str(tmp_path), "resume", "session-1"]
+    )
+    assert cli._run_tui_command(resumed) == 0
+    assert observed == ["session-2", "session-1"]
+
+
+def test_cli_dispatches_process_and_failure_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    async def daemon(
+        harness_paths: object,
+        *,
+        tcp_host: str,
+        tcp_port: int,
+    ) -> None:
+        calls.append(("daemon", harness_paths, tcp_host, tcp_port))
+
+    async def worker(
+        harness_paths: object,
+        session_id: str,
+    ) -> None:
+        calls.append(("worker", harness_paths, session_id))
+
+    async def doctor(harness_paths: object) -> int:
+        calls.append(("doctor", harness_paths))
+        return 7
+
+    class Client:
+        async def request(
+            self,
+            method: str,
+            path: str,
+        ) -> dict[str, object]:
+            calls.append(("request", method, path))
+            return {"capabilities": []}
+
+    async def ensure(unused: object) -> Client:
+        del unused
+        return Client()
+
+    monkeypatch.setattr(cli, "run_daemon", daemon)
+    monkeypatch.setattr(cli, "_worker", worker)
+    monkeypatch.setattr(cli, "_doctor", doctor)
+    monkeypatch.setattr(cli, "ensure_daemon", ensure)
+    monkeypatch.setattr(
+        cli,
+        "publish_all",
+        lambda unused_paths, unused_store: {"state": "pending"},
+    )
+    base = ["--state-dir", str(tmp_path / "state")]
+    expected = [
+        ([*base, "paths"], 0),
+        ([*base, "daemon", "--tcp-port", "12"], 0),
+        ([*base, "service", "run", "--tcp-port", "13"], 0),
+        ([*base, "worker", "session-1"], 0),
+        ([*base, "sync"], 1),
+        ([*base, "doctor"], 7),
+        ([*base, "capabilities"], 0),
+    ]
+    for arguments, status in expected:
+        parsed = cli.parser().parse_args(arguments)
+        assert asyncio.run(cli._run(parsed)) == status
+
+    unsupported = SimpleNamespace(
+        command="unsupported",
+        state_dir=tmp_path / "state",
+    )
+    with pytest.raises(ValueError, match="unsupported command"):
+        asyncio.run(cli._run(unsupported))
+
+    output = capsys.readouterr().out
+    assert '"state": "pending"' in output
+    assert ("worker", cli.paths(tmp_path / "state"), "session-1") in calls
+
+
+def test_service_status_returns_failure_for_inactive_daemons(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    statuses = [
+        ServiceStatus(
+            active=False,
+            installed=False,
+            unit_version=None,
+            build_id="",
+            detail="not installed",
+        ),
+        ServiceStatus(
+            active=False,
+            installed=True,
+            unit_version=1,
+            build_id="build-1",
+            detail="inactive",
+        ),
+    ]
+
+    class Manager:
+        def status(self) -> ServiceStatus:
+            return statuses.pop(0)
+
+    class Client:
+        def __init__(self, unused: object) -> None:
+            del unused
+
+        async def health(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_service_manager", lambda: Manager())
+    monkeypatch.setattr(cli, "HarnessClient", Client)
+    arguments = cli.parser().parse_args(
+        [
+            "--state-dir",
+            str(tmp_path / "state"),
+            "service",
+            "status",
+        ]
+    )
+    assert asyncio.run(cli._run(arguments)) == 1
+    assert asyncio.run(cli._run(arguments)) == 1
+
+
+def test_worker_closes_storage_after_session_worker_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[object] = []
+    harness_paths = SimpleNamespace(
+        database=Path("database"),
+        blobs=Path("blobs"),
+    )
+
+    class Store:
+        def __init__(self, database: Path) -> None:
+            observed.append(("store", database))
+
+        def close(self) -> None:
+            observed.append("closed")
+
+    class Blobs:
+        def __init__(self, root: Path) -> None:
+            observed.append(("blobs", root))
+
+    class Adapter:
+        pass
+
+    class Worker:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            observed.append(("worker", args, kwargs))
+
+        async def run(self) -> None:
+            observed.append("run")
+
+    monkeypatch.setattr(cli, "StateStore", Store)
+    monkeypatch.setattr(cli, "BlobStore", Blobs)
+    monkeypatch.setattr(cli, "ClaudeAdapter", Adapter)
+    monkeypatch.setattr(cli, "CodexAdapter", Adapter)
+    monkeypatch.setattr(cli, "Scheduler", lambda *args: args)
+    monkeypatch.setattr(cli, "SessionWorker", Worker)
+
+    asyncio.run(cli._worker(harness_paths, "session-1"))
+
+    assert observed[-2:] == ["run", "closed"]
+    worker_call = observed[-3]
+    assert isinstance(worker_call, tuple)
+    assert worker_call[0] == "worker"
+
+
 def test_doctor_reports_bundle_service_daemon_and_storage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1064,6 +1409,19 @@ def test_doctor_reports_bundle_service_daemon_and_storage(
     assert cli._sync_lag_seconds({"updated_at": ""}) is None
     assert cli._sync_lag_seconds({"updated_at": "invalid"}) is None
 
+    selection = SimpleNamespace(
+        executable=tmp_path / "bundle" / "bin" / "agent-harness",
+        build_id="build-1",
+    )
+    monkeypatch.setattr(cli, "_installed_selection", lambda: selection)
+    monkeypatch.setattr(
+        cli,
+        "verify_bundle",
+        lambda unused: SimpleNamespace(content_digest="digest-1"),
+    )
+    assert asyncio.run(cli._doctor(harness_paths)) == 0
+    assert '"content_digest": "digest-1"' in capsys.readouterr().out
+
     harness_paths.state_dir.chmod(0o755)
     harness_paths.socket.write_text("not a socket", encoding="utf-8")
     harness_paths.socket.chmod(0o644)
@@ -1091,3 +1449,54 @@ def test_doctor_stale_timestamp_classification() -> None:
         "2099-01-01T00:00:00+00:00"
     )
     assert cli._timestamp_is_expired("invalid")
+    assert cli._sync_lag_seconds(
+        {"updated_at": "2099-01-01T00:00:00"}
+    ) == 0.0
+    assert cli._timestamp(
+        "2099-01-01T00:00:00"
+    ) == cli._timestamp("2099-01-01T00:00:00+00:00")
+
+
+def test_installed_bundle_selection_is_verified(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    launcher = tmp_path / "launcher"
+    executable = tmp_path / "bundle" / "bin" / "agent-harness"
+    selection = SimpleNamespace(
+        executable=executable,
+        build_id="build-1",
+    )
+    monkeypatch.setattr(cli, "default_launcher", lambda: launcher)
+    monkeypatch.setattr(cli, "read_selection", lambda unused: None)
+    with pytest.raises(ValueError, match="install a verified bundle"):
+        cli._installed_selection()
+
+    monkeypatch.setattr(
+        cli,
+        "read_selection",
+        lambda unused: selection,
+    )
+    monkeypatch.setattr(
+        cli,
+        "verify_bundle",
+        lambda unused: SimpleNamespace(build_id="build-2"),
+    )
+    with pytest.raises(ValueError, match="inconsistent"):
+        cli._installed_selection()
+
+    monkeypatch.setattr(
+        cli,
+        "verify_bundle",
+        lambda unused: SimpleNamespace(build_id="build-1"),
+    )
+    assert cli._installed_selection() is selection
+    assert isinstance(cli._service_manager(), cli.SystemdUserService)
+
+
+def test_cli_module_guard_invokes_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.sys, "argv", ["agent-harness"])
+    with pytest.raises(SystemExit, match="2"):
+        runpy.run_module("agent_harness.cli", run_name="__main__")

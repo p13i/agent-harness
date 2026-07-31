@@ -328,6 +328,10 @@ def _copy_tree_verified(source: Path, destination: Path) -> None:
     for source_path in sorted(source.rglob("*")):
         relative = source_path.relative_to(source)
         destination_path = destination / relative
+        if source_path.is_symlink():
+            raise RuntimeError(
+                "migration source contains an unsupported symlink"
+            )
         if source_path.is_dir():
             destination_path.mkdir(
                 parents=True,
@@ -335,10 +339,6 @@ def _copy_tree_verified(source: Path, destination: Path) -> None:
                 mode=0o700,
             )
             continue
-        if source_path.is_symlink():
-            raise RuntimeError(
-                "migration source contains an unsupported symlink"
-            )
         destination_path.parent.mkdir(
             parents=True,
             exist_ok=True,

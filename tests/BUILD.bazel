@@ -44,7 +44,52 @@ py_test(
         "test_support.py",
         "unit_test_runner.py",
     ],
+    data = ["//cmd:agent_harness.py"],
     main = "unit_test_runner.py",
+    deps = [
+        "//agent_harness",
+        "//cmd:agent_harness_lib",
+        "@agent_harness_pip//pytest",
+    ],
+)
+
+py_test(
+    name = "provider_boundaries_test",
+    srcs = ["provider_boundaries_test.gpt.py"],
+    main = "provider_boundaries_test.gpt.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
+)
+
+py_test(
+    name = "storage_boundaries_test",
+    srcs = [
+        "storage_boundaries_test.py",
+        "test_support.py",
+    ],
+    main = "storage_boundaries_test.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
+)
+
+py_test(
+    name = "core_boundaries_test",
+    srcs = ["core_boundaries_test.gpt.py"],
+    main = "core_boundaries_test.gpt.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
+)
+
+py_test(
+    name = "tui_boundaries_test",
+    srcs = ["tui_boundaries_test.gpt.py"],
+    main = "tui_boundaries_test.gpt.py",
     deps = [
         "//agent_harness",
         "@agent_harness_pip//pytest",

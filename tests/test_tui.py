@@ -20,6 +20,7 @@ from agent_harness.tui import HarnessApp
 from agent_harness.tui import TranscriptBlockView
 from agent_harness.tui import TranscriptView
 from agent_harness.tui import _connection_label
+from agent_harness.tui import _compact_connection_label
 from agent_harness.tui import _cursor_part
 from agent_harness.tui import _display_lifecycle
 from agent_harness.tui import _expanded_blocks
@@ -37,6 +38,7 @@ from agent_harness.tui import _status_glyph
 from agent_harness.tui import _system_dark_mode
 from agent_harness.tui import _transcript_block_classes
 from agent_harness.tui import _turn_detail
+from agent_harness.tui import _turn_list_label
 from agent_harness.tui import _visible_sessions
 from agent_harness.tui_presenter import ColorScheme
 from agent_harness.tui_presenter import ComposerState
@@ -1949,3 +1951,241 @@ def test_multiline_composer_validates_bounds_and_ignores_foreign_change() -> Non
     first.on_text_area_changed(event)
     submitted = MultilineComposer.Submitted(first, "message")
     assert submitted.control is first
+
+
+def test_textual_slash_commands_cover_workspace_controls(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        app = HarnessApp(
+            Client(),
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            if app._poll_timer is not None:
+                app._poll_timer.stop()
+            calls: list[tuple[str, object]] = []
+
+            async def command(value: str) -> None:
+                calls.append(("command", value))
+
+            async def no_argument() -> None:
+                calls.append(("async", "called"))
+
+            async def open_session(value: str) -> None:
+                calls.append(("open", value))
+
+            async def save(*, force: bool = False) -> None:
+                calls.append(("save", force))
+
+            async def native(value: str) -> None:
+                calls.append(("native", value))
+
+            def sync() -> None:
+                calls.append(("sync", "called"))
+
+            app._command = command  # type: ignore[method-assign]
+            app._new_session = no_argument  # type: ignore[method-assign]
+            app._checkpoint = no_argument  # type: ignore[method-assign]
+            app._load_sessions = no_argument  # type: ignore[method-assign]
+            app._poll = no_argument  # type: ignore[method-assign]
+            app._load_providers = no_argument  # type: ignore[method-assign]
+            app._open_session = open_session  # type: ignore[method-assign]
+            app._save_ui_state = save  # type: ignore[method-assign]
+            app._native = native  # type: ignore[method-assign]
+            app._render_inspector = sync  # type: ignore[method-assign]
+            app._render_transcript = sync  # type: ignore[method-assign]
+            app._render_session_list = no_argument  # type: ignore[method-assign]
+            app._sync_system_theme = save  # type: ignore[method-assign]
+            app._write_help = sync  # type: ignore[method-assign]
+
+            commands = (
+                "/help",
+                "/new",
+                "/interrupt",
+                "/pause",
+                "/resume",
+                "/stop",
+                "/export",
+                "/checkpoint",
+                "/archive",
+                "/unarchive",
+                "/rename Renamed session",
+                "/fork Parallel",
+                "/sessions invalid",
+                "/sessions focused",
+                "/events invalid",
+                "/events on",
+                "/events off",
+                "/sidebar reset",
+                "/mode invalid",
+                "/mode focus",
+                "/provider",
+                "/provider invalid",
+                "/provider auto",
+                "/provider claude",
+                "/model opus",
+                "/effort xhigh",
+                "/theme invalid",
+                "/theme dark",
+                "/permission full",
+                "/route",
+                "/providers",
+                "/usage",
+                "/budget",
+                "/budget extend invalid",
+                "/budget extend 60 100 reason",
+                "/budget xhigh reason",
+                "/budget invalid 1",
+                "/native codex",
+                "/approve approval-1 accept",
+                "/reconcile accept-current reconciliation-1 digest",
+                "/reconcile stop reconciliation-1 digest approval-1",
+                "/unknown",
+            )
+            for value in commands:
+                await app._slash(value)
+
+            assert ("command", "interrupt") in calls
+            assert ("native", "codex") in calls
+            assert app._session_filter == "focused"
+            assert not app._show_events
+            assert app._provider_override == "claude"
+            assert app._model_override == "opus"
+            assert app._effort_override == "xhigh"
+            assert app._theme_preference == "dark"
+
+    asyncio.run(scenario())
+
+
+def test_textual_inspector_tabs_and_helper_boundaries(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        app = HarnessApp(
+            Client(),
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            if app._poll_timer is not None:
+                app._poll_timer.stop()
+            app._goal = None
+            assert "No goal" in "\n".join(app._goal_lines())
+            app._goal = {
+                "kind": "finite",
+                "status": "active",
+                "objective": "Ship",
+            }
+            assert "Ship" in "\n".join(app._goal_lines())
+
+            app._safety = {
+                "session": {"profile": "interactive"},
+                "envelopes": "invalid",
+            }
+            app._providers = {}
+            usage = "\n".join(app._usage_lines())
+            assert "No model turn" in usage
+            assert "refresh is pending" in usage
+            app._safety["envelopes"] = [
+                {
+                    "state": "running",
+                    "consumption": {
+                        "total_tokens": 10,
+                        "tool_calls": 2,
+                    },
+                    "limits": {
+                        "max_total_tokens": 20,
+                        "max_tool_calls": 4,
+                    },
+                }
+            ]
+            app._providers = {
+                "codex": {"ready": True},
+                "claude": {"ready": False},
+            }
+            usage = "\n".join(app._usage_lines())
+            assert "10 / 20" in usage
+            assert "codex · ready" in usage
+
+            app._approvals = ()
+            assert "No pending" in "\n".join(app._approval_lines())
+            app._approvals = (
+                {
+                    "kind": "tool",
+                    "prompt": "Run?",
+                    "approval_id": "approval-1",
+                },
+            )
+            assert "Run?" in "\n".join(app._approval_lines())
+
+            app._reconciliations = ()
+            assert "No reconciliation" in "\n".join(
+                app._recovery_lines()
+            )
+            app._reconciliations = (
+                {
+                    "command_id": "command-1",
+                    "pre_dispatch_checkpoint_id": "checkpoint-1",
+                    "current_workspace_summary": "changed",
+                    "current_workspace_digest": "digest",
+                },
+            )
+            assert "command-1" in "\n".join(app._recovery_lines())
+
+            app._session["external_ref"] = {
+                "orchestrator": "autoplan",
+                "job_id": "job-1",
+            }
+            assert "autoplan / job-1" in "\n".join(
+                app._storage_lines()
+            )
+            for tab in (
+                "goal",
+                "usage",
+                "approvals",
+                "recovery",
+                "storage",
+                "routing",
+            ):
+                app._inspector_tab = tab
+                app._render_inspector()
+
+            app._write_notice("")
+            app._write_notice("[red]failed[/red]")
+            app._write_notice("[yellow]warning[/yellow]")
+            app._write_notice("information")
+            app._render_activity_marker()
+            app._transcript_state = (
+                app._transcript_state.with_reader_at_bottom(False)
+            )
+            app._render_activity_marker()
+
+    asyncio.run(scenario())
+
+    assert _compact_connection_label("reconnecting", "idle")
+    assert _compact_connection_label("send-unacknowledged", "idle")
+    assert _compact_connection_label("disconnected", "idle")
+    assert _compact_connection_label("connected", "working")
+    assert _compact_connection_label("connected", "needs-input")
+    assert _compact_connection_label("connected", "failed")
+    assert _compact_connection_label("connected", "idle")
+    for status in (
+        "complete",
+        "running",
+        "failed",
+        "unknown",
+    ):
+        label = _turn_list_label(
+            {
+                "status": status,
+                "turn_ref": {"agent_role": "builder"},
+                "attempts": [
+                    {"provider": "codex", "effort": "high"}
+                ],
+            }
+        )
+        assert "builder" in label

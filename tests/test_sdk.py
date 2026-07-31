@@ -544,6 +544,13 @@ def test_managed_sdk_requires_keys_and_waits_boundedly(
                 timeout=1,
                 poll_interval=0,
             )
+        statuses.append("queued")
+        command = await client.wait_command(
+            "command-1",
+            timeout=0.000000001,
+            poll_interval=0.001,
+        )
+        assert command.status == "queued"
 
     asyncio.run(scenario())
 

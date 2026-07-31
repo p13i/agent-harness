@@ -30,6 +30,9 @@ from agent_harness.terminal import terminal_socket
 from agent_harness.storage import SCHEMA_VERSION
 
 
+STREAM_HEARTBEAT_LIMIT = 3600
+
+
 def create_app(
     service: HarnessService,
     token: str,
@@ -261,11 +264,7 @@ async def run_daemon(
         service.recover_workers()
         stopped = asyncio.Event()
         loop = asyncio.get_running_loop()
-        for signal_value in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(signal_value, stopped.set)
-            except NotImplementedError:
-                continue
+        _register_stop_signals(loop, stopped)
         await stopped.wait()
     finally:
         sync_task.cancel()
@@ -538,7 +537,7 @@ async def _stream(request: web.Request) -> web.StreamResponse:
         },
     )
     await response.prepare(request)
-    for unused in range(3600):
+    for unused in range(STREAM_HEARTBEAT_LIMIT):
         del unused
         events = service.store.events(session_id, after=after, limit=500)
         for event in events:
@@ -557,6 +556,17 @@ async def _stream(request: web.Request) -> web.StreamResponse:
         await response.write(b": heartbeat\n\n")
         await asyncio.sleep(1.0)
     return response
+
+
+def _register_stop_signals(
+    loop: asyncio.AbstractEventLoop,
+    stopped: asyncio.Event,
+) -> None:
+    for signal_value in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signal_value, stopped.set)
+        except NotImplementedError:
+            continue
 
 
 async def _message(request: web.Request) -> web.Response:

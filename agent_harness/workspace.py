@@ -129,10 +129,11 @@ def _untracked_archive(workspace: Path) -> bytes:
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for raw in paths:
             relative = Path(os.fsdecode(raw))
-            target = (workspace / relative).resolve()
-            if not target.is_relative_to(workspace.resolve()):
+            candidate = workspace / relative
+            if candidate.is_symlink():
                 continue
-            if target.is_symlink():
+            target = candidate.resolve()
+            if not target.is_relative_to(workspace.resolve()):
                 continue
             if not target.is_file():
                 continue
@@ -199,4 +200,3 @@ def _git_input(workspace: Path, content: bytes, *arguments: str) -> None:
             "checkpoint patch does not apply cleanly",
             status=409,
         )
-

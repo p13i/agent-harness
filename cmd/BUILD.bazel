@@ -1,8 +1,15 @@
-load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 
 exports_files(
     ["agent_harness.py"],
     visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "agent_harness_lib",
+    srcs = ["agent_harness.py"],
+    visibility = ["//visibility:public"],
+    deps = ["//agent_harness"],
 )
 
 py_binary(

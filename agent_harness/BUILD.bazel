@@ -1,4 +1,4 @@
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 
 py_library(
     name = "agent_harness",
@@ -15,4 +15,18 @@ py_library(
         "@agent_harness_pip//cryptography",
         "@agent_harness_pip//textual",
     ],
+)
+
+py_binary(
+    name = "ui_gallery",
+    srcs = ["ui_gallery.py"],
+    main = "ui_gallery.py",
+    deps = [":agent_harness"],
+)
+
+py_binary(
+    name = "wsl_e2e",
+    srcs = ["wsl_e2e.py"],
+    main = "wsl_e2e.py",
+    deps = [":agent_harness"],
 )
