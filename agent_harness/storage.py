@@ -1270,6 +1270,78 @@ class StateStore:
             ).fetchone()
         return int(row["count"])
 
+    def presentation_turn_rows(
+        self,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return canonical records needed for rebuildable turn views."""
+
+        self.get_session(session_id)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT
+                    turns.turn_id,
+                    turns.attempt_id,
+                    turns.status AS turn_status,
+                    turns.replay_of,
+                    turns.started_at,
+                    turns.completed_at,
+                    turns.turn_step_id,
+                    turns.turn_agent_role,
+                    provider_attempts.provider,
+                    provider_attempts.model,
+                    provider_attempts.effort,
+                    provider_attempts.status AS attempt_status,
+                    provider_attempts.ended_at,
+                    command_dispatches.command_id,
+                    commands.status AS command_status,
+                    commands.payload_json,
+                    commands.result_json
+                FROM turns
+                LEFT JOIN provider_attempts
+                    ON provider_attempts.attempt_id = turns.attempt_id
+                LEFT JOIN command_dispatches
+                    ON command_dispatches.turn_id = turns.turn_id
+                LEFT JOIN commands
+                    ON commands.command_id = command_dispatches.command_id
+                WHERE turns.session_id = ?
+                ORDER BY turns.started_at, turns.turn_id
+                """,
+                (session_id,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload = _load_object(row["payload_json"] or "{}")
+            command_result = _load_object(row["result_json"] or "{}")
+            turn_ref: dict[str, str] = {}
+            if row["turn_step_id"]:
+                turn_ref = {
+                    "step_id": str(row["turn_step_id"]),
+                    "agent_role": str(row["turn_agent_role"]),
+                }
+            result.append(
+                {
+                    "turn_id": str(row["turn_id"]),
+                    "attempt_id": str(row["attempt_id"]),
+                    "turn_status": str(row["turn_status"]),
+                    "replay_of": str(row["replay_of"]),
+                    "started_at": str(row["started_at"]),
+                    "completed_at": str(row["completed_at"]),
+                    "turn_ref": turn_ref,
+                    "provider": str(row["provider"] or ""),
+                    "model": str(row["model"] or ""),
+                    "effort": str(row["effort"] or ""),
+                    "attempt_status": str(row["attempt_status"] or ""),
+                    "ended_at": str(row["ended_at"] or ""),
+                    "command_id": str(row["command_id"] or ""),
+                    "command_status": str(row["command_status"] or ""),
+                    "request_text": str(payload.get("text", "")),
+                    "command_result": command_result,
+                }
+            )
+        return result
+
     def completed_command_results(
         self,
         session_id: str,
@@ -1778,6 +1850,21 @@ class StateStore:
                 ORDER BY created_at, reconciliation_id
                 """,
                 (session_id, ReconciliationStatus.RESOLVED),
+            ).fetchall()
+        return [_reconciliation(row) for row in rows]
+
+    def all_reconciliations(
+        self,
+        session_id: str,
+    ) -> list[ReconciliationRecord]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE session_id = ?
+                ORDER BY created_at, reconciliation_id
+                """,
+                (session_id,),
             ).fetchall()
         return [_reconciliation(row) for row in rows]
 

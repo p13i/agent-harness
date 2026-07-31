@@ -14,6 +14,8 @@ from textual.widgets import Static
 from textual.widgets import Tabs
 
 from agent_harness.errors import HarnessError
+from agent_harness.tui import ApprovalScreen
+from agent_harness.tui import CommandPaletteScreen
 from agent_harness.tui import HarnessApp
 from agent_harness.tui import TranscriptBlockView
 from agent_harness.tui import TranscriptView
@@ -34,6 +36,7 @@ from agent_harness.tui import _session_status
 from agent_harness.tui import _status_glyph
 from agent_harness.tui import _system_dark_mode
 from agent_harness.tui import _transcript_block_classes
+from agent_harness.tui import _turn_detail
 from agent_harness.tui import _visible_sessions
 from agent_harness.tui_presenter import ColorScheme
 from agent_harness.tui_presenter import ComposerState
@@ -54,6 +57,7 @@ from agent_harness.tui_presenter import resolve_theme
 from agent_harness.tui_presenter import safe_metadata
 from agent_harness.tui_widgets import ComposerAction
 from agent_harness.tui_widgets import ComposerDraft
+from agent_harness.tui_widgets import DEFAULT_SLASH_COMMANDS
 from agent_harness.tui_widgets import MultilineComposer
 from agent_harness.tui_widgets import SlashCommand
 from agent_harness.tui_widgets import SlashValidationState
@@ -245,6 +249,183 @@ class DisconnectingClient(Client):
         )
 
 
+class SwitchingClient:
+    def __init__(self) -> None:
+        self.delayed: set[str] = set()
+        self.started = {
+            "session-a": asyncio.Event(),
+            "session-b": asyncio.Event(),
+        }
+        self.release = {
+            "session-a": asyncio.Event(),
+            "session-b": asyncio.Event(),
+        }
+        self.ui_states = {
+            "session-a": {
+                "composer": "draft-a",
+                "workspace_mode": "focus",
+                "theme": "dark",
+            },
+            "session-b": {
+                "composer": "draft-b",
+                "workspace_mode": "control",
+                "theme": "dark",
+            },
+        }
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload=None,
+        idempotency_key: str = "",
+    ):
+        del idempotency_key
+        if path in {"/v1/sessions", "/v1/sessions?archived=1"}:
+            return {
+                "sessions": [
+                    self._session("session-a"),
+                    self._session("session-b"),
+                ]
+            }
+        if path == "/v1/sync":
+            return {
+                "state_root": "/workspace/chats",
+                "sync": {"state": "synced"},
+            }
+        if path == "/v1/providers":
+            return {"providers": {}}
+        session_id = self._session_id(path)
+        if path.endswith("/ui-state"):
+            if method == "PUT" and payload is not None:
+                self.ui_states[session_id] = dict(payload)
+            return {"ui_state": dict(self.ui_states[session_id])}
+        if path.endswith("/reconciliations"):
+            return {"reconciliations": []}
+        if path.endswith("/turns?limit=200"):
+            return {"turns": [self._turn(session_id)]}
+        if path.endswith("/events?after=0"):
+            return {"events": [self._event(session_id)]}
+        if "/events?after=" in path:
+            return {"events": []}
+        if method == "PATCH":
+            return {"session": self._session(session_id)}
+        if path == "/v1/sessions/" + session_id:
+            if session_id in self.delayed:
+                self.started[session_id].set()
+                await self.release[session_id].wait()
+            return {
+                "session": self._session(session_id),
+                "goal": None,
+                "approvals": [],
+                "safety": {
+                    "session": {"profile": "interactive"},
+                    "envelopes": [],
+                    "incidents": [],
+                },
+            }
+        return {}
+
+    def _session_id(self, path: str) -> str:
+        parts = path.split("/")
+        if len(parts) > 3:
+            return parts[3]
+        return "session-a"
+
+    def _session(self, session_id: str) -> dict[str, object]:
+        return {
+            "session_id": session_id,
+            "name": "Thread " + session_id[-1].upper(),
+            "lifecycle": "running",
+            "attention": "idle",
+            "permission_mode": "approval",
+            "active_provider": "codex",
+            "model": "default",
+            "worktree": "/workspace",
+        }
+
+    def _event(self, session_id: str) -> dict[str, object]:
+        return {
+            "sequence": 1,
+            "event_id": "event-" + session_id,
+            "event_type": "user.message",
+            "role": "user",
+            "turn_id": "turn-" + session_id,
+            "text": "Only " + session_id,
+            "status": "complete",
+            "metadata": {},
+        }
+
+    def _turn(self, session_id: str) -> dict[str, object]:
+        return {
+            "turn_id": "turn-" + session_id,
+            "turn_ids": ["turn-" + session_id],
+            "command_id": "command-" + session_id,
+            "turn_ref": {},
+            "request": "Only " + session_id,
+            "status": "complete",
+            "first_sequence": 1,
+            "last_sequence": 1,
+            "attempts": [],
+            "result": {},
+            "safety": {},
+            "checkpoint_id": "",
+            "evidence": [],
+            "reconciliation": {},
+            "activity": [self._event(session_id)],
+        }
+
+
+class ApprovalClient(Client):
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload=None,
+        idempotency_key: str = "",
+    ):
+        if path.endswith("/events?after=0"):
+            return {
+                "events": [
+                    {
+                        "sequence": 1,
+                        "event_type": "approval.requested",
+                        "turn_id": "turn-1",
+                        "text": "Apply the bounded change?",
+                        "status": "pending",
+                        "metadata": {"approval_id": "approval-1"},
+                    }
+                ]
+            }
+        if path == "/v1/sessions/session-1":
+            value = await super().request(
+                method,
+                path,
+                payload=payload,
+                idempotency_key=idempotency_key,
+            )
+            value["approvals"] = [
+                {
+                    "approval_id": "approval-1",
+                    "kind": "workspace-write",
+                    "prompt": "Apply the bounded change?",
+                    "choices": [
+                        {"id": "approve", "label": "Approve"},
+                        {"id": "deny", "label": "Deny"},
+                    ],
+                }
+            ]
+            return value
+        return await super().request(
+            method,
+            path,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+
 def test_textual_workspace_restores_draft_and_inspector(
     tmp_path: Path,
 ) -> None:
@@ -273,6 +454,154 @@ def test_textual_workspace_restores_draft_and_inspector(
             assert "/Users/test/my/chats" in str(inspector.render())
             session_list = app.query_one("#session-list", ListView)
             assert session_list.children[0].has_class("active-session")
+
+    asyncio.run(scenario())
+
+
+def test_textual_session_switch_is_atomic_and_rejects_stale_loads(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client = SwitchingClient()
+        app = HarnessApp(
+            client,  # type: ignore[arg-type]
+            tmp_path,
+            session_id="session-a",
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            if app._poll_timer is not None:
+                app._poll_timer.stop()
+            composer = app.query_one("#composer", MultilineComposer)
+            composer.text = "edited draft-a"
+            title = app.query_one("#session-title", Static)
+            transcript = app.query_one("#transcript", TranscriptView)
+            initial_geometry = (
+                title.region,
+                transcript.region,
+                composer.region,
+            )
+
+            client.delayed = {"session-a", "session-b"}
+            switch_to_b = asyncio.create_task(
+                app._open_session("session-b")
+            )
+            await client.started["session-b"].wait()
+            await pilot.pause()
+            assert app.session_id == "session-a"
+            assert "Thread A" in str(title.render())
+            assert composer.text == "edited draft-a"
+            connection = app.query_one("#connection-state", Static)
+            assert "switching" in str(connection.render())
+            assert (
+                title.region,
+                transcript.region,
+                composer.region,
+            ) == initial_geometry
+
+            switch_to_a = asyncio.create_task(
+                app._open_session("session-a")
+            )
+            await client.started["session-a"].wait()
+            await pilot.pause()
+            assert app.session_id == "session-a"
+            assert composer.text == "edited draft-a"
+
+            client.release["session-b"].set()
+            await switch_to_b
+            await pilot.pause()
+            assert app.session_id == "session-a"
+            assert "session-b" not in app.export_screenshot()
+
+            client.release["session-a"].set()
+            await switch_to_a
+            await pilot.pause()
+            assert app.session_id == "session-a"
+            assert "Thread A" in str(title.render())
+            assert composer.text == "edited draft-a"
+            assert "session-b" not in app.export_screenshot()
+            assert not app.screen.has_class("switching")
+            assert "switching" not in str(connection.render())
+
+    asyncio.run(scenario())
+
+
+def test_textual_notifications_are_unified_and_action_first(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        app = HarnessApp(
+            ApprovalClient(),
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            if app._poll_timer is not None:
+                app._poll_timer.stop()
+            notification = app.query_one(
+                "#notification-message",
+                Static,
+            )
+            assert "Approval needed" in str(notification.render())
+            transcript = app.query_one("#transcript", TranscriptView)
+            assert "Approval needed" not in str(transcript.render())
+            assert not isinstance(app.screen, ApprovalScreen)
+
+            await pilot.click("#notification-primary")
+            await pilot.pause()
+            assert isinstance(app.screen, ApprovalScreen)
+            app.pop_screen()
+            await pilot.pause()
+
+            app._dismiss_notification("approval:approval-1")
+            app._write_notice(
+                "[yellow]Waiting for the original send "
+                "acknowledgement.[/yellow]"
+            )
+            assert "Waiting for the original send" in str(
+                notification.render()
+            )
+            assert "use /" not in str(notification.render()).casefold()
+
+            fired: list[bool] = []
+            app._notification_timer = app.set_timer(
+                0.01,
+                lambda: fired.append(True),
+            )
+            await app._open_session("session-1")
+            await pilot.pause(0.05)
+            assert fired == []
+            assert app._notification_timer is None
+
+    asyncio.run(scenario())
+
+
+def test_textual_modes_and_palette_share_durable_command_registry(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        client = Client()
+        app = HarnessApp(
+            client,
+            tmp_path,
+            session_id="session-1",
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            if app._poll_timer is not None:
+                app._poll_timer.stop()
+            await pilot.press("f3")
+            await pilot.pause()
+            assert app._workspace_mode == "control"
+            assert app.screen.has_class("control")
+            assert client.ui_updates[-1]["workspace_mode"] == "control"
+
+            await pilot.press("f2")
+            await pilot.pause()
+            assert isinstance(app.screen, CommandPaletteScreen)
+            results = app.screen.query_one("#command-results", ListView)
+            assert len(results.children) == len(DEFAULT_SLASH_COMMANDS)
 
     asyncio.run(scenario())
 
@@ -501,7 +830,7 @@ def test_transcript_block_renderer_covers_typed_visual_states() -> None:
     assert "magenta" in rendered[TranscriptBlockKind.APPROVAL]
     assert "#fb923c" in rendered[TranscriptBlockKind.RECONCILIATION]
     assert "red" in rendered[TranscriptBlockKind.WARNING]
-    assert "Click or focus" in rendered[TranscriptBlockKind.TOOL]
+    assert "Details collapsed" in rendered[TranscriptBlockKind.TOOL]
     assert "…" in rendered[TranscriptBlockKind.TOOL]
 
     expanded = _render_transcript_block(
@@ -539,12 +868,10 @@ def test_tui_projection_helpers_cover_invalid_and_attention_states() -> None:
     assert _session_status("running", "working") == "working"
     assert _session_status("paused", "needs-input") == "action needed"
     assert _session_status("running", "failed") == "needs attention"
-    assert _status_glyph("working").startswith("[bold yellow]")
-    assert _status_glyph("needs-reconciliation").startswith(
-        "[bold magenta]"
-    )
-    assert _status_glyph("failed").startswith("[bold red]")
-    assert _status_glyph("idle").startswith("[bold green]")
+    assert _status_glyph("working") == "◉"
+    assert _status_glyph("needs-reconciliation") == "◆"
+    assert _status_glyph("failed") == "●"
+    assert _status_glyph("idle") == "●"
     assert "agent working" in _connection_label("working")
     assert "action needed" in _connection_label("needs-input")
     assert "needs attention" in _connection_label("failed")
@@ -879,6 +1206,79 @@ def test_native_attachment_uses_pinned_provider_packages() -> None:
         "@anthropic-ai/claude-code@2.1.220",
         "--dangerously-skip-permissions",
     ]
+
+
+def test_control_turn_detail_tabs_are_bounded_and_distinct() -> None:
+    turn = {
+        "turn_id": "turn-1",
+        "request": "Build the bounded change.",
+        "status": "complete",
+        "attempts": [
+            {
+                "provider": "codex",
+                "model": "default",
+                "effort": "high",
+                "status": "complete",
+            }
+        ],
+        "result": {"status": "complete"},
+        "safety": {
+            "consumption": {"total_tokens": 42, "tool_calls": 2}
+        },
+        "activity": [
+            {
+                "event_type": "tool.result",
+                "status": "complete",
+                "text": "tests passed",
+            }
+        ],
+        "evidence": [
+            {
+                "event_type": "goal.evidence",
+                "status": "complete",
+                "text": "make test passed",
+            }
+        ],
+        "checkpoint_id": "checkpoint-1",
+        "_diff": {
+            "changed_files": ["app.py"],
+            "content": "@@ -1 +1 @@",
+            "binary": True,
+            "truncated": True,
+            "redactions": 1,
+        },
+        "reconciliation": {
+            "status": "pending",
+            "current_workspace_summary": "one changed file",
+            "reconciliation_id": "recovery-1",
+        },
+    }
+    assert "Build the bounded change." in _turn_detail(
+        turn,
+        tab="summary",
+    )
+    assert "tests passed" in _turn_detail(turn, tab="activity")
+    changes = _turn_detail(turn, tab="changes")
+    assert "app.py" in changes
+    assert "Binary bodies omitted" in changes
+    assert "Diff continues" in changes
+    assert "sensitive values hidden" in changes
+    assert "make test passed" in _turn_detail(turn, tab="evidence")
+    assert "one changed file" in _turn_detail(turn, tab="recovery")
+
+    empty = {
+        "turn_id": "turn-empty",
+        "activity": [],
+        "evidence": [],
+        "reconciliation": {},
+    }
+    assert "No recorded activity" in _turn_detail(
+        empty,
+        tab="activity",
+    )
+    assert "No checkpoint" in _turn_detail(empty, tab="changes")
+    assert "No evidence" in _turn_detail(empty, tab="evidence")
+    assert "No recovery" in _turn_detail(empty, tab="recovery")
 
 
 def test_budget_commands_require_explicit_operator_actions(

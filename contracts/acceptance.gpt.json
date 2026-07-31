@@ -1,6 +1,6 @@
 {
   "schema": "p13i/agent-harness/acceptance/v1",
-  "contract_version": "1.3.0",
+  "contract_version": "1.4.0",
   "journeys": [
     {
       "id": "AH-AC-001",
@@ -269,6 +269,30 @@
           "target": "external://p13i/agent-harness:wsl-e2e",
           "status": "pending"
         }
+      ]
+    },
+    {
+      "id": "AH-AC-041",
+      "title": "Resume the same durable state in Focus and Control modes",
+      "local_evidence": ["//tests:unit_tests", "//tests:chat_pty_test"]
+    },
+    {
+      "id": "AH-AC-042",
+      "title": "Present terse deduplicated notifications without transcript noise",
+      "local_evidence": ["//tests:unit_tests", "//tools:ui_gallery_test"]
+    },
+    {
+      "id": "AH-AC-043",
+      "title": "Switch chat threads atomically without stale-view jitter",
+      "local_evidence": ["//tests:unit_tests"]
+    },
+    {
+      "id": "AH-AC-044",
+      "title": "Inspect provider-neutral turns and redacted checkpoint diffs",
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests",
+        "//tools:ui_gallery_test"
       ]
     }
   ]

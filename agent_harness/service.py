@@ -29,6 +29,9 @@ from agent_harness.models import Lifecycle
 from agent_harness.models import PermissionMode
 from agent_harness.models import Session
 from agent_harness.orchestration import normalize_external_ref
+from agent_harness.presentation import checkpoint_diff
+from agent_harness.presentation import session_turn
+from agent_harness.presentation import session_turns
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
 from agent_harness.projections import write_session_projections
@@ -396,6 +399,48 @@ class HarnessService:
             for item in self.store.pending_reconciliations(session_id)
         ]
 
+    def turns(
+        self,
+        session_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        return session_turns(
+            self.store,
+            session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    def turn(
+        self,
+        session_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        return session_turn(self.store, session_id, turn_id)
+
+    def checkpoint_diff(
+        self,
+        session_id: str,
+        checkpoint_id: str,
+        *,
+        start_line: int = 0,
+        limit: int = 400,
+    ) -> dict[str, Any]:
+        require_uuid(session_id, "session_id")
+        require_uuid(checkpoint_id, "checkpoint_id")
+        self.store.get_session(session_id)
+        checkpoint = self.store.checkpoint(checkpoint_id)
+        if checkpoint.session_id != session_id:
+            raise ValueError("checkpoint does not belong to the session")
+        return checkpoint_diff(
+            checkpoint,
+            self.blobs,
+            start_line=start_line,
+            limit=limit,
+        )
+
     def inspect_reconciliation(
         self,
         reconciliation_id: str,
@@ -734,20 +779,25 @@ class HarnessService:
         require_uuid(session_id, "session_id")
         self.store.get_session(session_id)
         allowed = {
+            "active_drawer",
             "active_pane",
             "composer_cursor",
             "composer",
+            "control_detail_tab",
             "effort",
             "events",
             "expanded_blocks",
             "inspector_tab",
+            "last_notification_sequence",
             "model",
             "provider",
             "request_id",
+            "selected_turn_id",
             "session_filter",
             "session_query",
             "sidebar_width",
             "theme",
+            "workspace_mode",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -775,6 +825,7 @@ class HarnessService:
             "session_query",
             "sidebar_width",
             "theme",
+            "workspace_mode",
         }
         for session in self.store.list_sessions():
             if session.workspace != workspace:

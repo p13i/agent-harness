@@ -54,6 +54,7 @@ coverage:
 		--exclude agent_harness/terminal.py \
 		--group "presenter=100:agent_harness/tui_presenter.py,agent_harness/tui_widgets.py" \
 		--group "interaction-state=100:agent_harness/tui_presenter.py,agent_harness/tui_widgets.py" \
+		--group "presentation-state=100:agent_harness/presentation.py,agent_harness/notifications.py" \
 		--group "orchestration=100:agent_harness/orchestration.py" \
 		--group "reconciliation=100:agent_harness/reconciliation.py" \
 		--group "safety=100:agent_harness/safety.py" \

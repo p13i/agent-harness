@@ -149,6 +149,11 @@ def create_app(
         _set_ui_state,
     )
     app.router.add_get("/v1/sessions/{session_id}/events", _events)
+    app.router.add_get("/v1/sessions/{session_id}/turns", _turns)
+    app.router.add_get(
+        "/v1/sessions/{session_id}/turns/{turn_id}",
+        _turn,
+    )
     app.router.add_get("/v1/sessions/{session_id}/stream", _stream)
     app.router.add_post("/v1/sessions/{session_id}/messages", _message)
     app.router.add_post(
@@ -181,6 +186,10 @@ def create_app(
     app.router.add_post(
         "/v1/sessions/{session_id}/checkpoints",
         _checkpoint,
+    )
+    app.router.add_get(
+        "/v1/sessions/{session_id}/checkpoints/{checkpoint_id}/diff",
+        _checkpoint_diff,
     )
     app.router.add_post(
         "/v1/sessions/{session_id}/fork",
@@ -493,6 +502,25 @@ async def _events(request: web.Request) -> web.Response:
     )
 
 
+async def _turns(request: web.Request) -> web.Response:
+    value = _service(request).turns(
+        request.match_info["session_id"],
+        after_sequence=_integer(
+            request.query.get("after_sequence", "0")
+        ),
+        limit=_integer(request.query.get("limit", "50")),
+    )
+    return web.json_response(value)
+
+
+async def _turn(request: web.Request) -> web.Response:
+    value = _service(request).turn(
+        request.match_info["session_id"],
+        request.match_info["turn_id"],
+    )
+    return web.json_response(value)
+
+
 async def _stream(request: web.Request) -> web.StreamResponse:
     service = _service(request)
     session_id = request.match_info["session_id"]
@@ -662,6 +690,16 @@ async def _checkpoint(request: web.Request) -> web.Response:
             "checkpoint": _service(request).checkpoint(session_id)
         },
     )
+
+
+async def _checkpoint_diff(request: web.Request) -> web.Response:
+    value = _service(request).checkpoint_diff(
+        request.match_info["session_id"],
+        request.match_info["checkpoint_id"],
+        start_line=_integer(request.query.get("start_line", "0")),
+        limit=_integer(request.query.get("limit", "400")),
+    )
+    return web.json_response({"diff": value})
 
 
 async def _fork(request: web.Request) -> web.Response:

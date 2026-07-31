@@ -164,7 +164,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
     ):
         requests.append((method, path, payload, idempotency_key))
         if path == "/v1/capabilities":
-            return {"api_version": "1.3.0"}
+            return {"api_version": "1.4.0"}
         if path == "/v1/sessions" and method == "GET":
             return {"sessions": [{"session_id": "session-1"}]}
         if path == "/v1/sessions?archived=1":
@@ -181,6 +181,17 @@ def test_typed_sdk_covers_the_complete_control_plane(
             return {"ui_state": {"composer": "draft"}}
         if "/events?" in path:
             return {"events": [{"sequence": 1}]}
+        if "/checkpoints/" in path and "/diff?" in path:
+            return {
+                "diff": {
+                    "checkpoint_id": "checkpoint-1",
+                    "content": "@@ -1 +1 @@",
+                }
+            }
+        if "/turns/" in path:
+            return {"turn": {"turn_id": "turn-1"}}
+        if "/turns?" in path:
+            return {"turns": [{"turn_id": "turn-1"}]}
         if path.endswith("/approvals"):
             return {"approvals": [{"approval_id": "approval-1"}]}
         if "/approvals/" in path:
@@ -257,7 +268,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
     monkeypatch.setattr(client.raw, "request", request)
 
     async def scenario() -> None:
-        assert (await client.capabilities())["api_version"] == "1.3.0"
+        assert (await client.capabilities())["api_version"] == "1.4.0"
         assert len(await client.list_sessions()) == 1
         assert len(
             await client.list_sessions(include_archived=True)
@@ -315,6 +326,24 @@ def test_typed_sdk_covers_the_complete_control_plane(
         assert (
             await client.events("session-1", after=1, limit=2)
         ).events[0]["sequence"] == 1
+        assert (
+            await client.turns(
+                "session-1",
+                after_sequence=2,
+                limit=3,
+            )
+        )["turns"][0]["turn_id"] == "turn-1"
+        assert (
+            await client.turn("session-1", "turn-1")
+        )["turn"]["turn_id"] == "turn-1"
+        assert (
+            await client.checkpoint_diff(
+                "session-1",
+                "checkpoint-1",
+                start_line=4,
+                limit=12,
+            )
+        )["checkpoint_id"] == "checkpoint-1"
         assert (
             await client.send_message("session-1", "continue")
         ).command_id == "command-1"
@@ -420,6 +449,19 @@ def test_typed_sdk_covers_the_complete_control_plane(
     assert any(
         item[1].endswith("/budget-extensions")
         and bool(item[3])
+        for item in requests
+    )
+    assert any(
+        item[1]
+        == "/v1/sessions/session-1/turns?after_sequence=2&limit=3"
+        for item in requests
+    )
+    assert any(
+        item[1]
+        == (
+            "/v1/sessions/session-1/checkpoints/checkpoint-1/"
+            "diff?start_line=4&limit=12"
+        )
         for item in requests
     )
     assert any(

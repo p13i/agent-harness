@@ -36,11 +36,16 @@ def main() -> int:
     openapi = (root / "contracts" / "openapi.gpt.yaml").read_text(
         encoding="utf-8"
     )
+    presentation_schema = json.loads(
+        (root / "schemas" / "presentation.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
     journeys = contract.get("journeys")
     if not isinstance(journeys, list):
         raise AssertionError("acceptance journeys must be an array")
     expected_ids = [
-        "AH-AC-" + str(index).zfill(3) for index in range(1, 41)
+        "AH-AC-" + str(index).zfill(3) for index in range(1, 45)
     ]
     actual_ids = [str(item.get("id", "")) for item in journeys]
     if actual_ids != expected_ids:
@@ -48,6 +53,20 @@ def main() -> int:
     version = str(contract.get("contract_version", ""))
     if "version: " + version not in openapi:
         raise AssertionError("acceptance evidence is stale")
+    if presentation_schema.get("$id") != (
+        "p13i/agent-harness/presentation/v1"
+    ):
+        raise AssertionError("presentation schema is stale")
+    for path in (
+        "/v1/sessions/{session_id}/turns:",
+        "/v1/sessions/{session_id}/turns/{turn_id}:",
+        (
+            "/v1/sessions/{session_id}/checkpoints/"
+            "{checkpoint_id}/diff:"
+        ),
+    ):
+        if path not in openapi:
+            raise AssertionError("presentation endpoint is undocumented")
     for journey in journeys:
         _validate_journey(journey)
     return 0

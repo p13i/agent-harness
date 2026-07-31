@@ -56,6 +56,30 @@ hidden unless `/events on` activates the diagnostic view.
 `/theme system` tracks the host appearance; `/theme light`
 and `/theme dark` select an explicit appearance.
 
+Focus mode is the default conversation workspace. Press
+`F3` or run `/mode control` to open the turn timeline;
+repeat the action or run `/mode focus` to return. Control
+mode groups retries and failover attempts under one turn.
+Its detail tabs separate Summary, Activity, Changes,
+Evidence, and Recovery. Selecting a checkpointed turn loads
+its bounded, redacted diff without restoring historical
+workspace state.
+
+`F2` opens the searchable action palette. `F1` opens the
+same palette, and slash completion uses the same command
+registry. Ordinary status messages appear in one compact
+notification surface. Decision-required states provide
+buttons for their existing actions and remain visible until
+resolved or deferred; notification text is not inserted into
+the conversation.
+
+Thread changes are atomic. The current transcript, header,
+and composer remain stable until the selected session is
+ready. Rapid selection ignores late responses from obsolete
+requests. Returning to a recently viewed session restores
+its draft, selection, focus, scroll position, and mode from
+the bounded local view cache while canonical state refreshes.
+
 The composer accepts multiple lines. `Enter` sends,
 `Shift+Enter` and `Ctrl+J` insert a newline, and pasted text
 never submits by itself. During a connection loss the
@@ -240,6 +264,35 @@ result = client.wait_command(
 Managed methods require caller-supplied idempotency keys.
 Interactive conveniences may generate keys automatically.
 
+Read logical turns and a safe checkpoint diff through the
+same typed client:
+
+```python
+page = await client.turns(
+    session_id,
+    after_sequence=0,
+    limit=50,
+)
+turn = await client.turn(
+    session_id,
+    page["turns"][0]["turn_id"],
+)
+diff = await client.checkpoint_diff(
+    session_id,
+    turn["turn"]["checkpoint_id"],
+    start_line=0,
+    limit=400,
+)
+```
+
+The corresponding authenticated HTTP endpoints are:
+
+```text
+GET /v1/sessions/{session_id}/turns
+GET /v1/sessions/{session_id}/turns/{turn_id}
+GET /v1/sessions/{session_id}/checkpoints/{checkpoint_id}/diff
+```
+
 ## Recovery
 
 The stable resume identifier is the harness session UUID,
@@ -299,7 +352,11 @@ make ui-gallery
 
 These targets use scripted adapters and do not invoke live
 providers. The gallery renders every declared interface
-fixture in both themes and all four breakpoints without
+fixture in Focus and Control modes, both themes, and all
+four breakpoints: 176 screenshots exported from the actual
+Textual widget tree. It rejects secret-bearing content,
+outbound resources, clipping, overlapping notification and
+composer regions, and missing keyboard focus without
 network or provider access.
 
 On WSL, the opt-in service journey installs and exercises an

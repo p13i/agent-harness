@@ -296,6 +296,14 @@ DEFAULT_SLASH_COMMANDS = (
         first_argument_choices=("reset",),
     ),
     SlashCommand(
+        "/mode",
+        "Choose Focus or Control",
+        "/mode <focus|control>",
+        min_arguments=1,
+        max_arguments=1,
+        first_argument_choices=("focus", "control"),
+    ),
+    SlashCommand(
         "/provider",
         "Choose a provider",
         "/provider <auto|claude|codex>",

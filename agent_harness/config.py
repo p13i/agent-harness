@@ -10,7 +10,7 @@ import secrets
 import socket
 
 
-API_VERSION = "1.3.0"
+API_VERSION = "1.4.0"
 CONTROL_PROTOCOL_VERSION = 3
 
 

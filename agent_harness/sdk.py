@@ -262,6 +262,59 @@ class AgentHarnessClient:
         )
         return EventPage(_object_tuple(result.get("events")))
 
+    async def turns(
+        self,
+        session_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        query = urlencode(
+            {
+                "after_sequence": str(after_sequence),
+                "limit": str(limit),
+            }
+        )
+        return await self.raw.request(
+            "GET",
+            "/v1/sessions/" + session_id + "/turns?" + query,
+        )
+
+    async def turn(
+        self,
+        session_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        return await self.raw.request(
+            "GET",
+            "/v1/sessions/" + session_id + "/turns/" + turn_id,
+        )
+
+    async def checkpoint_diff(
+        self,
+        session_id: str,
+        checkpoint_id: str,
+        *,
+        start_line: int = 0,
+        limit: int = 400,
+    ) -> dict[str, Any]:
+        query = urlencode(
+            {
+                "start_line": str(start_line),
+                "limit": str(limit),
+            }
+        )
+        result = await self.raw.request(
+            "GET",
+            "/v1/sessions/"
+            + session_id
+            + "/checkpoints/"
+            + checkpoint_id
+            + "/diff?"
+            + query,
+        )
+        return _object(result.get("diff"))
+
     async def stream_events(
         self,
         session_id: str,

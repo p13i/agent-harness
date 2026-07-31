@@ -113,6 +113,65 @@ async def test_api_inspects_and_resolves_reconciliation(
             turn_id,
             checkpoint.checkpoint_id,
         )
+        service.store.append_event(
+            session_id,
+            "checkpoint.created",
+            status="complete",
+            metadata={"checkpoint_id": checkpoint.checkpoint_id},
+            turn_id=turn_id,
+        )
+        turn_page = await client.get(
+            "/v1/sessions/"
+            + session_id
+            + "/turns?after_sequence=0&limit=10",
+            headers=headers,
+        )
+        assert turn_page.status == 200
+        turn_page_value = await turn_page.json()
+        assert turn_page_value["turns"][0]["turn_id"] == turn_id
+        assert turn_page_value["turns"][0]["checkpoint_id"] == (
+            checkpoint.checkpoint_id
+        )
+        assert "payload_json" not in str(turn_page_value)
+        turn_detail = await client.get(
+            "/v1/sessions/" + session_id + "/turns/" + turn_id,
+            headers=headers,
+        )
+        assert (await turn_detail.json())["turn"]["turn_ids"] == [
+            turn_id
+        ]
+        diff = await client.get(
+            "/v1/sessions/"
+            + session_id
+            + "/checkpoints/"
+            + checkpoint.checkpoint_id
+            + "/diff?start_line=0&limit=10",
+            headers=headers,
+        )
+        assert diff.status == 200
+        assert (await diff.json())["diff"]["checkpoint_id"] == (
+            checkpoint.checkpoint_id
+        )
+        unauthorized_turns = await client.get(
+            "/v1/sessions/" + session_id + "/turns"
+        )
+        assert unauthorized_turns.status == 401
+        invalid_turn_page = await client.get(
+            "/v1/sessions/"
+            + session_id
+            + "/turns?after_sequence=-1",
+            headers=headers,
+        )
+        assert invalid_turn_page.status == 400
+        invalid_diff_page = await client.get(
+            "/v1/sessions/"
+            + session_id
+            + "/checkpoints/"
+            + checkpoint.checkpoint_id
+            + "/diff?start_line=-1",
+            headers=headers,
+        )
+        assert invalid_diff_page.status == 400
         service.store.mark_provider_boundary(attempt.attempt_id)
         digest, summary = inspect_workspace(Path(session.worktree))
         recovery = service.store.recover_interrupted_commands(
@@ -277,7 +336,7 @@ async def test_api_creates_session_and_accepts_message(
             headers=headers,
         )
         capabilities_value = await capabilities.json()
-        assert capabilities_value["api_version"] == "1.3.0"
+        assert capabilities_value["api_version"] == "1.4.0"
         assert capabilities_value["control_protocol_version"] == (
             CONTROL_PROTOCOL_VERSION
         )

@@ -1,11 +1,12 @@
 openapi: 3.1.0
 info:
   title: p13i agent harness
-  version: 1.3.0
+  version: 1.4.0
   description: >-
     Durable provider-neutral agent sessions, goals, events,
     approvals, routing, checkpoints, terminals, and fleet
-    transfer, external orchestration, and reconciliation.
+    transfer, external orchestration, reconciliation, and
+    safe human-facing turn and diff projections.
 servers:
   - url: https://localhost
 security:
@@ -140,6 +141,34 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/turns:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: listPresentationTurns
+      parameters:
+        - $ref: "#/components/parameters/AfterSequence"
+        - $ref: "#/components/parameters/PresentationLimit"
+      responses:
+        "200":
+          description: Provider-neutral logical turn page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TurnPage"
+  /v1/sessions/{session_id}/turns/{turn_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/TurnId"
+    get:
+      operationId: getPresentationTurn
+      responses:
+        "200":
+          description: One provider-neutral logical turn
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TurnDetail"
   /v1/sessions/{session_id}/usage:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -275,6 +304,22 @@ paths:
       responses:
         "201":
           $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/checkpoints/{checkpoint_id}/diff:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/CheckpointId"
+    get:
+      operationId: getCheckpointDiff
+      parameters:
+        - $ref: "#/components/parameters/StartLine"
+        - $ref: "#/components/parameters/DiffLimit"
+      responses:
+        "200":
+          description: Redacted and bounded checkpoint diff
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CheckpointDiffResponse"
   /v1/sessions/{session_id}/fork:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -436,6 +481,20 @@ components:
       schema:
         type: string
         format: uuid
+    TurnId:
+      name: turn_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CheckpointId:
+      name: checkpoint_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     CommandId:
       name: command_id
       in: path
@@ -507,6 +566,36 @@ components:
         minimum: 1
         maximum: 5000
         default: 1000
+    AfterSequence:
+      name: after_sequence
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    PresentationLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    StartLine:
+      name: start_line
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    DiffLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 400
   requestBodies:
     JsonObject:
       required: false
@@ -526,6 +615,210 @@ components:
           schema:
             type: object
   schemas:
+    PresentationAttempt:
+      type: object
+      additionalProperties: false
+      required:
+        - turn_id
+        - attempt_id
+        - provider
+        - model
+        - effort
+        - status
+        - started_at
+        - ended_at
+      properties:
+        turn_id:
+          type: string
+        attempt_id:
+          type: string
+        provider:
+          type: string
+        model:
+          type: string
+        effort:
+          type: string
+        status:
+          type: string
+        started_at:
+          type: string
+        ended_at:
+          type: string
+    PresentationTurn:
+      type: object
+      additionalProperties: false
+      required:
+        - turn_id
+        - turn_ids
+        - command_id
+        - turn_ref
+        - request
+        - status
+        - started_at
+        - completed_at
+        - first_sequence
+        - last_sequence
+        - attempts
+        - result
+        - safety
+        - checkpoint_id
+        - evidence
+        - reconciliation
+        - activity
+      properties:
+        turn_id:
+          type: string
+        turn_ids:
+          type: array
+          items:
+            type: string
+        command_id:
+          type: string
+        turn_ref:
+          type: object
+        request:
+          type: string
+        status:
+          type: string
+        started_at:
+          type: string
+        completed_at:
+          type: string
+        first_sequence:
+          type: integer
+          minimum: 0
+        last_sequence:
+          type: integer
+          minimum: 0
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/PresentationAttempt"
+        result:
+          type: object
+        safety:
+          type: object
+        checkpoint_id:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: object
+        reconciliation:
+          type: object
+        activity:
+          type: array
+          items:
+            type: object
+    TurnPage:
+      type: object
+      required:
+        - schema
+        - session_id
+        - revision
+        - after_sequence
+        - next_after_sequence
+        - turns
+        - session_activity
+      properties:
+        schema:
+          const: p13i/agent-harness/presentation/v1
+        session_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          minimum: 0
+        after_sequence:
+          type: integer
+          minimum: 0
+        next_after_sequence:
+          type: integer
+          minimum: 0
+        turns:
+          type: array
+          items:
+            $ref: "#/components/schemas/PresentationTurn"
+        session_activity:
+          type: array
+          items:
+            type: object
+    TurnDetail:
+      type: object
+      required:
+        - schema
+        - session_id
+        - revision
+        - turn
+      properties:
+        schema:
+          const: p13i/agent-harness/presentation/v1
+        session_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          minimum: 0
+        turn:
+          $ref: "#/components/schemas/PresentationTurn"
+    CheckpointDiffResponse:
+      type: object
+      required:
+        - diff
+      properties:
+        diff:
+          $ref: "#/components/schemas/CheckpointDiff"
+    CheckpointDiff:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - checkpoint_id
+        - session_id
+        - language
+        - start_line
+        - next_start_line
+        - total_lines
+        - truncated
+        - redactions
+        - binary
+        - changed_files
+        - content
+      properties:
+        schema:
+          const: p13i/agent-harness/presentation/v1
+        checkpoint_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        language:
+          const: diff
+        start_line:
+          type: integer
+          minimum: 0
+        next_start_line:
+          oneOf:
+            - type: integer
+              minimum: 0
+            - type: "null"
+        total_lines:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        redactions:
+          type: integer
+          minimum: 0
+        binary:
+          type: boolean
+        changed_files:
+          type: array
+          items:
+            type: string
+        content:
+          type: string
     CreateSession:
       type: object
       required:

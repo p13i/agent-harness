@@ -1,14 +1,18 @@
-"""Render deterministic agent-harness interface galleries."""
+"""Render deterministic galleries from the real Textual widget tree."""
 
 from __future__ import annotations
 
 import argparse
-import html
+import asyncio
 import json
 from pathlib import Path
+import re
+from typing import Any
 
-from agent_harness.tui_presenter import decide_layout
-from agent_harness.tui_presenter import resolve_theme
+from textual.containers import Horizontal
+from textual.widgets import Static
+
+from agent_harness.tui import HarnessApp
 
 
 FIXTURES = (
@@ -24,6 +28,7 @@ FIXTURES = (
     "archived",
     "high-session-count",
 )
+MODES = ("focus", "control")
 BREAKPOINTS = (
     (60, 20),
     (80, 24),
@@ -33,31 +38,416 @@ BREAKPOINTS = (
 THEMES = ("light", "dark")
 
 
+class GalleryClient:
+    """Network-free canonical fixture source for visual evidence."""
+
+    def __init__(self, fixture: str, theme: str) -> None:
+        self.fixture = fixture
+        self.theme = theme
+        self.ui_state: dict[str, Any] = {
+            "composer": "",
+            "theme": theme,
+            "workspace_mode": "focus",
+        }
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        del idempotency_key
+        if method == "PUT" and path.endswith("/ui-state"):
+            if payload is not None:
+                self.ui_state = dict(payload)
+            return {"ui_state": dict(self.ui_state)}
+        if path in {"/v1/sessions", "/v1/sessions?archived=1"}:
+            return {"sessions": self._sessions()}
+        if path == "/v1/sync":
+            return {
+                "state_root": "/workspace/chats",
+                "sync": {"state": "synced"},
+            }
+        if path == "/v1/providers":
+            return {
+                "providers": {
+                    "codex": {
+                        "ready": True,
+                        "usage": {"binding_percent": 42},
+                        "usage_refreshing": False,
+                    },
+                    "claude": {
+                        "ready": True,
+                        "usage": {"binding_percent": 31},
+                        "usage_refreshing": False,
+                    },
+                }
+            }
+        if path.endswith("/ui-state"):
+            return {"ui_state": dict(self.ui_state)}
+        if path.endswith("/events?after=0"):
+            return {"events": self._events()}
+        if "/events?after=" in path:
+            return {"events": []}
+        if path.endswith("/turns?limit=200"):
+            return {"turns": self._turns()}
+        if path.endswith("/reconciliations"):
+            return {"reconciliations": self._reconciliations()}
+        if path.endswith("/usage"):
+            return {"safety": self._safety()}
+        if path.endswith("/budget-extensions"):
+            return {"safety": self._safety()}
+        if path == "/v1/sessions/gallery-session":
+            return self._session_snapshot()
+        if method == "PATCH" and path == "/v1/sessions/gallery-session":
+            return {"session": self._session()}
+        if method == "POST" and path == "/v1/sync":
+            return {"sync": {"state": "synced"}}
+        return {}
+
+    def _session(self) -> dict[str, Any]:
+        lifecycle = "running"
+        attention = "idle"
+        if self.fixture == "streaming" or self.fixture == "tool-heavy":
+            attention = "working"
+        if self.fixture == "approval":
+            attention = "needs-input"
+        if self.fixture == "guarded":
+            lifecycle = "paused"
+            attention = "guarded"
+        if self.fixture == "disconnected":
+            attention = "working"
+        if self.fixture == "reconciliation":
+            lifecycle = "paused"
+            attention = "needs-input"
+        if self.fixture == "archived":
+            lifecycle = "stopped"
+        return {
+            "session_id": "gallery-session",
+            "name": self.fixture.replace("-", " ").title(),
+            "workspace": "/workspace/agent-harness",
+            "worktree": "/workspace/agent-harness",
+            "lifecycle": lifecycle,
+            "attention": attention,
+            "active_provider": "codex",
+            "model": "default",
+            "effort": "high",
+            "permission_mode": "approval",
+            "archived": self.fixture == "archived",
+        }
+
+    def _session_snapshot(self) -> dict[str, Any]:
+        approvals: list[dict[str, Any]] = []
+        if self.fixture == "approval":
+            approvals.append(
+                {
+                    "approval_id": "approval-gallery",
+                    "kind": "workspace-write",
+                    "prompt": "Apply the checkpointed workspace change?",
+                    "choices": [
+                        {"id": "approve", "label": "Approve"},
+                        {"id": "deny", "label": "Deny"},
+                    ],
+                }
+            )
+        return {
+            "session": self._session(),
+            "goal": {
+                "kind": "finite",
+                "status": "active",
+                "objective": "Ship a bounded, verified agent workspace.",
+            },
+            "approvals": approvals,
+            "safety": self._safety(),
+        }
+
+    def _sessions(self) -> list[dict[str, Any]]:
+        count = 5
+        if self.fixture == "high-session-count":
+            count = 32
+        sessions = [self._session()]
+        for index in range(1, count):
+            sessions.append(
+                {
+                    "session_id": "gallery-" + str(index),
+                    "name": "Build lane " + str(index),
+                    "lifecycle": "running",
+                    "attention": "idle",
+                    "active_provider": "claude",
+                    "archived": False,
+                }
+            )
+        return sessions
+
+    def _events(self) -> list[dict[str, Any]]:
+        if self.fixture in {"empty", "new-session"}:
+            return []
+        user = {
+            "sequence": 1,
+            "event_id": "event-user",
+            "event_type": "user.message",
+            "role": "user",
+            "turn_id": "turn-gallery",
+            "text": "Implement the durable presentation contract.",
+            "status": "complete",
+            "metadata": {},
+        }
+        if self.fixture == "streaming":
+            return [
+                user,
+                {
+                    "sequence": 2,
+                    "event_id": "event-agent",
+                    "event_type": "agent.message.delta",
+                    "role": "assistant",
+                    "turn_id": "turn-gallery",
+                    "text": "Validating the interface and contract",
+                    "status": "streaming",
+                    "metadata": {},
+                },
+            ]
+        if self.fixture == "tool-heavy":
+            return [
+                user,
+                {
+                    "sequence": 2,
+                    "event_id": "event-agent",
+                    "event_type": "agent.message",
+                    "role": "assistant",
+                    "turn_id": "turn-gallery",
+                    "text": "The bounded implementation is ready.",
+                    "status": "complete",
+                    "metadata": {},
+                },
+                {
+                    "sequence": 3,
+                    "event_id": "event-tool",
+                    "event_type": "tool.result",
+                    "role": "tool",
+                    "turn_id": "turn-gallery",
+                    "text": "142 tests passed",
+                    "status": "complete",
+                    "metadata": {"name": "bazel test"},
+                },
+            ]
+        if self.fixture == "approval":
+            return [
+                user,
+                {
+                    "sequence": 2,
+                    "event_id": "event-approval",
+                    "event_type": "approval.requested",
+                    "role": "",
+                    "turn_id": "turn-gallery",
+                    "text": "Apply the checkpointed workspace change?",
+                    "status": "pending",
+                    "metadata": {"approval_id": "approval-gallery"},
+                },
+            ]
+        if self.fixture == "guarded":
+            return [
+                user,
+                {
+                    "sequence": 2,
+                    "event_id": "event-guard",
+                    "event_type": "safety.guarded",
+                    "role": "",
+                    "turn_id": "turn-gallery",
+                    "text": "",
+                    "status": "guarded",
+                    "metadata": {"reason": "Budget limit reached"},
+                },
+            ]
+        if self.fixture == "reconciliation":
+            return [
+                user,
+                {
+                    "sequence": 2,
+                    "event_id": "event-recovery",
+                    "event_type": "reconciliation.requested",
+                    "role": "",
+                    "turn_id": "turn-gallery",
+                    "text": "",
+                    "status": "pending",
+                    "metadata": {
+                        "reconciliation_id": "reconciliation-gallery"
+                    },
+                },
+            ]
+        if self.fixture == "long-code":
+            return [
+                user,
+                {
+                    "sequence": 2,
+                    "event_id": "event-code",
+                    "event_type": "agent.message",
+                    "role": "assistant",
+                    "turn_id": "turn-gallery",
+                    "text": (
+                        "```python\n"
+                        "def bounded_turn(store, session_id):\n"
+                        "    checkpoint = store.checkpoint(session_id)\n"
+                        "    return checkpoint.as_dict()\n"
+                        "```"
+                    ),
+                    "status": "complete",
+                    "metadata": {},
+                },
+            ]
+        if self.fixture == "archived":
+            return [
+                {
+                    "sequence": 1,
+                    "event_id": "event-archived",
+                    "event_type": "session.archived",
+                    "role": "",
+                    "turn_id": "",
+                    "text": "",
+                    "status": "complete",
+                    "metadata": {},
+                }
+            ]
+        return [
+            user,
+            {
+                "sequence": 2,
+                "event_id": "event-agent",
+                "event_type": "agent.message",
+                "role": "assistant",
+                "turn_id": "turn-gallery",
+                "text": "The durable session remains available.",
+                "status": "complete",
+                "metadata": {},
+            },
+        ]
+
+    def _turns(self) -> list[dict[str, Any]]:
+        if self.fixture in {"empty", "new-session"}:
+            return []
+        status = "complete"
+        if self.fixture in {
+            "approval",
+            "guarded",
+            "reconciliation",
+            "streaming",
+        }:
+            status = "running"
+        recovery: dict[str, Any] = {}
+        if self.fixture == "reconciliation":
+            recovery = {
+                "reconciliation_id": "reconciliation-gallery",
+                "status": "pending",
+            }
+        return [
+            {
+                "turn_id": "turn-gallery",
+                "turn_ids": ["turn-gallery"],
+                "command_id": "command-gallery",
+                "turn_ref": {
+                    "step_id": "presentation",
+                    "agent_role": "implementer",
+                },
+                "request": "Implement the durable presentation contract.",
+                "status": status,
+                "started_at": "2026-07-30T12:00:00+00:00",
+                "completed_at": "2026-07-30T12:00:04+00:00",
+                "first_sequence": 1,
+                "last_sequence": 2,
+                "attempts": [
+                    {
+                        "turn_id": "turn-gallery",
+                        "attempt_id": "attempt-gallery",
+                        "provider": "codex",
+                        "model": "default",
+                        "effort": "high",
+                        "status": status,
+                        "started_at": "2026-07-30T12:00:00+00:00",
+                        "ended_at": "2026-07-30T12:00:04+00:00",
+                    }
+                ],
+                "result": {"status": status, "provider": "codex"},
+                "safety": {
+                    "state": status,
+                    "consumption": {
+                        "total_tokens": 1842,
+                        "tool_calls": 5,
+                    },
+                },
+                "checkpoint_id": "checkpoint-gallery",
+                "evidence": [],
+                "reconciliation": recovery,
+                "activity": self._events(),
+            }
+        ]
+
+    def _reconciliations(self) -> list[dict[str, Any]]:
+        if self.fixture != "reconciliation":
+            return []
+        return [
+            {
+                "reconciliation_id": "reconciliation-gallery",
+                "command_id": "command-gallery",
+                "pre_dispatch_checkpoint_id": "checkpoint-gallery",
+                "current_workspace_summary": "one changed file",
+                "current_workspace_digest": "digest-gallery",
+            }
+        ]
+
+    def _safety(self) -> dict[str, Any]:
+        return {
+            "session": {"profile": "interactive"},
+            "envelopes": [
+                {
+                    "state": "running",
+                    "guard_reason": "",
+                    "recovery_stage": 0,
+                    "limits": {
+                        "max_total_tokens": 300000,
+                        "max_seconds": 3600,
+                        "max_tool_calls": 256,
+                    },
+                    "consumption": {
+                        "total_tokens": 1842,
+                        "input_tokens": 1600,
+                        "cached_input_tokens": 200,
+                        "context_tokens": 1200,
+                        "elapsed_seconds": 4.2,
+                        "tool_calls": 5,
+                        "output_tokens": 242,
+                        "exact_tokens": True,
+                    },
+                }
+            ],
+            "incidents": [],
+        }
+
+
 def render_gallery(output: Path) -> dict[str, object]:
+    """Render every normalized UI state without external processes."""
+
+    return asyncio.run(_render_gallery(output))
+
+
+async def _render_gallery(output: Path) -> dict[str, object]:
     output.mkdir(parents=True, exist_ok=True)
     files: list[str] = []
     for fixture in FIXTURES:
-        for theme in THEMES:
-            for width, height in BREAKPOINTS:
-                name = (
-                    fixture
-                    + "-"
-                    + theme
-                    + "-"
-                    + str(width)
-                    + "x"
-                    + str(height)
-                    + ".svg"
+        for mode in MODES:
+            for theme in THEMES:
+                rendered = await _render_mode_theme(
+                    output,
+                    fixture,
+                    mode,
+                    theme,
                 )
-                content = render_svg(fixture, theme, width, height)
-                if "secret" in content.casefold():
-                    raise ValueError("gallery contains secret-bearing text")
-                path = output / name
-                path.write_text(content, encoding="utf-8")
-                files.append(name)
+                files.extend(rendered)
     manifest = {
-        "schema": "p13i/agent-harness/ui-gallery/v1",
+        "schema": "p13i/agent-harness/ui-gallery/v2",
+        "renderer": "textual-widget-tree",
         "fixtures": list(FIXTURES),
+        "modes": list(MODES),
         "themes": list(THEMES),
         "breakpoints": [
             {"width": width, "height": height}
@@ -72,430 +462,153 @@ def render_gallery(output: Path) -> dict[str, object]:
     return manifest
 
 
+async def _render_mode_theme(
+    output: Path,
+    fixture: str,
+    mode: str,
+    theme: str,
+) -> list[str]:
+    client = GalleryClient(fixture, theme)
+    app = HarnessApp(
+        client,  # type: ignore[arg-type]
+        Path("/workspace/agent-harness"),
+        session_id="gallery-session",
+    )
+    files: list[str] = []
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        if app._poll_timer is not None:
+            app._poll_timer.stop()
+        app._set_workspace_mode(mode)
+        if fixture == "disconnected":
+            app._set_connection_state("reconnecting")
+        await pilot.pause()
+        for width, height in BREAKPOINTS:
+            await pilot.resize_terminal(width, height)
+            await pilot.pause()
+            _validate_layout(app)
+            content = _self_contained_svg(app.export_screenshot())
+            if "secret" in content.casefold():
+                raise ValueError("gallery contains secret-bearing text")
+            name = (
+                fixture
+                + "-"
+                + mode
+                + "-"
+                + theme
+                + "-"
+                + str(width)
+                + "x"
+                + str(height)
+                + ".svg"
+            )
+            (output / name).write_text(content, encoding="utf-8")
+            files.append(name)
+    return files
+
+
 def render_svg(
     fixture: str,
     theme: str,
     columns: int,
     rows: int,
+    *,
+    mode: str = "focus",
 ) -> str:
+    """Render one actual Textual screenshot for focused tests."""
+
     if fixture not in FIXTURES:
         raise ValueError("unknown gallery fixture")
     if theme not in THEMES:
         raise ValueError("unknown gallery theme")
-    layout = decide_layout(columns, rows)
-    tokens = resolve_theme(theme, system_dark=False)
-    scale = 8
-    width = columns * scale
-    height = rows * 16
-    sidebar_width = 0
-    if layout.sidebar_visible:
-        sidebar_width = min(248, max(176, width // 5))
-    inspector_width = 0
-    if layout.inspector_visible:
-        inspector_width = min(288, max(232, width // 5))
-    main_x = sidebar_width
-    main_width = width - sidebar_width - inspector_width
-    if main_width < 320:
-        main_width = width
-        main_x = 0
-    colors = tokens.colors
-    status_color = colors.success
-    if fixture == "approval":
-        status_color = colors.approval
-    elif fixture == "guarded":
-        status_color = colors.danger
-    elif fixture == "disconnected":
-        status_color = colors.warning
-    elif fixture == "reconciliation":
-        status_color = colors.reconciliation
-    transcript = _fixture_lines(fixture)
-    composer_y = height - 104
-    blocks = _transcript_blocks(
-        transcript,
-        main_x + 20,
-        96,
-        main_width - 40,
-        colors,
-        status_color,
-        composer_y - 12,
-    )
-    sidebar = ""
-    if sidebar_width:
-        sidebar = _sidebar(sidebar_width, height, colors, fixture)
-    inspector = ""
-    if inspector_width:
-        inspector = _inspector(
-            width - inspector_width,
-            inspector_width,
-            height,
-            colors,
-            fixture,
-        )
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="'
-        + str(width)
-        + '" height="'
-        + str(height)
-        + '" viewBox="0 0 '
-        + str(width)
-        + " "
-        + str(height)
-        + '">'
-        + '<rect width="100%" height="100%" fill="'
-        + colors.canvas
-        + '"/>'
-        + '<rect width="100%" height="48" fill="'
-        + colors.surface
-        + '"/>'
-        + _text(16, 30, "P13I AGENT HARNESS", colors.active, 14, True)
-        + _text(
-            width - 116,
-            30,
-            "● " + _fixture_status(fixture),
-            status_color,
-            12,
-            False,
-        )
-        + sidebar
-        + inspector
-        + _text(
-            main_x + 20,
-            76,
-            _fixture_title(fixture),
-            colors.text,
-            16,
-            True,
-        )
-        + blocks
-        + _composer(
-            main_x + 20,
-            composer_y,
-            main_width - 40,
-            colors,
-            fixture,
-        )
-        + "</svg>\n"
+    if mode not in MODES:
+        raise ValueError("unknown gallery mode")
+    if (columns, rows) not in BREAKPOINTS:
+        raise ValueError("unknown gallery breakpoint")
+    return asyncio.run(
+        _render_one(fixture, mode, theme, columns, rows)
     )
 
 
-def _sidebar(width: int, height: int, colors, fixture: str) -> str:
-    labels = (
-        "NEEDS ATTENTION",
-        "◆ Durable recovery",
-        "ACTIVE",
-        "● Agent harness",
-        "RECENT",
-        "○ API contract",
-    )
-    content = (
-        '<rect y="48" width="'
-        + str(width)
-        + '" height="'
-        + str(height - 48)
-        + '" fill="'
-        + colors.surface
-        + '"/>'
-        + _text(16, 76, "WORKSPACE", colors.text_muted, 10, True)
-        + _text(16, 98, "agent-harness", colors.text, 13, True)
-        + _text(16, 126, "Search sessions", colors.text_muted, 11, False)
-    )
-    y = 166
-    for label in labels:
-        color = colors.text
-        size = 12
-        bold = False
-        if label.isupper():
-            color = colors.text_muted
-            size = 10
-            bold = True
-        content += _text(16, y, label, color, size, bold)
-        y += 24
-    if fixture == "archived":
-        content += _text(16, y, "ARCHIVED", colors.text_muted, 10, True)
-        content += _text(
-            16,
-            y + 24,
-            "○ Migration notes",
-            colors.text,
-            12,
-            False,
-        )
-    return content
-
-
-def _inspector(
-    x: int,
-    width: int,
-    height: int,
-    colors,
+async def _render_one(
     fixture: str,
+    mode: str,
+    theme: str,
+    columns: int,
+    rows: int,
 ) -> str:
-    content = (
-        '<rect x="'
-        + str(x)
-        + '" y="48" width="'
-        + str(width)
-        + '" height="'
-        + str(height - 48)
-        + '" fill="'
-        + colors.surface
-        + '"/>'
-        + _text(
-            x + 16,
-            76,
-            "CONTEXT  GOAL  USAGE",
-            colors.text_muted,
-            10,
-            True,
-        )
+    client = GalleryClient(fixture, theme)
+    app = HarnessApp(
+        client,  # type: ignore[arg-type]
+        Path("/workspace/agent-harness"),
+        session_id="gallery-session",
     )
-    if fixture == "reconciliation":
-        lines = (
-            "RECOVERY",
-            "Interrupted command",
-            "checkpoint-01",
-            "one changed file",
-            "accept · restore · stop",
-        )
-    else:
-        lines = (
-            "ROUTING",
-            "provider  automatic",
-            "effort    bounded",
-            "",
-            "STORAGE",
-            "state     synchronized",
-            "session   resume UUID",
-        )
-    y = 112
-    for line in lines:
-        color = colors.text
-        if line.isupper():
-            color = colors.active
-        content += _text(x + 16, y, line, color, 11, line.isupper())
-        y += 24
-    return content
+    async with app.run_test(size=(columns, rows)) as pilot:
+        await pilot.pause()
+        if app._poll_timer is not None:
+            app._poll_timer.stop()
+        app._set_workspace_mode(mode)
+        if fixture == "disconnected":
+            app._set_connection_state("reconnecting")
+        await pilot.pause()
+        _validate_layout(app)
+        return _self_contained_svg(app.export_screenshot())
 
 
-def _transcript_blocks(
-    lines: tuple[tuple[str, str], ...],
-    x: int,
-    y: int,
-    width: int,
-    colors,
-    status_color: str,
-    maximum_y: int,
-) -> str:
-    content = ""
-    current_y = y
-    previous_end = y
-    for index, (title, body) in enumerate(lines):
-        block_height = 68
-        if "\n" in body:
-            block_height = 88
-        if current_y + block_height > maximum_y:
-            marker_y = current_y
-            if marker_y + 28 > maximum_y:
-                marker_y = maximum_y - 20
-            marker_y = max(previous_end + 4, marker_y)
-            marker_height = maximum_y - marker_y
-            if marker_height >= 20:
-                remaining = len(lines) - index
-                content += (
-                    '<rect x="'
-                    + str(x)
-                    + '" y="'
-                    + str(marker_y)
-                    + '" width="'
-                    + str(max(120, width))
-                    + '" height="'
-                    + str(marker_height)
-                    + '" rx="5" fill="'
-                    + colors.surface
-                    + '" stroke="'
-                    + colors.border
-                    + '"/>'
-                    + _text(
-                        x + 14,
-                        marker_y + min(19, marker_height - 5),
-                        str(remaining)
-                        + " more blocks · scroll transcript",
-                        colors.text_muted,
-                        10,
-                        True,
-                    )
-                )
-            break
-        border = colors.border
-        title_color = colors.text_muted
-        if title == "AGENT":
-            border = colors.success
-            title_color = colors.success
-        if title in {"RECOVERY", "APPROVAL", "WARNING"}:
-            border = status_color
-            title_color = status_color
-        content += (
-            '<rect x="'
-            + str(x)
-            + '" y="'
-            + str(current_y)
-            + '" width="'
-            + str(max(120, width))
-            + '" height="'
-            + str(block_height)
-            + '" rx="5" fill="'
-            + colors.surface
-            + '" stroke="'
-            + border
-            + '"/>'
-        )
-        content += _text(
-            x + 14,
-            current_y + 22,
-            title,
-            title_color,
-            10,
-            True,
-        )
-        body_y = current_y + 44
-        for body_line in body.splitlines():
-            content += _text(
-                x + 14,
-                body_y,
-                body_line,
-                colors.text,
-                12,
-                False,
+def _validate_layout(app: HarnessApp) -> None:
+    composer = app.query_one("#composer-shell")
+    body = app.query_one("#body")
+    topbar = app.query_one("#topbar")
+    notification = app.query_one("#notification-shell", Horizontal)
+    if topbar.region.bottom > body.region.y:
+        raise ValueError("topbar overlaps the workspace body")
+    if composer.region.bottom > app.screen.region.bottom:
+        raise ValueError("composer is clipped")
+    if composer.region.width < 20 or composer.region.height < 3:
+        raise ValueError("composer lacks usable geometry")
+    if (
+        notification.display
+        and notification.region.bottom > composer.region.y
+    ):
+        raise ValueError("notification overlaps the composer")
+    if app.focused is None:
+        raise ValueError("gallery lacks keyboard focus")
+    brand = app.query_one("#brand", Static)
+    if "P13I" not in str(brand.render()):
+        raise ValueError("gallery lacks product identity")
+
+
+def _self_contained_svg(content: str) -> str:
+    value = re.sub(
+        r"\s*@font-face\s*\{.*?\}\s*",
+        "\n",
+        content,
+        flags=re.DOTALL,
+    )
+    value = re.sub(
+        r"(Generated with Rich)\s+https?://[^ <]+",
+        r"\1",
+        value,
+    )
+    resource_text = value.replace(
+        'xmlns="http://www.w3.org/2000/svg"',
+        "",
+    )
+    resources = sorted(
+        set(
+            re.findall(
+                r"https?://[^\s\"'<>)}]+",
+                resource_text,
+                re.IGNORECASE,
             )
-            body_y += 17
-        previous_end = current_y + block_height
-        current_y += block_height + 12
-    return content
-
-
-def _composer(
-    x: int,
-    y: int,
-    width: int,
-    colors,
-    fixture: str,
-) -> str:
-    draft = "Ask, build, debug, or steer the active agent…"
-    if fixture == "new-session":
-        draft = "Describe the first bounded outcome…"
-    return (
-        '<rect x="'
-        + str(x)
-        + '" y="'
-        + str(y)
-        + '" width="'
-        + str(max(120, width))
-        + '" height="76" rx="8" fill="'
-        + colors.surface
-        + '" stroke="'
-        + colors.focus
-        + '"/>'
-        + _text(x + 14, y + 22, "MESSAGE", colors.active, 10, True)
-        + _text(x + 14, y + 46, draft, colors.text_muted, 12, False)
-        + _text(
-            x + 14,
-            y + 66,
-            "Enter send · Shift+Enter newline · interactive · approval",
-            colors.text_muted,
-            9,
-            False,
         )
     )
-
-
-def _fixture_lines(fixture: str) -> tuple[tuple[str, str], ...]:
-    if fixture == "empty":
-        return (("SYSTEM", "Durable session ready"),)
-    if fixture == "new-session":
-        return (("SYSTEM", "No model starts until you send a message."),)
-    if fixture == "streaming":
-        return (
-            ("YOU", "Implement the public session contract."),
-            ("AGENT", "I am validating the migration and API…"),
+    if resources:
+        raise ValueError(
+            "gallery contains an outbound resource: "
+            + ", ".join(resources[:3])
         )
-    if fixture == "tool-heavy":
-        return (
-            ("AGENT", "I am running bounded local checks."),
-            ("TOOL · TEST", "120 passed · details collapsed"),
-            ("TOOL · BUILD", "bundle verified · details collapsed"),
-        )
-    if fixture == "approval":
-        return (("APPROVAL", "Restore the pre-turn checkpoint?"),)
-    if fixture == "guarded":
-        return (("WARNING", "Turn paused at the safety envelope."),)
-    if fixture == "disconnected":
-        return (("SYSTEM", "Reconnecting · original send retained"),)
-    if fixture == "reconciliation":
-        return (
-            (
-                "RECOVERY",
-                "Provider dispatch was interrupted.\n"
-                "Inspect before accepting, restoring, or stopping.",
-            ),
-        )
-    if fixture == "long-code":
-        return (
-            (
-                "AGENT",
-                "def bounded_turn():\n"
-                "    return checkpoint_before_dispatch()",
-            ),
-        )
-    if fixture == "archived":
-        return (("SYSTEM", "Archived sessions remain searchable."),)
-    return (
-        ("SYSTEM", "32 sessions · attention grouped first"),
-        ("AGENT", "The active stream remains stable."),
-    )
-
-
-def _fixture_title(fixture: str) -> str:
-    return fixture.replace("-", " ").title()
-
-
-def _fixture_status(fixture: str) -> str:
-    if fixture == "disconnected":
-        return "reconnecting"
-    if fixture == "reconciliation":
-        return "action needed"
-    if fixture == "approval":
-        return "approval"
-    if fixture == "guarded":
-        return "guarded"
-    return "connected"
-
-
-def _text(
-    x: int,
-    y: int,
-    value: str,
-    color: str,
-    size: int,
-    bold: bool,
-) -> str:
-    weight = "400"
-    if bold:
-        weight = "700"
-    return (
-        '<text x="'
-        + str(x)
-        + '" y="'
-        + str(y)
-        + '" fill="'
-        + color
-        + '" font-family="ui-monospace, monospace" font-size="'
-        + str(size)
-        + '" font-weight="'
-        + weight
-        + '">'
-        + html.escape(value)
-        + "</text>"
-    )
+    return value
 
 
 def main(arguments: list[str] | None = None) -> int:

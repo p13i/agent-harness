@@ -97,17 +97,51 @@ selection, focus, and expanded state. A retained request ID
 connects the multiline composer to command idempotency
 during disconnect and reconnect.
 
+Focus and Control are two projections over that same
+session. Focus prioritizes conversation and steering.
+Control groups provider attempts under their logical
+command and exposes Summary, Activity, Changes, Evidence,
+and Recovery views. The projection is rebuilt from commands,
+turns, attempts, dispatches, events, checkpoints, safety,
+and reconciliation records. It is not a second source of
+truth.
+
+The authenticated presentation API returns allowlisted
+logical turns and line-paged checkpoint diffs. It excludes
+private blob identifiers and raw provider payloads. Diff
+reads omit sensitive paths and binary bodies and redact
+credential-shaped values before returning content.
+
+Notifications are immutable projections of canonical events
+and connection transitions. Stable keys coalesce repeat
+polls and replace progressing state in place. Transient
+outcomes, retained activity, and decision-required cards use
+one presentation model. Notification copy does not enter the
+transcript.
+
+Session selection uses a monotonic generation. The outgoing
+tree remains mounted while the incoming UI state, session,
+events, turns, and reconciliation state load concurrently.
+Only the latest generation may apply. A bounded
+least-recently-used view cache retains the draft, cursor,
+scroll, focus, mode, expanded blocks, and timeline selection
+for immediate revisits.
+
 Durable interface state is limited to presentation concerns:
 draft and cursor, selected inspector tab, sidebar width and
 visibility, session query, theme override, expanded block
-IDs, and any unacknowledged request ID. The canonical
+IDs, Focus or Control mode, selected turn, Control detail
+tab, active drawer, last acknowledged notification
+sequence, and any unacknowledged request ID. The canonical
 conversation, goal, approvals, and recovery state remain in
 their existing durable records.
 
 The layout presenter declares deterministic modes from
 `60x20` through `160x48`. The system appearance drives the
 default theme while an explicit light or dark override
-remains durable.
+remains durable. Visual acceptance evidence is exported from
+the real Textual widget tree rather than a parallel
+illustration renderer.
 
 ## Usage safety
 

@@ -31,6 +31,7 @@ py_test(
         "test_cli.py",
         "test_goals.py",
         "test_normalize.py",
+        "test_presentation.py",
         "test_projections.py",
         "test_routing.py",
         "test_safety.py",
@@ -73,6 +74,7 @@ py_test(
     ],
     data = ["//cmd:agent-harness"],
     main = "chat_pty_test_runner.py",
+    tags = ["exclusive"],
     deps = ["@agent_harness_pip//pytest"],
 )
 
@@ -97,6 +99,7 @@ py_test(
     data = [
         "//contracts:acceptance.gpt.json",
         "//contracts:openapi.gpt.yaml",
+        "//schemas:presentation.schema.json",
     ],
     main = "acceptance_test.gpt.py",
     deps = ["//agent_harness"],

@@ -7,10 +7,15 @@ import os
 from pathlib import Path
 import pty
 import select
+import sqlite3
+import struct
 import subprocess
 import tempfile
 import termios
 import time
+
+
+STARTUP_TIMEOUT_SECONDS = 20
 
 
 def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
@@ -33,7 +38,11 @@ def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
     primary = -1
     replica = -1
     try:
-        _wait_for_socket(state / ".runtime" / "control.sock", daemon)
+        _wait_for_socket(
+            state / ".runtime" / "control.sock",
+            daemon,
+            timeout=STARTUP_TIMEOUT_SECONDS,
+        )
         primary, replica = pty.openpty()
         terminal_attributes = termios.tcgetattr(replica)
         terminal_attributes[0] &= ~termios.IXON
@@ -60,10 +69,21 @@ def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
             env=environment,
             preexec_fn=configure_child_terminal,
         )
-        output = _read_until(primary, b"P13I AGENT HARNESS", timeout=8)
+        output = _read_until(
+            primary,
+            b"P13I AGENT HARNESS",
+            timeout=STARTUP_TIMEOUT_SECONDS,
+        )
         terminal_attributes = termios.tcgetattr(replica)
         terminal_attributes[0] &= ~termios.IXON
         termios.tcsetattr(replica, termios.TCSANOW, terminal_attributes)
+        os.write(primary, b"\x1bOR")
+        output += _read_until(primary, b"Control", timeout=5)
+        fcntl.ioctl(
+            replica,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", 20, 60, 0, 0),
+        )
         time.sleep(0.5)
         os.write(primary, b"\x11")
         return_code, trailing_output = _wait_for_exit(
@@ -79,6 +99,52 @@ def test_chat_starts_and_quits_in_a_real_pty(tmp_path: Path) -> None:
         assert b"P13I AGENT HARNESS" in output
         assert b"Traceback" not in output
         assert b"signal only works in main thread" not in output
+
+        with sqlite3.connect(state / ".runtime" / "state.sqlite3") as db:
+            row = db.execute(
+                "SELECT session_id FROM sessions "
+                "ORDER BY created_at LIMIT 1"
+            ).fetchone()
+        assert row is not None
+        session_id = str(row[0])
+
+        os.close(primary)
+        primary = -1
+        primary, replica = pty.openpty()
+        terminal_attributes = termios.tcgetattr(replica)
+        terminal_attributes[0] &= ~termios.IXON
+        termios.tcsetattr(replica, termios.TCSANOW, terminal_attributes)
+        chat = subprocess.Popen(
+            [
+                str(launcher),
+                "--state-dir",
+                str(state),
+                "--cwd",
+                str(workspace),
+                "chat",
+                "resume",
+                session_id,
+            ],
+            stdin=replica,
+            stdout=replica,
+            stderr=replica,
+            env=environment,
+            preexec_fn=configure_child_terminal,
+        )
+        resumed_output = _read_until(
+            primary,
+            b"Control",
+            timeout=STARTUP_TIMEOUT_SECONDS,
+        )
+        os.write(primary, b"\x11")
+        return_code, trailing_output = _wait_for_exit(
+            chat,
+            primary,
+            timeout=5,
+        )
+        resumed_output += trailing_output
+        assert return_code == 0
+        assert b"Traceback" not in resumed_output
     finally:
         if replica >= 0:
             os.close(replica)
@@ -111,8 +177,10 @@ def _launcher() -> Path:
 def _wait_for_socket(
     socket: Path,
     daemon: subprocess.Popen[bytes],
+    *,
+    timeout: float = 8,
 ) -> None:
-    deadline = time.monotonic() + 8
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if socket.exists():
             return
