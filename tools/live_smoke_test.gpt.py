@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,7 +38,7 @@ def test_live_smoke_uses_bazel_callers_workspace(
 
 def test_live_smoke_refuses_to_invoke_without_confirmation() -> None:
     result = subprocess.run(
-        [str(_launcher()), "codex"],
+        [str(_launcher())],
         check=False,
         capture_output=True,
         text=True,
@@ -45,6 +47,104 @@ def test_live_smoke_refuses_to_invoke_without_confirmation() -> None:
     assert result.returncode == 2
     assert "--confirm-spend is required" in result.stderr
     assert "no provider was invoked" in result.stderr
+
+
+def test_live_smoke_uses_exactly_one_turn_per_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _smoke_module()
+    providers: list[str] = []
+    stopped: list[str] = []
+
+    class Client:
+        raw = object()
+
+        def __init__(self, unused_paths: object) -> None:
+            del unused_paths
+
+        async def create_session(
+            self,
+            workspace: Path,
+            **values: object,
+        ) -> dict[str, str]:
+            assert workspace == tmp_path
+            assert values["permission_mode"] == "read-only"
+            assert values["execution_profile"] == "live-smoke"
+            return {"session_id": "session-1"}
+
+        async def send_message(
+            self,
+            session_id: str,
+            prompt: str,
+            *,
+            provider: str,
+            effort: str,
+            workload: str,
+        ) -> SimpleNamespace:
+            assert session_id == "session-1"
+            assert prompt == module.PROVIDER_PROMPTS[provider]
+            assert effort == "low"
+            assert workload == "operations"
+            providers.append(provider)
+            return SimpleNamespace(command_id="command-" + provider)
+
+        async def usage(self, session_id: str) -> dict[str, object]:
+            assert session_id == "session-1"
+            return {
+                "envelopes": [
+                    {
+                        "profile": "live-smoke",
+                        "limits": {"max_attempts": 1},
+                    },
+                    {
+                        "profile": "live-smoke",
+                        "limits": {"max_attempts": 1},
+                    },
+                ]
+            }
+
+        async def command(self, session_id: str, action: str) -> None:
+            assert action == "stop"
+            stopped.append(session_id)
+
+    async def ready(unused_paths: object) -> None:
+        del unused_paths
+
+    async def complete(
+        unused_raw: object,
+        command_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, object]:
+        del unused_raw
+        assert timeout == 330
+        provider = command_id.removeprefix("command-")
+        return {
+            "status": "complete",
+            "result": {"native_session_id": "native-" + provider},
+        }
+
+    monkeypatch.setattr(module, "ensure_daemon", ready)
+    monkeypatch.setattr(module, "AgentHarnessClient", Client)
+    monkeypatch.setattr(module, "wait_command", complete)
+    result = asyncio.run(
+        module.run(
+            SimpleNamespace(
+                confirm_spend=True,
+                state_dir=tmp_path / "state",
+                workspace=tmp_path,
+            )
+        )
+    )
+
+    assert providers == ["claude", "codex"]
+    assert result["commands"] == ["command-claude", "command-codex"]
+    assert result["native_sessions"] == {
+        "claude": "native-claude",
+        "codex": "native-codex",
+    }
+    assert stopped == ["session-1"]
 
 
 def _launcher() -> Path:

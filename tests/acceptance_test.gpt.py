@@ -17,6 +17,9 @@ LOCAL_TARGETS = frozenset(
         "//tests:integration_tests",
         "//tests:parity_test",
         "//tests:unit_tests",
+        "//tools:install_test",
+        "//tools:ui_gallery_test",
+        "//tools:wsl_e2e_test",
     }
 )
 EXTERNAL_TARGET = re.compile(r"^external://[A-Za-z0-9_./:-]+$")
@@ -37,7 +40,7 @@ def main() -> int:
     if not isinstance(journeys, list):
         raise AssertionError("acceptance journeys must be an array")
     expected_ids = [
-        "AH-AC-" + str(index).zfill(3) for index in range(1, 31)
+        "AH-AC-" + str(index).zfill(3) for index in range(1, 41)
     ]
     actual_ids = [str(item.get("id", "")) for item in journeys]
     if actual_ids != expected_ids:

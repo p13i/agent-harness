@@ -8,6 +8,8 @@ py_library(
     imports = [".."],
     visibility = ["//visibility:public"],
     deps = [
+        "//tools:bundle_lib",
+        "//tools:install_lib",
         "@agent_harness_pip//aiohttp",
         "@agent_harness_pip//claude_agent_sdk",
         "@agent_harness_pip//cryptography",

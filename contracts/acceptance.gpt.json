@@ -1,6 +1,6 @@
 {
   "schema": "p13i/agent-harness/acceptance/v1",
-  "contract_version": "1.2.0",
+  "contract_version": "1.3.0",
   "journeys": [
     {
       "id": "AH-AC-001",
@@ -214,6 +214,62 @@
       "id": "AH-AC-030",
       "title": "Synchronize chats without force-push or silent loss",
       "local_evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+    },
+    {
+      "id": "AH-AC-031",
+      "title": "Bind one durable session to an external job",
+      "local_evidence": ["//tests:integration_tests", "//tests:unit_tests"]
+    },
+    {
+      "id": "AH-AC-032",
+      "title": "Retry a managed turn without duplicate model work",
+      "local_evidence": ["//tests:integration_tests", "//tests:e2e_tests"]
+    },
+    {
+      "id": "AH-AC-033",
+      "title": "Barrier ambiguous provider work after restart",
+      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+    },
+    {
+      "id": "AH-AC-034",
+      "title": "Inspect and explicitly reconcile interrupted work",
+      "local_evidence": ["//tests:integration_tests", "//tests:e2e_tests"]
+    },
+    {
+      "id": "AH-AC-035",
+      "title": "Retain multiline drafts and recover an unacknowledged send",
+      "local_evidence": ["//tests:unit_tests", "//tests:chat_pty_test"]
+    },
+    {
+      "id": "AH-AC-036",
+      "title": "Search, archive, resize, and theme the responsive workspace",
+      "local_evidence": ["//tests:unit_tests", "//tools:ui_gallery_test"]
+    },
+    {
+      "id": "AH-AC-037",
+      "title": "Run an installed bundle without checkout or Bazel cache",
+      "local_evidence": ["//tools:install_test"]
+    },
+    {
+      "id": "AH-AC-038",
+      "title": "Manage the isolated systemd user-service lifecycle",
+      "local_evidence": ["//tools:install_test", "//tests:unit_tests"]
+    },
+    {
+      "id": "AH-AC-039",
+      "title": "Render every declared UI state without provider or network use",
+      "local_evidence": ["//tools:ui_gallery_test", "//tests:unit_tests"]
+    },
+    {
+      "id": "AH-AC-040",
+      "title": "Exercise the real WSL user-systemd lifecycle",
+      "local_evidence": ["//tools:wsl_e2e_test"],
+      "external_evidence": [
+        {
+          "target": "external://p13i/agent-harness:wsl-e2e",
+          "status": "pending"
+        }
+      ]
     }
   ]
 }

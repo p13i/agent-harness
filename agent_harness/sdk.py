@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from aiohttp import ClientSession
 from aiohttp import UnixConnector
@@ -53,16 +55,47 @@ class AgentHarnessClient:
         self.paths = paths
         self.raw = HarnessClient(paths)
 
+    async def capabilities(self) -> dict[str, Any]:
+        return await self.raw.request("GET", "/v1/capabilities")
+
     async def list_sessions(
         self,
         *,
         include_archived: bool = False,
+        external_orchestrator: str = "",
+        external_job_id: str = "",
     ) -> tuple[dict[str, Any], ...]:
         path = "/v1/sessions"
+        query: dict[str, str] = {}
         if include_archived:
-            path += "?archived=1"
+            query["archived"] = "1"
+        if external_orchestrator or external_job_id:
+            if not external_orchestrator or not external_job_id:
+                raise ValueError(
+                    "external orchestrator and job ID are both required"
+                )
+            query["external_orchestrator"] = external_orchestrator
+            query["external_job_id"] = external_job_id
+        if query:
+            path += "?" + urlencode(query)
         result = await self.raw.request("GET", path)
         return _object_tuple(result.get("sessions"))
+
+    async def session_by_external_ref(
+        self,
+        orchestrator: str,
+        job_id: str,
+    ) -> dict[str, Any] | None:
+        sessions = await self.list_sessions(
+            include_archived=True,
+            external_orchestrator=orchestrator,
+            external_job_id=job_id,
+        )
+        if not sessions:
+            return None
+        if len(sessions) != 1:
+            raise RuntimeError("external reference is not unique")
+        return sessions[0]
 
     async def create_session(
         self,
@@ -77,26 +110,60 @@ class AgentHarnessClient:
         permission_mode: str = "approval",
         direct: bool = False,
         execution_profile: str = "unattended",
+        external_ref: dict[str, str] | None = None,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         if budgets is None:
             budgets = {}
+        payload: dict[str, Any] = {
+            "workspace": str(workspace.expanduser().resolve()),
+            "name": name,
+            "goal": goal,
+            "goal_kind": goal_kind,
+            "constraints": list(constraints),
+            "predicates": list(predicates),
+            "budgets": budgets,
+            "permission_mode": permission_mode,
+            "direct": direct,
+            "execution_profile": execution_profile,
+        }
+        if external_ref is not None:
+            payload["external_ref"] = external_ref
         result = await self.raw.request(
             "POST",
             "/v1/sessions",
-            payload={
-                "workspace": str(workspace.expanduser().resolve()),
-                "name": name,
-                "goal": goal,
-                "goal_kind": goal_kind,
-                "constraints": list(constraints),
-                "predicates": list(predicates),
-                "budgets": budgets,
-                "permission_mode": permission_mode,
-                "direct": direct,
-                "execution_profile": execution_profile,
-            },
+            payload=payload,
+            idempotency_key=idempotency_key,
         )
         return _object(result.get("session"))
+
+    async def ensure_session(
+        self,
+        workspace: Path,
+        *,
+        orchestrator: str,
+        job_id: str,
+        idempotency_key: str,
+        name: str = "",
+        goal: str = "",
+        permission_mode: str = "approval",
+        direct: bool = False,
+        execution_profile: str = "unattended",
+    ) -> dict[str, Any]:
+        _require_managed_key(idempotency_key)
+        return await self.create_session(
+            workspace,
+            name=name,
+            goal=goal,
+            permission_mode=permission_mode,
+            direct=direct,
+            execution_profile=execution_profile,
+            external_ref={
+                "orchestrator": orchestrator,
+                "job_id": job_id,
+            },
+            idempotency_key=idempotency_key,
+        )
 
     async def session(self, session_id: str) -> SessionView:
         result = await self.raw.request(
@@ -134,6 +201,27 @@ class AgentHarnessClient:
             "PATCH",
             "/v1/sessions/" + session_id,
             payload=payload,
+        )
+        return _object(result.get("session"))
+
+    async def set_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        action = "archive"
+        if not archived:
+            action = "unarchive"
+        key = idempotency_key
+        if not key:
+            key = new_uuid()
+        result = await self.raw.request(
+            "POST",
+            "/v1/sessions/" + session_id + "/" + action,
+            payload={},
+            idempotency_key=key,
         )
         return _object(result.get("session"))
 
@@ -215,6 +303,7 @@ class AgentHarnessClient:
         effort: str = "",
         workload: str = "implementation",
         idempotency_key: str = "",
+        turn_ref: dict[str, str] | None = None,
     ) -> CommandView:
         payload = {
             "text": text,
@@ -224,6 +313,8 @@ class AgentHarnessClient:
         }
         if provider:
             payload["provider"] = provider
+        if turn_ref is not None:
+            payload["turn_ref"] = turn_ref
         key = idempotency_key
         if not key:
             key = new_uuid()
@@ -234,6 +325,34 @@ class AgentHarnessClient:
             idempotency_key=key,
         )
         return _command_view(result.get("command"))
+
+    async def submit_managed_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        step_id: str,
+        agent_role: str,
+        idempotency_key: str,
+        provider: str = "",
+        model: str = "",
+        effort: str = "",
+        workload: str = "implementation",
+    ) -> CommandView:
+        _require_managed_key(idempotency_key)
+        return await self.send_message(
+            session_id,
+            text,
+            provider=provider,
+            model=model,
+            effort=effort,
+            workload=workload,
+            idempotency_key=idempotency_key,
+            turn_ref={
+                "step_id": step_id,
+                "agent_role": agent_role,
+            },
+        )
 
     async def command(
         self,
@@ -266,6 +385,27 @@ class AgentHarnessClient:
         )
         return _command_view(result.get("command"))
 
+    async def wait_command(
+        self,
+        command_id: str,
+        *,
+        timeout: float,
+        poll_interval: float = 0.2,
+    ) -> CommandView:
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if poll_interval <= 0:
+            raise ValueError("poll interval must be positive")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            command = await self.command_status(command_id)
+            if command.status in {"complete", "failed", "cancelled"}:
+                return command
+            if loop.time() >= deadline:
+                return command
+            await asyncio.sleep(poll_interval)
+
     async def approvals(
         self,
         session_id: str,
@@ -281,7 +421,12 @@ class AgentHarnessClient:
         session_id: str,
         approval_id: str,
         decision: str,
+        *,
+        idempotency_key: str = "",
     ) -> bool:
+        key = idempotency_key
+        if not key:
+            key = new_uuid()
         result = await self.raw.request(
             "POST",
             "/v1/sessions/"
@@ -289,6 +434,7 @@ class AgentHarnessClient:
             + "/approvals/"
             + approval_id,
             payload={"decision": decision},
+            idempotency_key=key,
         )
         return bool(result.get("resolved", False))
 
@@ -306,6 +452,7 @@ class AgentHarnessClient:
         subject: str,
         outcome: str,
         value: dict[str, Any] | None = None,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         if value is None:
             value = {}
@@ -318,14 +465,21 @@ class AgentHarnessClient:
                 "outcome": outcome,
                 "value": value,
             },
+            idempotency_key=idempotency_key,
         )
         return _object(result.get("evidence"))
 
-    async def checkpoint(self, session_id: str) -> dict[str, Any]:
+    async def checkpoint(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         result = await self.raw.request(
             "POST",
             "/v1/sessions/" + session_id + "/checkpoints",
             payload={},
+            idempotency_key=idempotency_key,
         )
         return _object(result.get("checkpoint"))
 
@@ -334,11 +488,17 @@ class AgentHarnessClient:
         session_id: str,
         *,
         name: str = "",
+        external_ref: dict[str, str] | None = None,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name}
+        if external_ref is not None:
+            payload["external_ref"] = external_ref
         result = await self.raw.request(
             "POST",
             "/v1/sessions/" + session_id + "/fork",
-            payload={"name": name},
+            payload=payload,
+            idempotency_key=idempotency_key,
         )
         return _object(result.get("session"))
 
@@ -390,6 +550,55 @@ class AgentHarnessClient:
         )
         return _object(result.get("safety"))
 
+    async def reconciliations(
+        self,
+        session_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        result = await self.raw.request(
+            "GET",
+            "/v1/sessions/" + session_id + "/reconciliations",
+        )
+        return _object_tuple(result.get("reconciliations"))
+
+    async def reconciliation(
+        self,
+        reconciliation_id: str,
+    ) -> dict[str, Any]:
+        result = await self.raw.request(
+            "GET",
+            "/v1/reconciliations/" + reconciliation_id,
+        )
+        return _object(result.get("reconciliation"))
+
+    async def resolve_reconciliation(
+        self,
+        reconciliation_id: str,
+        *,
+        decision: str,
+        observed_workspace_digest: str,
+        idempotency_key: str,
+        approval_id: str = "",
+        audit: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _require_managed_key(idempotency_key)
+        payload: dict[str, Any] = {
+            "decision": decision,
+            "observed_workspace_digest": observed_workspace_digest,
+        }
+        if approval_id:
+            payload["approval_id"] = approval_id
+        if audit is not None:
+            payload["audit"] = audit
+        result = await self.raw.request(
+            "POST",
+            "/v1/reconciliations/"
+            + reconciliation_id
+            + "/resolution",
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+        return _object(result.get("reconciliation"))
+
     async def extend_budget(
         self,
         session_id: str,
@@ -398,6 +607,7 @@ class AgentHarnessClient:
         additional_seconds: int | None = None,
         additional_tokens: int | None = None,
         allow_xhigh_once: bool = False,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "reason": reason,
@@ -407,11 +617,14 @@ class AgentHarnessClient:
             payload["additional_seconds"] = additional_seconds
         if additional_tokens is not None:
             payload["additional_tokens"] = additional_tokens
+        key = idempotency_key
+        if not key:
+            key = new_uuid()
         result = await self.raw.request(
             "POST",
             "/v1/sessions/" + session_id + "/budget-extensions",
             payload=payload,
-            idempotency_key=new_uuid(),
+            idempotency_key=key,
         )
         return _object(result.get("safety"))
 
@@ -421,7 +634,11 @@ class AgentHarnessClient:
         *,
         session_id: str = "",
         execution_profile: str = "unattended",
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
+        key = idempotency_key
+        if not key:
+            key = new_uuid()
         result = await self.raw.request(
             "POST",
             "/v1/leases",
@@ -430,7 +647,7 @@ class AgentHarnessClient:
                 "session_id": session_id,
                 "execution_profile": execution_profile,
             },
-            idempotency_key=new_uuid(),
+            idempotency_key=key,
         )
         return _object(result.get("lease"))
 
@@ -441,17 +658,21 @@ class AgentHarnessClient:
         action: str,
         pid: int | None = None,
         pid_start: str = "",
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"action": action}
         if pid is not None:
             payload["pid"] = pid
         if pid_start:
             payload["pid_start"] = pid_start
+        key = idempotency_key
+        if not key:
+            key = new_uuid()
         result = await self.raw.request(
             "PATCH",
             "/v1/leases/" + lease_id,
             payload=payload,
-            idempotency_key=new_uuid(),
+            idempotency_key=key,
         )
         return _object(result.get("lease"))
 
@@ -462,18 +683,29 @@ class AgentHarnessClient:
     async def sync_status(self) -> dict[str, Any]:
         return await self.raw.request("GET", "/v1/sync")
 
-    async def sync(self) -> dict[str, Any]:
+    async def sync(
+        self,
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         return await self.raw.request(
             "POST",
             "/v1/sync",
             payload={},
+            idempotency_key=idempotency_key,
         )
 
-    async def export(self, session_id: str) -> Path:
+    async def export(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str = "",
+    ) -> Path:
         result = await self.raw.request(
             "POST",
             "/v1/sessions/" + session_id + "/export",
             payload={},
+            idempotency_key=idempotency_key,
         )
         return Path(str(result.get("path", "")))
 
@@ -504,3 +736,10 @@ def _event_data(lines: list[str]) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("SSE event data must be an object")
     return value
+
+
+def _require_managed_key(value: str) -> None:
+    if not value:
+        raise ValueError(
+            "managed operations require a caller idempotency key"
+        )

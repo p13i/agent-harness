@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -21,11 +22,17 @@ from agent_harness.models import CommandStatus
 from agent_harness.models import Evidence
 from agent_harness.models import Goal
 from agent_harness.models import ProviderAttempt
+from agent_harness.models import ReconciliationRecord
+from agent_harness.models import ReconciliationStatus
+from agent_harness.models import RestartRecovery
 from agent_harness.models import Session
 from agent_harness.models import SessionEvent
+from agent_harness.orchestration import creation_digest
+from agent_harness.orchestration import normalize_external_ref
+from agent_harness.orchestration import normalize_turn_ref
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 PORTABLE_SESSION_TABLES = (
     "sessions",
@@ -46,6 +53,9 @@ PORTABLE_SESSION_TABLES = (
     "transfers",
     "registry_entries",
     "ui_state",
+    "command_dispatches",
+    "reconciliations",
+    "session_creation_receipts",
 )
 PORTABLE_GLOBAL_TABLES = (
     "usage_samples",
@@ -73,7 +83,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     owner_epoch INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    archived INTEGER NOT NULL DEFAULT 0
+    archived INTEGER NOT NULL DEFAULT 0,
+    external_orchestrator TEXT NOT NULL DEFAULT '',
+    external_job_id TEXT NOT NULL DEFAULT '',
+    creation_digest TEXT NOT NULL DEFAULT '',
+    CHECK (
+        (external_orchestrator = '' AND external_job_id = '')
+        OR
+        (external_orchestrator != '' AND external_job_id != '')
+    )
 );
 CREATE TABLE IF NOT EXISTS provider_attempts (
     attempt_id TEXT PRIMARY KEY,
@@ -96,7 +114,9 @@ CREATE TABLE IF NOT EXISTS turns (
     status TEXT NOT NULL,
     replay_of TEXT NOT NULL,
     started_at TEXT NOT NULL,
-    completed_at TEXT NOT NULL
+    completed_at TEXT NOT NULL,
+    turn_step_id TEXT NOT NULL DEFAULT '',
+    turn_agent_role TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS events (
     session_id TEXT NOT NULL REFERENCES sessions(session_id),
@@ -121,7 +141,9 @@ CREATE TABLE IF NOT EXISTS commands (
     status TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    turn_step_id TEXT NOT NULL DEFAULT '',
+    turn_agent_role TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS commands_dispatch
 ON commands(session_id, status, created_at);
@@ -251,6 +273,44 @@ CREATE TABLE IF NOT EXISTS mutation_receipts (
     status_code INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session_creation_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS command_dispatches (
+    attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id),
+    command_id TEXT NOT NULL REFERENCES commands(command_id),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    turn_id TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
+    crossed_boundary INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS command_dispatches_command
+ON command_dispatches(command_id, crossed_boundary, state);
+CREATE TABLE IF NOT EXISTS reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    command_id TEXT NOT NULL UNIQUE REFERENCES commands(command_id),
+    pre_dispatch_checkpoint_id TEXT NOT NULL
+        REFERENCES checkpoints(checkpoint_id),
+    current_workspace_digest TEXT NOT NULL,
+    current_workspace_summary TEXT NOT NULL,
+    provider_attempts_json TEXT NOT NULL,
+    safety_consumption_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    audit_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reconciliations_pending
+ON reconciliations(session_id, status, created_at);
 CREATE TABLE IF NOT EXISTS routing_decisions (
     decision_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id),
@@ -329,14 +389,90 @@ class StateStore:
                     "INSERT INTO schema_meta(version) VALUES (?)",
                     (SCHEMA_VERSION,),
                 )
-            elif int(row["version"]) == 1:
+            elif int(row["version"]) in {1, 2}:
+                self._migrate_to_v3(connection)
                 connection.execute(
                     "UPDATE schema_meta SET version = ?",
                     (SCHEMA_VERSION,),
                 )
             elif int(row["version"]) != SCHEMA_VERSION:
                 raise RuntimeError("unsupported database schema version")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS sessions_external_ref
+                ON sessions(external_orchestrator, external_job_id)
+                WHERE external_orchestrator != ''
+                """
+            )
         os.chmod(self.path, 0o600)
+
+    def _migrate_to_v3(self, connection: sqlite3.Connection) -> None:
+        self._add_column(
+            connection,
+            "sessions",
+            "external_orchestrator",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._add_column(
+            connection,
+            "sessions",
+            "external_job_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._add_column(
+            connection,
+            "sessions",
+            "creation_digest",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._add_column(
+            connection,
+            "turns",
+            "turn_step_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._add_column(
+            connection,
+            "turns",
+            "turn_agent_role",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._add_column(
+            connection,
+            "commands",
+            "turn_step_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._add_column(
+            connection,
+            "commands",
+            "turn_agent_role",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+
+    def _add_column(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        declaration: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(" + table + ")"
+            ).fetchall()
+        }
+        if column in columns:
+            return
+        connection.execute(
+            "ALTER TABLE "
+            + table
+            + " ADD COLUMN "
+            + column
+            + " "
+            + declaration
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -353,6 +489,15 @@ class StateStore:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    def integrity_check(self) -> str:
+        with self._lock:
+            row = self._connection.execute(
+                "PRAGMA quick_check"
+            ).fetchone()
+        if row is None:
+            return ""
+        return str(row[0])
 
     def backup(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -396,15 +541,197 @@ class StateStore:
         return changed
 
     def create_session(self, session: Session) -> Session:
+        external_ref = normalize_external_ref(session.external_ref)
         with self.transaction() as connection:
-            connection.execute(
+            try:
+                self._insert_session(
+                    connection,
+                    replace(session, external_ref=external_ref),
+                    "",
+                )
+            except sqlite3.IntegrityError as error:
+                raise ConflictError(
+                    "session identifier or external reference already exists"
+                ) from error
+        return replace(session, external_ref=external_ref)
+
+    def ensure_session(
+        self,
+        session: Session,
+        creation_input: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> tuple[Session, bool]:
+        request_digest = creation_digest(creation_input)
+        external_ref = normalize_external_ref(session.external_ref)
+        input_ref = normalize_external_ref(
+            creation_input.get("external_ref")
+        )
+        if external_ref != input_ref:
+            raise ValueError(
+                "session and creation input external_ref must match"
+            )
+        normalized = replace(session, external_ref=external_ref)
+        with self.transaction() as connection:
+            if idempotency_key:
+                receipt = connection.execute(
+                    """
+                    SELECT * FROM session_creation_receipts
+                    WHERE idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+                if receipt is not None:
+                    if str(receipt["request_digest"]) != request_digest:
+                        raise ConflictError(
+                            "idempotency key was already used with "
+                            "different session input"
+                        )
+                    existing = connection.execute(
+                        "SELECT * FROM sessions WHERE session_id = ?",
+                        (receipt["session_id"],),
+                    ).fetchone()
+                    if existing is None:
+                        raise RuntimeError(
+                            "session creation receipt has no session"
+                        )
+                    return _session(existing), False
+            if external_ref:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE external_orchestrator = ?
+                    AND external_job_id = ?
+                    """,
+                    (
+                        external_ref["orchestrator"],
+                        external_ref["job_id"],
+                    ),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["creation_digest"]) != request_digest:
+                        raise ConflictError(
+                            "external reference already names a session "
+                            "with different creation input"
+                        )
+                    existing_session = _session(existing)
+                    if idempotency_key:
+                        self._insert_creation_receipt(
+                            connection,
+                            idempotency_key,
+                            request_digest,
+                            existing_session,
+                        )
+                    return existing_session, False
+            try:
+                self._insert_session(
+                    connection,
+                    normalized,
+                    request_digest,
+                )
+            except sqlite3.IntegrityError as error:
+                raise ConflictError(
+                    "session identifier or external reference already exists"
+                ) from error
+            if idempotency_key:
+                self._insert_creation_receipt(
+                    connection,
+                    idempotency_key,
+                    request_digest,
+                    normalized,
+                )
+        return normalized, True
+
+    def existing_ensured_session(
+        self,
+        creation_input: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+        external_ref: dict[str, str] | None = None,
+    ) -> Session | None:
+        request_digest = creation_digest(creation_input)
+        normalized_ref = normalize_external_ref(external_ref)
+        if external_ref is None:
+            normalized_ref = normalize_external_ref(
+                creation_input.get("external_ref")
+            )
+        by_key: Session | None = None
+        by_reference: Session | None = None
+        with self._lock:
+            if idempotency_key:
+                receipt = self._connection.execute(
+                    """
+                    SELECT * FROM session_creation_receipts
+                    WHERE idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+                if receipt is not None:
+                    if str(receipt["request_digest"]) != request_digest:
+                        raise ConflictError(
+                            "idempotency key was already used with "
+                            "different session input"
+                        )
+                    row = self._connection.execute(
+                        "SELECT * FROM sessions WHERE session_id = ?",
+                        (receipt["session_id"],),
+                    ).fetchone()
+                    if row is None:
+                        raise RuntimeError(
+                            "session creation receipt has no session"
+                        )
+                    by_key = _session(row)
+            if normalized_ref:
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE external_orchestrator = ?
+                    AND external_job_id = ?
+                    """,
+                    (
+                        normalized_ref["orchestrator"],
+                        normalized_ref["job_id"],
+                    ),
+                ).fetchone()
+                if row is not None:
+                    if str(row["creation_digest"]) != request_digest:
+                        raise ConflictError(
+                            "external reference already names a session "
+                            "with different creation input"
+                        )
+                    by_reference = _session(row)
+        if (
+            by_key is not None
+            and by_reference is not None
+            and by_key.session_id != by_reference.session_id
+        ):
+            raise ConflictError(
+                "idempotency key and external reference name "
+                "different sessions"
+            )
+        if by_key is not None:
+            return by_key
+        return by_reference
+
+    def _insert_session(
+        self,
+        connection: sqlite3.Connection,
+        session: Session,
+        request_digest: str,
+    ) -> None:
+        external_ref = normalize_external_ref(session.external_ref)
+        connection.execute(
                 """
                 INSERT INTO sessions(
                     session_id, name, workspace, worktree, lifecycle,
                     attention, permission_mode, active_provider, model,
                     effort, goal_id, owner_host, owner_epoch, created_at,
-                    updated_at, archived
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    updated_at, archived, external_orchestrator,
+                    external_job_id, creation_digest
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?
+                )
                 """,
                 (
                     session.session_id,
@@ -423,9 +750,44 @@ class StateStore:
                     session.created_at,
                     session.updated_at,
                     int(session.archived),
+                    external_ref.get("orchestrator", ""),
+                    external_ref.get("job_id", ""),
+                    request_digest,
                 ),
             )
-        return session
+
+    def _insert_creation_receipt(
+        self,
+        connection: sqlite3.Connection,
+        idempotency_key: str,
+        request_digest: str,
+        session: Session,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO session_creation_receipts VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                idempotency_key,
+                request_digest,
+                session.session_id,
+                _dump({"session": session.as_dict()}),
+                utc_now(),
+            ),
+        )
+
+    def create_fork(
+        self,
+        source_session_id: str,
+        fork: Session,
+        *,
+        external_ref: dict[str, str] | None = None,
+    ) -> Session:
+        self.get_session(source_session_id)
+        normalized_ref = normalize_external_ref(external_ref)
+        return self.create_session(
+            replace(fork, external_ref=normalized_ref)
+        )
 
     def get_session(self, session_id: str) -> Session:
         with self._lock:
@@ -437,14 +799,68 @@ class StateStore:
             raise NotFoundError("session")
         return _session(row)
 
-    def list_sessions(self, include_archived: bool = False) -> list[Session]:
+    def get_session_by_external_ref(
+        self,
+        orchestrator: str,
+        job_id: str,
+    ) -> Session | None:
+        external_ref = normalize_external_ref(
+            {"orchestrator": orchestrator, "job_id": job_id}
+        )
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM sessions
+                WHERE external_orchestrator = ? AND external_job_id = ?
+                """,
+                (
+                    external_ref["orchestrator"],
+                    external_ref["job_id"],
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return _session(row)
+
+    def find_session_by_external_ref(
+        self,
+        orchestrator: str,
+        job_id: str,
+    ) -> Session | None:
+        return self.get_session_by_external_ref(orchestrator, job_id)
+
+    def list_sessions(
+        self,
+        include_archived: bool = False,
+        *,
+        external_ref: dict[str, str] | None = None,
+    ) -> list[Session]:
         query = "SELECT * FROM sessions"
-        parameters: tuple[Any, ...] = ()
+        clauses: list[str] = []
+        parameters: list[Any] = []
         if not include_archived:
-            query += " WHERE archived = 0"
+            clauses.append("archived = 0")
+        if external_ref is not None:
+            normalized = normalize_external_ref(external_ref)
+            if not normalized:
+                raise ValueError("external_ref lookup requires identifiers")
+            clauses.extend(
+                [
+                    "external_orchestrator = ?",
+                    "external_job_id = ?",
+                ]
+            )
+            parameters.extend(
+                [normalized["orchestrator"], normalized["job_id"]]
+            )
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY updated_at DESC, session_id"
         with self._lock:
-            rows = self._connection.execute(query, parameters).fetchall()
+            rows = self._connection.execute(
+                query,
+                tuple(parameters),
+            ).fetchall()
         return [_session(row) for row in rows]
 
     def update_session(self, session_id: str, **changes: Any) -> Session:
@@ -605,6 +1021,28 @@ class StateStore:
         payload: dict[str, Any],
         idempotency_key: str,
     ) -> CommandReceipt:
+        receipt, unused_created = self.ensure_command(
+            session_id,
+            command_type,
+            payload,
+            idempotency_key,
+        )
+        del unused_created
+        return receipt
+
+    def ensure_command(
+        self,
+        session_id: str,
+        command_type: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> tuple[CommandReceipt, bool]:
+        normalized_payload = dict(payload)
+        turn_ref = normalize_turn_ref(payload.get("turn_ref"))
+        if turn_ref:
+            normalized_payload["turn_ref"] = turn_ref
+        else:
+            normalized_payload.pop("turn_ref", None)
         now = utc_now()
         command_id = new_uuid()
         with self.transaction() as connection:
@@ -613,25 +1051,39 @@ class StateStore:
                 (idempotency_key,),
             ).fetchone()
             if existing is not None:
-                return _command(existing)
+                same_request = (
+                    str(existing["session_id"]) == session_id
+                    and str(existing["command_type"]) == command_type
+                    and str(existing["payload_json"])
+                    == _dump(normalized_payload)
+                )
+                if not same_request:
+                    raise ConflictError(
+                        "idempotency key was already used with "
+                        "different command input"
+                    )
+                return _command(existing), False
             connection.execute(
                 """
                 INSERT INTO commands(
                     idempotency_key, command_id, session_id,
                     command_type, payload_json, status, result_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, turn_step_id,
+                    turn_agent_role
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     idempotency_key,
                     command_id,
                     session_id,
                     command_type,
-                    _dump(payload),
+                    _dump(normalized_payload),
                     CommandStatus.QUEUED,
                     "{}",
                     now,
                     now,
+                    turn_ref.get("step_id", ""),
+                    turn_ref.get("agent_role", ""),
                 ),
             )
         return CommandReceipt(
@@ -643,7 +1095,8 @@ class StateStore:
             result={},
             created_at=now,
             updated_at=now,
-        )
+            turn_ref=turn_ref,
+        ), True
 
     def claim_command(
         self,
@@ -657,6 +1110,17 @@ class StateStore:
             type_clause = " AND command_type IN (" + placeholders + ")"
             parameters.extend(sorted(command_types))
         with self.transaction() as connection:
+            if not command_types:
+                reconciliation = connection.execute(
+                    """
+                    SELECT 1 FROM reconciliations
+                    WHERE session_id = ? AND status != ?
+                    LIMIT 1
+                    """,
+                    (session_id, ReconciliationStatus.RESOLVED),
+                ).fetchone()
+                if reconciliation is not None:
+                    return None
             row = connection.execute(
                 """
                 SELECT * FROM commands
@@ -734,31 +1198,12 @@ class StateStore:
         return _command(row)
 
     def recover_dispatching(self, session_id: str) -> int:
-        now = utc_now()
-        with self.transaction() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE commands SET status = ?, result_json = ?,
-                updated_at = ?
-                WHERE session_id = ? AND status = ?
-                """,
-                (
-                    CommandStatus.FAILED,
-                    _dump(
-                        {
-                            "code": "E_NEEDS_RECONCILIATION",
-                            "message": (
-                                "worker stopped after dispatch began; "
-                                "the effect is ambiguous"
-                            ),
-                        }
-                    ),
-                    now,
-                    session_id,
-                    CommandStatus.DISPATCHING,
-                ),
-            )
-        return cursor.rowcount
+        recovery = self.recover_interrupted_commands(
+            session_id,
+            "",
+            "",
+        )
+        return len(recovery.reconciliations)
 
     def start_turn(
         self,
@@ -766,11 +1211,15 @@ class StateStore:
         attempt_id: str,
         *,
         replay_of: str = "",
+        turn_ref: dict[str, str] | None = None,
     ) -> str:
+        normalized_ref = normalize_turn_ref(turn_ref)
         turn_id = new_uuid()
         with self.transaction() as connection:
             connection.execute(
-                "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     turn_id,
                     session_id,
@@ -779,9 +1228,29 @@ class StateStore:
                     replay_of,
                     utc_now(),
                     "",
+                    normalized_ref.get("step_id", ""),
+                    normalized_ref.get("agent_role", ""),
                 ),
             )
         return turn_id
+
+    def turn_ref(self, turn_id: str) -> dict[str, str]:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT turn_step_id, turn_agent_role FROM turns
+                WHERE turn_id = ?
+                """,
+                (turn_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("turn")
+        if not row["turn_step_id"]:
+            return {}
+        return {
+            "step_id": str(row["turn_step_id"]),
+            "agent_role": str(row["turn_agent_role"]),
+        }
 
     def finish_turn(self, turn_id: str, status: str) -> None:
         with self.transaction() as connection:
@@ -993,6 +1462,448 @@ class StateStore:
             ).fetchall()
         return [_checkpoint(row) for row in rows]
 
+    def checkpoint(self, checkpoint_id: str) -> Checkpoint:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM checkpoints WHERE checkpoint_id = ?
+                """,
+                (checkpoint_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("checkpoint")
+        return _checkpoint(row)
+
+    def record_dispatch_checkpoint(
+        self,
+        command_id: str,
+        attempt_id: str,
+        turn_id: str,
+        checkpoint_id: str,
+    ) -> None:
+        command = self.get_command(command_id)
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO command_dispatches VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    attempt_id,
+                    command_id,
+                    command.session_id,
+                    turn_id,
+                    checkpoint_id,
+                    0,
+                    "prepared",
+                    now,
+                    now,
+                ),
+            )
+
+    def mark_provider_boundary(self, attempt_id: str) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE command_dispatches SET crossed_boundary = 1,
+                    state = 'dispatched', updated_at = ?
+                WHERE attempt_id = ? AND crossed_boundary = 0
+                """,
+                (utc_now(), attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    "provider dispatch boundary is stale"
+                )
+
+    def complete_dispatch(self, attempt_id: str, state: str) -> None:
+        if state not in {
+            "complete",
+            "failed",
+            "interrupted",
+            "exhausted",
+        }:
+            raise ValueError("dispatch completion state is unsupported")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE command_dispatches SET state = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (state, utc_now(), attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("provider dispatch")
+
+    def recover_interrupted_commands(
+        self,
+        session_id: str,
+        current_workspace_digest: str,
+        current_workspace_summary: str,
+    ) -> RestartRecovery:
+        now = utc_now()
+        requeued: list[str] = []
+        reconciliations: list[ReconciliationRecord] = []
+        with self.transaction() as connection:
+            commands = connection.execute(
+                """
+                SELECT * FROM commands
+                WHERE session_id = ? AND status = ?
+                ORDER BY created_at, command_id
+                """,
+                (session_id, CommandStatus.DISPATCHING),
+            ).fetchall()
+            for command in commands:
+                dispatch = connection.execute(
+                    """
+                    SELECT * FROM command_dispatches
+                    WHERE command_id = ? AND crossed_boundary = 1
+                    AND state IN ('dispatched', 'prepared')
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (command["command_id"],),
+                ).fetchone()
+                if dispatch is None:
+                    self._requeue_pre_boundary(
+                        connection,
+                        str(command["command_id"]),
+                        now,
+                    )
+                    requeued.append(str(command["command_id"]))
+                    continue
+                record = self._create_reconciliation(
+                    connection,
+                    command,
+                    dispatch,
+                    current_workspace_digest,
+                    current_workspace_summary,
+                    now,
+                )
+                reconciliations.append(record)
+        return RestartRecovery(
+            requeued_command_ids=tuple(requeued),
+            reconciliations=tuple(reconciliations),
+        )
+
+    def _requeue_pre_boundary(
+        self,
+        connection: sqlite3.Connection,
+        command_id: str,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE commands SET status = ?, result_json = '{}',
+                updated_at = ? WHERE command_id = ?
+            """,
+            (CommandStatus.QUEUED, now, command_id),
+        )
+        connection.execute(
+            """
+            UPDATE provider_attempts SET status = 'interrupted',
+                ended_at = ?
+            WHERE status = 'running' AND session_id = (
+                SELECT session_id FROM commands WHERE command_id = ?
+            )
+            """,
+            (now, command_id),
+        )
+        connection.execute(
+            """
+            UPDATE command_dispatches SET state = 'interrupted',
+                updated_at = ?
+            WHERE command_id = ? AND crossed_boundary = 0
+            """,
+            (now, command_id),
+        )
+        connection.execute(
+            """
+            UPDATE command_envelopes SET state = 'reserved',
+                updated_at = ? WHERE command_id = ?
+            """,
+            (now, command_id),
+        )
+
+    def _create_reconciliation(
+        self,
+        connection: sqlite3.Connection,
+        command: sqlite3.Row,
+        dispatch: sqlite3.Row,
+        current_workspace_digest: str,
+        current_workspace_summary: str,
+        now: str,
+    ) -> ReconciliationRecord:
+        existing = connection.execute(
+            """
+            SELECT * FROM reconciliations WHERE command_id = ?
+            """,
+            (command["command_id"],),
+        ).fetchone()
+        if existing is not None:
+            return _reconciliation(existing)
+        attempt_rows = connection.execute(
+            """
+            SELECT provider_attempts.* FROM provider_attempts
+            JOIN command_dispatches USING(attempt_id)
+            WHERE command_dispatches.command_id = ?
+            ORDER BY provider_attempts.started_at,
+                provider_attempts.attempt_id
+            """,
+            (command["command_id"],),
+        ).fetchall()
+        attempts = [
+            {
+                "attempt_id": str(row["attempt_id"]),
+                "provider": str(row["provider"]),
+                "model": str(row["model"]),
+                "effort": str(row["effort"]),
+                "status": "ambiguous",
+                "native_status": str(row["status"]),
+                "started_at": str(row["started_at"]),
+                "ended_at": str(row["ended_at"]),
+            }
+            for row in attempt_rows
+        ]
+        envelope = connection.execute(
+            """
+            SELECT consumption_json FROM command_envelopes
+            WHERE command_id = ?
+            """,
+            (command["command_id"],),
+        ).fetchone()
+        consumption: dict[str, Any] = {}
+        if envelope is not None:
+            consumption = _load_object(envelope["consumption_json"])
+        reconciliation_id = new_uuid()
+        connection.execute(
+            """
+            INSERT INTO reconciliations VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                reconciliation_id,
+                command["session_id"],
+                command["command_id"],
+                dispatch["checkpoint_id"],
+                current_workspace_digest,
+                current_workspace_summary,
+                _dump(attempts),
+                _dump(consumption),
+                ReconciliationStatus.PENDING,
+                "",
+                "{}",
+                now,
+                "",
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE commands SET status = ?, result_json = ?,
+                updated_at = ? WHERE command_id = ?
+            """,
+            (
+                CommandStatus.FAILED,
+                _dump(
+                    {
+                        "code": "E_NEEDS_RECONCILIATION",
+                        "message": (
+                            "worker stopped after provider dispatch; "
+                            "the effect is ambiguous"
+                        ),
+                        "reconciliation_id": reconciliation_id,
+                    }
+                ),
+                now,
+                command["command_id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE provider_attempts SET status = 'ambiguous',
+                ended_at = ?
+            WHERE attempt_id IN (
+                SELECT attempt_id FROM command_dispatches
+                WHERE command_id = ? AND crossed_boundary = 1
+                AND state IN ('dispatched', 'prepared')
+            )
+            """,
+            (now, command["command_id"]),
+        )
+        connection.execute(
+            """
+            UPDATE command_dispatches SET state = 'ambiguous',
+                updated_at = ?
+            WHERE command_id = ? AND crossed_boundary = 1
+            AND state IN ('dispatched', 'prepared')
+            """,
+            (now, command["command_id"]),
+        )
+        row = connection.execute(
+            """
+            SELECT * FROM reconciliations
+            WHERE reconciliation_id = ?
+            """,
+            (reconciliation_id,),
+        ).fetchone()
+        return _reconciliation(row)
+
+    def reconciliation(
+        self,
+        reconciliation_id: str,
+    ) -> ReconciliationRecord:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("reconciliation")
+        return _reconciliation(row)
+
+    def pending_reconciliations(
+        self,
+        session_id: str,
+    ) -> list[ReconciliationRecord]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE session_id = ? AND status != ?
+                ORDER BY created_at, reconciliation_id
+                """,
+                (session_id, ReconciliationStatus.RESOLVED),
+            ).fetchall()
+        return [_reconciliation(row) for row in rows]
+
+    def begin_reconciliation_resolution(
+        self,
+        reconciliation_id: str,
+        decision: str,
+        observed_workspace_digest: str,
+    ) -> ReconciliationRecord:
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("reconciliation")
+            if str(row["status"]) == ReconciliationStatus.RESOLVED:
+                raise ConflictError("reconciliation is already resolved")
+            if (
+                str(row["current_workspace_digest"])
+                != observed_workspace_digest
+            ):
+                raise ConflictError(
+                    "observed workspace digest is stale"
+                )
+            existing_decision = str(row["resolution"])
+            if existing_decision and existing_decision != decision:
+                raise ConflictError(
+                    "reconciliation resolution is already in progress"
+                )
+            if str(row["status"]) == ReconciliationStatus.PENDING:
+                connection.execute(
+                    """
+                    UPDATE reconciliations SET status = ?,
+                        resolution = ?
+                    WHERE reconciliation_id = ? AND status = ?
+                    """,
+                    (
+                        ReconciliationStatus.RESOLVING,
+                        decision,
+                        reconciliation_id,
+                        ReconciliationStatus.PENDING,
+                    ),
+                )
+            current = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+        return _reconciliation(current)
+
+    def resolve_reconciliation_record(
+        self,
+        reconciliation_id: str,
+        decision: str,
+        observed_workspace_digest: str,
+        audit: dict[str, Any],
+    ) -> ReconciliationRecord:
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("reconciliation")
+            if (
+                str(row["status"]) == ReconciliationStatus.RESOLVED
+                and str(row["resolution"]) == decision
+                and str(row["current_workspace_digest"])
+                == observed_workspace_digest
+            ):
+                return _reconciliation(row)
+            if str(row["status"]) not in {
+                ReconciliationStatus.PENDING,
+                ReconciliationStatus.RESOLVING,
+            }:
+                raise ConflictError(
+                    "reconciliation was already resolved differently"
+                )
+            if (
+                str(row["resolution"])
+                and str(row["resolution"]) != decision
+            ):
+                raise ConflictError(
+                    "reconciliation resolution is already in progress"
+                )
+            if (
+                str(row["current_workspace_digest"])
+                != observed_workspace_digest
+            ):
+                raise ConflictError(
+                    "observed workspace digest is stale"
+                )
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE reconciliations SET status = ?, resolution = ?,
+                    audit_json = ?, resolved_at = ?
+                WHERE reconciliation_id = ? AND status != ?
+                """,
+                (
+                    ReconciliationStatus.RESOLVED,
+                    decision,
+                    _dump(audit),
+                    now,
+                    reconciliation_id,
+                    ReconciliationStatus.RESOLVED,
+                ),
+            )
+            resolved = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+        return _reconciliation(resolved)
+
     def create_approval(
         self,
         session_id: str,
@@ -1048,6 +1959,30 @@ class StateStore:
                 }
             )
         return result
+
+    def approval(self, approval_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM approvals WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("approval")
+        return {
+            "approval_id": str(row["approval_id"]),
+            "session_id": str(row["session_id"]),
+            "turn_id": str(row["turn_id"]),
+            "provider_request_id": str(
+                row["provider_request_id"]
+            ),
+            "kind": str(row["kind"]),
+            "prompt": str(row["prompt"]),
+            "choices": json.loads(row["choices_json"]),
+            "status": str(row["status"]),
+            "decision": _load_object(row["decision_json"]),
+            "created_at": str(row["created_at"]),
+            "resolved_at": str(row["resolved_at"]),
+        }
 
     def resolve_approval(
         self,
@@ -1736,6 +2671,24 @@ class StateStore:
                 (session_id, incarnation),
             )
 
+    def worker_registrations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT session_id, pid, incarnation, heartbeat_at
+                FROM workers ORDER BY session_id
+                """
+            ).fetchall()
+        return [
+            {
+                "session_id": str(row["session_id"]),
+                "pid": int(row["pid"]),
+                "incarnation": str(row["incarnation"]),
+                "heartbeat_at": str(row["heartbeat_at"]),
+            }
+            for row in rows
+        ]
+
     def set_ui_state(self, key: str, value: dict[str, Any]) -> None:
         with self.transaction() as connection:
             connection.execute(
@@ -1854,6 +2807,21 @@ class StateStore:
                     "key = ?",
                     ("session:" + session_id,),
                 ),
+                "command_dispatches": self._portable_rows(
+                    "command_dispatches",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "reconciliations": self._portable_rows(
+                    "reconciliations",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "session_creation_receipts": self._portable_rows(
+                    "session_creation_receipts",
+                    "session_id = ?",
+                    (session_id,),
+                ),
             }
         return {
             "schema": "p13i/agent-harness/chat-record/v1",
@@ -1949,6 +2917,7 @@ class StateStore:
         ]
         if not merge_global:
             table_rows["ui_state"].extend(validated_global_ui)
+        self._validate_portable_external_refs(table_rows["sessions"])
         with self.transaction() as connection:
             for table in PORTABLE_SESSION_TABLES:
                 self._insert_portable_rows(
@@ -1982,6 +2951,43 @@ class StateStore:
                         table,
                         validated,
                     )
+
+    def _validate_portable_external_refs(
+        self,
+        session_rows: list[dict[str, Any]],
+    ) -> None:
+        portable_refs: dict[tuple[str, str], str] = {}
+        for row in session_rows:
+            orchestrator = str(row.get("external_orchestrator", ""))
+            job_id = str(row.get("external_job_id", ""))
+            external_ref = normalize_external_ref(
+                {"orchestrator": orchestrator, "job_id": job_id}
+            )
+            if not external_ref:
+                continue
+            key = (
+                external_ref["orchestrator"],
+                external_ref["job_id"],
+            )
+            session_id = str(row.get("session_id", ""))
+            portable_session_id = portable_refs.get(key)
+            if (
+                portable_session_id is not None
+                and portable_session_id != session_id
+            ):
+                raise ConflictError(
+                    "portable external reference names two session UUIDs"
+                )
+            portable_refs[key] = session_id
+            existing = self.get_session_by_external_ref(*key)
+            if (
+                existing is not None
+                and existing.session_id != session_id
+            ):
+                raise ConflictError(
+                    "portable external reference conflicts with "
+                    "an existing session"
+                )
 
     def _portable_rows(
         self,
@@ -2117,6 +3123,9 @@ class StateStore:
         session_id = str(session_value.get("session_id", ""))
         if not session_id:
             raise ValueError("session export has no session identifier")
+        external_ref = normalize_external_ref(
+            session_value.get("external_ref")
+        )
         with self.transaction() as connection:
             existing = connection.execute(
                 "SELECT owner_epoch FROM sessions WHERE session_id = ?",
@@ -2124,11 +3133,34 @@ class StateStore:
             ).fetchone()
             if existing is not None:
                 raise ConflictError("session already exists on this host")
+            if external_ref:
+                conflict = connection.execute(
+                    """
+                    SELECT session_id FROM sessions
+                    WHERE external_orchestrator = ?
+                    AND external_job_id = ?
+                    """,
+                    (
+                        external_ref["orchestrator"],
+                        external_ref["job_id"],
+                    ),
+                ).fetchone()
+                if conflict is not None:
+                    raise ConflictError(
+                        "external reference already names another session"
+                    )
             now = utc_now()
             connection.execute(
                 """
-                INSERT INTO sessions VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                INSERT INTO sessions(
+                    session_id, name, workspace, worktree, lifecycle,
+                    attention, permission_mode, active_provider, model,
+                    effort, goal_id, owner_host, owner_epoch, created_at,
+                    updated_at, archived, external_orchestrator,
+                    external_job_id, creation_digest
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?
                 )
                 """,
                 (
@@ -2148,6 +3180,9 @@ class StateStore:
                     str(session_value.get("created_at", now)),
                     now,
                     0,
+                    external_ref.get("orchestrator", ""),
+                    external_ref.get("job_id", ""),
+                    "",
                 ),
             )
             self._import_attempts(connection, payload, session_id)
@@ -2345,6 +3380,7 @@ def _session(row: sqlite3.Row | dict[str, Any]) -> Session:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         archived=bool(row["archived"]),
+        external_ref=_external_ref(row),
     )
 
 
@@ -2374,6 +3410,7 @@ def _command(row: sqlite3.Row | dict[str, Any]) -> CommandReceipt:
         result=_load_object(str(row["result_json"])),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        turn_ref=_turn_ref(row),
     )
 
 
@@ -2434,4 +3471,57 @@ def _checkpoint(row: sqlite3.Row) -> Checkpoint:
         untracked_digest=str(row["untracked_digest"]),
         context_digest=str(row["context_digest"]),
         created_at=str(row["created_at"]),
+    )
+
+
+def _external_ref(
+    row: sqlite3.Row | dict[str, Any],
+) -> dict[str, str]:
+    orchestrator = str(row["external_orchestrator"])
+    if not orchestrator:
+        return {}
+    return {
+        "orchestrator": orchestrator,
+        "job_id": str(row["external_job_id"]),
+    }
+
+
+def _turn_ref(
+    row: sqlite3.Row | dict[str, Any],
+) -> dict[str, str]:
+    step_id = str(row["turn_step_id"])
+    if not step_id:
+        return {}
+    return {
+        "step_id": step_id,
+        "agent_role": str(row["turn_agent_role"]),
+    }
+
+
+def _reconciliation(row: sqlite3.Row) -> ReconciliationRecord:
+    attempts = json.loads(row["provider_attempts_json"])
+    if not isinstance(attempts, list):
+        raise ValueError("stored provider attempts are not a list")
+    return ReconciliationRecord(
+        reconciliation_id=str(row["reconciliation_id"]),
+        session_id=str(row["session_id"]),
+        command_id=str(row["command_id"]),
+        pre_dispatch_checkpoint_id=str(
+            row["pre_dispatch_checkpoint_id"]
+        ),
+        current_workspace_digest=str(
+            row["current_workspace_digest"]
+        ),
+        current_workspace_summary=str(
+            row["current_workspace_summary"]
+        ),
+        provider_attempts=tuple(dict(item) for item in attempts),
+        safety_consumption=_load_object(
+            row["safety_consumption_json"]
+        ),
+        status=str(row["status"]),
+        resolution=str(row["resolution"]),
+        audit=_load_object(row["audit_json"]),
+        created_at=str(row["created_at"]),
+        resolved_at=str(row["resolved_at"]),
     )

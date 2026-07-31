@@ -88,15 +88,29 @@ def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lcov", type=Path, required=True)
     parser.add_argument("--minimum", type=float, required=True)
+    parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--group", action="append", default=[])
     values = parser.parse_args(arguments)
 
-    files = tuple(
+    all_files = tuple(
         item
         for item in read_lcov(values.lcov)
-        if item.path.startswith("agent_harness/")
+        if _is_product_file(item.path)
+    )
+    exclusions = frozenset(values.exclude)
+    files = tuple(
+        item for item in all_files if item.path not in exclusions
     )
     failures: list[str] = []
+    missing_exclusions = exclusions - {
+        item.path for item in all_files
+    }
+    if missing_exclusions:
+        names = ", ".join(sorted(missing_exclusions))
+        print("exclusions: missing " + names)
+        failures.append("exclusions")
+    elif exclusions:
+        print("exclusions: " + ", ".join(sorted(exclusions)))
     overall = percentage(files)
     print("overall: " + _result(overall, values.minimum))
     if overall < values.minimum:
@@ -120,6 +134,12 @@ def main(arguments: list[str] | None = None) -> int:
         print("coverage gate failed: " + ", ".join(failures))
         return 1
     return 0
+
+
+def _is_product_file(path: str) -> bool:
+    if path.startswith("agent_harness/"):
+        return True
+    return path in {"tools/bundle.py", "tools/install.py"}
 
 
 def _result(measured: float, minimum: float) -> str:

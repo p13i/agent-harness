@@ -1,9 +1,78 @@
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "bundle_lib",
+    srcs = ["bundle.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "install_lib",
+    srcs = ["install.py"],
+    visibility = ["//visibility:public"],
+    deps = [":bundle_lib"],
+)
 
 py_binary(
     name = "install",
-    srcs = ["install.py"],
+    srcs = [
+        "bundle.py",
+        "install.py",
+    ],
     main = "install.py",
+    deps = ["//agent_harness"],
+)
+
+py_binary(
+    name = "bundle",
+    srcs = ["bundle.py"],
+    main = "bundle.py",
+)
+
+py_binary(
+    name = "ui_gallery",
+    srcs = ["ui_gallery.py"],
+    main = "ui_gallery.py",
+    deps = ["//agent_harness"],
+)
+
+py_test(
+    name = "ui_gallery_test",
+    srcs = [
+        "ui_gallery.py",
+        "ui_gallery_test.py",
+    ],
+    main = "ui_gallery_test.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
+)
+
+py_binary(
+    name = "wsl_e2e",
+    srcs = ["wsl_e2e.py"],
+    main = "wsl_e2e.py",
+    deps = [
+        ":bundle_lib",
+        ":install_lib",
+        "//agent_harness",
+    ],
+)
+
+py_test(
+    name = "wsl_e2e_test",
+    srcs = [
+        "wsl_e2e.py",
+        "wsl_e2e_test.py",
+    ],
+    main = "wsl_e2e_test.py",
+    deps = [
+        ":bundle_lib",
+        ":install_lib",
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
 )
 
 py_test(
@@ -47,9 +116,13 @@ py_test(
 py_test(
     name = "install_test",
     srcs = [
+        "bundle.py",
         "install.py",
         "install_test.py",
     ],
     main = "install_test.py",
-    deps = ["@agent_harness_pip//pytest"],
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
 )

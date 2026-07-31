@@ -19,6 +19,14 @@ def report(path: Path) -> None:
                 "LF:100",
                 "LH:62",
                 "end_of_record",
+                "SF:tools/bundle.py",
+                "LF:100",
+                "LH:100",
+                "end_of_record",
+                "SF:tools/unrelated.py",
+                "LF:100",
+                "LH:0",
+                "end_of_record",
                 "",
             ]
         ),
@@ -32,7 +40,7 @@ def test_coverage_gate_enforces_overall_and_group_thresholds(
     lcov = tmp_path / "coverage.dat"
     report(lcov)
 
-    assert len(read_lcov(lcov)) == 2
+    assert len(read_lcov(lcov)) == 4
     assert (
         main(
             [
@@ -42,6 +50,8 @@ def test_coverage_gate_enforces_overall_and_group_thresholds(
                 "80",
                 "--group",
                 "core=95:agent_harness/core.py",
+                "--group",
+                "bundle=95:tools/bundle.py",
             ]
         )
         == 0
@@ -78,6 +88,44 @@ def test_coverage_gate_rejects_invalid_or_missing_groups(
                 "0",
                 "--group",
                 "missing=1:agent_harness/missing.py",
+            ]
+        )
+        == 1
+    )
+
+
+def test_coverage_gate_excludes_declared_process_boundaries(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lcov = tmp_path / "coverage.dat"
+    report(lcov)
+
+    assert (
+        main(
+            [
+                "--lcov",
+                str(lcov),
+                "--minimum",
+                "98",
+                "--exclude",
+                "agent_harness/adapter.py",
+            ]
+        )
+        == 0
+    )
+    assert "exclusions: agent_harness/adapter.py" in (
+        capsys.readouterr().out
+    )
+    assert (
+        main(
+            [
+                "--lcov",
+                str(lcov),
+                "--minimum",
+                "0",
+                "--exclude",
+                "agent_harness/missing.py",
             ]
         )
         == 1

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import asdict
+import datetime
 import json
 from pathlib import Path
 import shutil
+import stat
 import sys
 from typing import Any
 
@@ -16,19 +19,29 @@ from agent_harness.client import HarnessClient
 from agent_harness.client import ensure_daemon
 from agent_harness.client import stop_daemon
 from agent_harness.client import wait_command
+from agent_harness.config import CONTROL_BUILD_ID
+from agent_harness.config import CONTROL_PROTOCOL_VERSION
 from agent_harness.config import paths
 from agent_harness.config import prepare_paths
+from agent_harness.config import public_paths
 from agent_harness.errors import HarnessError
 from agent_harness.ids import new_uuid
 from agent_harness.migration import migrate_state
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
 from agent_harness.scheduler import Scheduler
+from agent_harness.service_manager import SystemdUserService
+from agent_harness.service_manager import UnitConfiguration
 from agent_harness.storage import StateStore
 from agent_harness.sync import publish_all
 from agent_harness.sync import read_sync_status
 from agent_harness.tui import run_tui
 from agent_harness.worker import SessionWorker
+from tools.bundle import BundleError
+from tools.bundle import verify_bundle
+from tools.install import default_launcher
+from tools.install import InstallError
+from tools.install import read_selection
 
 
 def parser() -> argparse.ArgumentParser:
@@ -95,6 +108,10 @@ def parser() -> argparse.ArgumentParser:
     extend.add_argument("--allow-xhigh-once", action="store_true")
     extend.add_argument("--reason", required=True)
     subcommands.add_parser("providers")
+    subcommands.add_parser("capabilities")
+
+    paths_command = subcommands.add_parser("paths")
+    paths_command.add_argument("--json", action="store_true")
 
     events = subcommands.add_parser("events")
     events.add_argument("session_id")
@@ -107,6 +124,33 @@ def parser() -> argparse.ArgumentParser:
 
     checkpoint = subcommands.add_parser("checkpoint")
     checkpoint.add_argument("session_id")
+
+    archive = subcommands.add_parser("archive")
+    archive.add_argument("session_id")
+    unarchive = subcommands.add_parser("unarchive")
+    unarchive.add_argument("session_id")
+
+    reconcile = subcommands.add_parser("reconcile")
+    reconcile_commands = reconcile.add_subparsers(
+        dest="reconcile_action",
+        required=True,
+    )
+    reconcile_list = reconcile_commands.add_parser("list")
+    reconcile_list.add_argument("session_id")
+    reconcile_inspect = reconcile_commands.add_parser("inspect")
+    reconcile_inspect.add_argument("reconciliation_id")
+    reconcile_resolve = reconcile_commands.add_parser("resolve")
+    reconcile_resolve.add_argument("reconciliation_id")
+    reconcile_resolve.add_argument(
+        "decision",
+        choices=("accept-current", "restore-pre-turn", "stop"),
+    )
+    reconcile_resolve.add_argument(
+        "--observed-workspace-digest",
+        required=True,
+    )
+    reconcile_resolve.add_argument("--approval-id", default="")
+    reconcile_resolve.add_argument("--audit", default="{}")
 
     route = subcommands.add_parser("route")
     route.add_argument("session_id")
@@ -158,7 +202,15 @@ def parser() -> argparse.ArgumentParser:
     service = subcommands.add_parser("service")
     service.add_argument(
         "service_action",
-        choices=("run", "status", "stop"),
+        choices=(
+            "install",
+            "start",
+            "restart",
+            "status",
+            "stop",
+            "uninstall",
+            "run",
+        ),
     )
     service.add_argument("--tcp-host", default="")
     service.add_argument("--tcp-port", type=int, default=0)
@@ -252,6 +304,9 @@ async def _run(arguments: argparse.Namespace) -> int:
         return 0
     harness_paths = paths(arguments.state_dir)
     prepare_paths(harness_paths)
+    if arguments.command == "paths":
+        _print_json(public_paths(harness_paths))
+        return 0
     if arguments.command == "daemon":
         await run_daemon(
             harness_paths,
@@ -267,14 +322,84 @@ async def _run(arguments: argparse.Namespace) -> int:
                 tcp_port=arguments.tcp_port,
             )
             return 0
-        if arguments.service_action == "stop":
-            stopped = await stop_daemon(harness_paths)
-            _print_json({"running": False, "stopped": stopped})
+        manager = _service_manager()
+        if arguments.service_action == "install":
+            selection = _installed_selection()
+            manager.install(
+                UnitConfiguration(
+                    executable=selection.executable,
+                    state_dir=harness_paths.state_dir,
+                    build_id=selection.build_id,
+                )
+            )
+            _print_json(
+                {
+                    "installed": True,
+                    "build_id": selection.build_id,
+                    "unit": str(manager.unit_path),
+                }
+            )
             return 0
-        client = HarnessClient(harness_paths)
-        healthy = await client.health()
-        _print_json({"running": healthy})
-        if healthy:
+        if arguments.service_action == "start":
+            manager.start()
+            _print_json({"started": True})
+            return 0
+        if arguments.service_action == "restart":
+            manager.restart()
+            _print_json({"restarted": True})
+            return 0
+        if arguments.service_action == "stop":
+            status = manager.status()
+            if status.installed:
+                manager.stop()
+                _print_json({"stopped": True, "service": True})
+                return 0
+            stopped = await stop_daemon(harness_paths)
+            _print_json(
+                {
+                    "running": False,
+                    "stopped": stopped,
+                    "service": False,
+                }
+            )
+            return 0
+        if arguments.service_action == "uninstall":
+            manager.uninstall()
+            _print_json(
+                {
+                    "installed": False,
+                    "state_preserved": str(harness_paths.state_dir),
+                }
+            )
+            return 0
+        status = manager.status()
+        if not status.installed:
+            client = HarnessClient(harness_paths)
+            healthy = await client.health()
+            _print_json(
+                {
+                    "active": healthy,
+                    "installed": False,
+                    "detail": "local daemon",
+                    "control_build_id": CONTROL_BUILD_ID,
+                    "control_protocol_version": (
+                        CONTROL_PROTOCOL_VERSION
+                    ),
+                }
+            )
+            if healthy:
+                return 0
+            return 1
+        _print_json(
+            {
+                **asdict(status),
+                "control_build_id": CONTROL_BUILD_ID,
+                "control_protocol_version": (
+                    CONTROL_PROTOCOL_VERSION
+                ),
+            }
+        )
+        if status.active:
             return 0
         return 1
     if arguments.command == "worker":
@@ -369,6 +494,9 @@ async def _run(arguments: argparse.Namespace) -> int:
         )
         _print_json(result)
         return 0
+    if arguments.command == "capabilities":
+        _print_json(await client.request("GET", "/v1/capabilities"))
+        return 0
     if arguments.command == "usage":
         result = await client.request(
             "GET",
@@ -425,6 +553,54 @@ async def _run(arguments: argparse.Namespace) -> int:
             + arguments.session_id
             + "/checkpoints",
             payload={},
+        )
+        _print_json(result)
+        return 0
+    if arguments.command in {"archive", "unarchive"}:
+        result = await client.request(
+            "POST",
+            "/v1/sessions/"
+            + arguments.session_id
+            + "/"
+            + arguments.command,
+            payload={},
+            idempotency_key=new_uuid(),
+        )
+        _print_json(result)
+        return 0
+    if arguments.command == "reconcile":
+        if arguments.reconcile_action == "list":
+            result = await client.request(
+                "GET",
+                "/v1/sessions/"
+                + arguments.session_id
+                + "/reconciliations",
+            )
+            _print_json(result)
+            return 0
+        if arguments.reconcile_action == "inspect":
+            result = await client.request(
+                "GET",
+                "/v1/reconciliations/"
+                + arguments.reconciliation_id,
+            )
+            _print_json(result)
+            return 0
+        audit = _json_object(arguments.audit, "--audit")
+        result = await client.request(
+            "POST",
+            "/v1/reconciliations/"
+            + arguments.reconciliation_id
+            + "/resolution",
+            payload={
+                "decision": arguments.decision,
+                "observed_workspace_digest": (
+                    arguments.observed_workspace_digest
+                ),
+                "approval_id": arguments.approval_id,
+                "audit": audit,
+            },
+            idempotency_key=new_uuid(),
         )
         _print_json(result)
         return 0
@@ -553,6 +729,15 @@ async def _worker(harness_paths: Any, session_id: str) -> None:
 
 
 async def _doctor(harness_paths: Any) -> int:
+    state_mode = stat.S_IMODE(
+        harness_paths.state_dir.stat().st_mode
+    )
+    runtime_private = (
+        stat.S_IMODE(harness_paths.runtime.stat().st_mode) == 0o700
+    )
+    socket_mode: int | None = None
+    if harness_paths.socket.exists():
+        socket_mode = stat.S_IMODE(harness_paths.socket.stat().st_mode)
     checks = {
         "npx": shutil.which("npx") is not None,
         "git": shutil.which("git") is not None,
@@ -560,28 +745,185 @@ async def _doctor(harness_paths: Any) -> int:
         "git_state_repository": (
             harness_paths.state_dir / ".git"
         ).exists(),
-        "private_runtime_mode": (
-            harness_paths.runtime.stat().st_mode & 0o077
-        )
-        == 0,
+        "private_state_mode": state_mode == 0o700,
+        "private_runtime_mode": runtime_private,
+        "private_socket_mode": (
+            socket_mode is None or socket_mode == 0o600
+        ),
     }
+    details: dict[str, Any] = {}
     store = StateStore(harness_paths.database)
     try:
-        store.list_sessions()
-        checks["sqlite"] = True
+        checks["sqlite"] = store.integrity_check() == "ok"
+        workers = store.worker_registrations()
+        active_leases = store.active_process_leases()
+        stale_workers = [
+            worker
+            for worker in workers
+            if _timestamp_is_stale(
+                str(worker.get("heartbeat_at", "")),
+                maximum_age_seconds=90,
+            )
+        ]
+        stale_leases = [
+            lease
+            for lease in active_leases
+            if _timestamp_is_expired(
+                str(lease.get("expires_at", ""))
+            )
+        ]
+        checks["stale_workers"] = not stale_workers
+        checks["stale_process_leases"] = not stale_leases
+        details["workers"] = workers
+        details["active_process_leases"] = active_leases
+        details["stale_workers"] = stale_workers
+        details["stale_process_leases"] = stale_leases
+        socket_mode_detail = "absent"
+        if socket_mode is not None:
+            socket_mode_detail = oct(socket_mode)
+        details["permissions"] = {
+            "state_mode": oct(state_mode),
+            "runtime_mode": oct(
+                stat.S_IMODE(harness_paths.runtime.stat().st_mode)
+            ),
+            "socket_mode": socket_mode_detail,
+        }
     finally:
         store.close()
+    bundle_status: dict[str, Any] = {
+        "status": "warning",
+        "detail": "no installed bundle is selected",
+    }
+    try:
+        selection = _installed_selection()
+        bundle = verify_bundle(selection.executable.parent.parent)
+        bundle_status = {
+            "status": "pass",
+            "build_id": selection.build_id,
+            "content_digest": bundle.content_digest,
+            "executable": str(selection.executable),
+        }
+    except (BundleError, InstallError, ValueError):
+        bundle_status = {
+            "status": "warning",
+            "detail": "installed bundle is absent or invalid",
+        }
+    service_probes = [
+        asdict(item) for item in _service_manager().diagnostics()
+    ]
+    daemon = HarnessClient(harness_paths)
+    daemon_health = await daemon._health_payload()
+    daemon_status = "not-running"
+    if daemon_health:
+        daemon_status = "incompatible"
+        if (
+            daemon_health.get("control_build_id")
+            == CONTROL_BUILD_ID
+            and daemon_health.get("control_protocol_version")
+            == CONTROL_PROTOCOL_VERSION
+        ):
+            daemon_status = "compatible"
+    disk = shutil.disk_usage(harness_paths.state_dir)
+    details.update(
+        {
+            "bundle": bundle_status,
+            "daemon": {
+                "status": daemon_status,
+                "control_build_id": daemon_health.get(
+                    "control_build_id",
+                    "",
+                ),
+                "control_protocol_version": daemon_health.get(
+                    "control_protocol_version",
+                    0,
+                ),
+            },
+            "disk": {
+                "free_bytes": disk.free,
+                "headroom": disk.free >= 2 * 1024**3,
+            },
+            "provider_launchers": {
+                "claude": (
+                    "npx @anthropic-ai/claude-code@2.1.220"
+                ),
+                "codex": "npx -y @openai/codex@0.146.0",
+            },
+            "service": service_probes,
+        }
+    )
+    sync_status = read_sync_status(harness_paths)
+    details["sync_lag_seconds"] = _sync_lag_seconds(sync_status)
     _print_json(
         {
             "checks": checks,
+            "details": details,
             "ok": all(checks.values()),
             "state_root": str(harness_paths.state_dir),
-            "sync": read_sync_status(harness_paths),
+            "sync": sync_status,
         }
     )
     if all(checks.values()):
         return 0
     return 1
+
+
+def _service_manager() -> SystemdUserService:
+    return SystemdUserService()
+
+
+def _installed_selection():
+    selection = read_selection(default_launcher())
+    if selection is None:
+        raise ValueError(
+            "install a verified bundle before installing the service"
+        )
+    bundle = verify_bundle(selection.executable.parent.parent)
+    if bundle.build_id != selection.build_id:
+        raise ValueError("installed bundle selection is inconsistent")
+    return selection
+
+
+def _sync_lag_seconds(value: dict[str, Any]) -> float | None:
+    updated_at = str(value.get("updated_at", ""))
+    if not updated_at:
+        return None
+    try:
+        observed = datetime.datetime.fromisoformat(updated_at)
+    except ValueError:
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=datetime.UTC)
+    now = datetime.datetime.now(datetime.UTC)
+    return max(0.0, (now - observed).total_seconds())
+
+
+def _timestamp_is_stale(
+    value: str,
+    *,
+    maximum_age_seconds: float,
+) -> bool:
+    observed = _timestamp(value)
+    if observed is None:
+        return True
+    age = datetime.datetime.now(datetime.UTC) - observed
+    return age.total_seconds() > maximum_age_seconds
+
+
+def _timestamp_is_expired(value: str) -> bool:
+    observed = _timestamp(value)
+    if observed is None:
+        return True
+    return observed <= datetime.datetime.now(datetime.UTC)
+
+
+def _timestamp(value: str) -> datetime.datetime | None:
+    try:
+        observed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=datetime.UTC)
+    return observed.astimezone(datetime.UTC)
 
 
 def _print_json(value: dict[str, Any]) -> None:

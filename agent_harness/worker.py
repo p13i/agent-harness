@@ -32,6 +32,7 @@ from agent_harness.models import ProviderAttempt
 from agent_harness.models import Session
 from agent_harness.providers.base import ProviderAdapter
 from agent_harness.providers.base import ProviderEvent
+from agent_harness.reconciliation import ReconciliationManager
 from agent_harness.scheduler import Scheduler
 from agent_harness.safety import SafetyLimits
 from agent_harness.safety import TurnGuard
@@ -78,8 +79,11 @@ class SessionWorker:
             os.getpid(),
             self.incarnation,
         )
-        ambiguous = self.store.recover_dispatching(self.session_id)
-        if ambiguous:
+        recovery = await ReconciliationManager(
+            self.store,
+            self.blobs,
+        ).recover_after_restart(self.session_id)
+        if recovery.reconciliations:
             self.store.update_session(
                 self.session_id,
                 attention=Attention.NEEDS_RECONCILIATION,
@@ -88,7 +92,14 @@ class SessionWorker:
                 self.session_id,
                 "worker.recovered",
                 status="needs-reconciliation",
-                metadata={"ambiguous_commands": ambiguous},
+                metadata=recovery.as_dict(),
+            )
+        elif recovery.requeued_command_ids:
+            self.store.append_event(
+                self.session_id,
+                "worker.recovered",
+                status="requeued",
+                metadata=recovery.as_dict(),
             )
         try:
             await self._loop()
@@ -117,6 +128,14 @@ class SessionWorker:
                 await self._control(control)
                 continue
             if session.lifecycle == Lifecycle.PAUSED:
+                await asyncio.sleep(0.2)
+                continue
+            if self.store.pending_reconciliations(self.session_id):
+                if session.attention != Attention.NEEDS_RECONCILIATION:
+                    self.store.update_session(
+                        self.session_id,
+                        attention=Attention.NEEDS_RECONCILIATION,
+                    )
                 await asyncio.sleep(0.2)
                 continue
             command = self.store.claim_command(self.session_id)
@@ -443,17 +462,12 @@ class SessionWorker:
         )
         native_session_id = self._native_session(decision.provider)
         prompt = text
+        context_digest = ""
         if not native_session_id or session.active_provider != decision.provider:
             prompt = context.text + "\n\n# Next instruction\n\n" + text
-            digest = hashlib.sha256(
+            context_digest = hashlib.sha256(
                 context.text.encode("utf-8")
             ).hexdigest()
-            self.store.record_context_delivery(
-                self.session_id,
-                decision.provider,
-                digest,
-                "",
-            )
         submitted_tokens = (len(prompt) + 3) // 4
         violation = guard.begin_attempt(submitted_tokens)
         if violation:
@@ -483,7 +497,14 @@ class SessionWorker:
             recovery_stage=recovery_stage,
             consumption=guard.consumption.as_dict(),
         )
-        turn_id = self.store.start_turn(self.session_id, attempt_id)
+        turn_ref = payload.get("turn_ref")
+        if not isinstance(turn_ref, dict):
+            turn_ref = {}
+        turn_id = self.store.start_turn(
+            self.session_id,
+            attempt_id,
+            turn_ref=turn_ref,
+        )
         self.store.record_routing(
             self.session_id,
             turn_id,
@@ -502,7 +523,10 @@ class SessionWorker:
             self.session_id,
             "routing.selected",
             status="complete",
-            metadata=decision.as_dict(),
+            metadata={
+                **decision.as_dict(),
+                "turn_ref": turn_ref,
+            },
             turn_id=turn_id,
         )
         adapter = self.adapters[decision.provider]
@@ -568,6 +592,41 @@ class SessionWorker:
         ) -> dict[str, Any]:
             return await self._approval(turn_id, method, request)
 
+        pre_dispatch_checkpoint = await asyncio.to_thread(
+            checkpoint_workspace,
+            session,
+            self.blobs,
+            sequence=self.store.last_sequence(self.session_id),
+            provider=decision.provider,
+            native_session_id=native_session_id,
+            context_text=context.text,
+        )
+        self.store.add_checkpoint(pre_dispatch_checkpoint)
+        self.store.record_dispatch_checkpoint(
+            command_id,
+            attempt_id,
+            turn_id,
+            pre_dispatch_checkpoint.checkpoint_id,
+        )
+        if context_digest:
+            self.store.record_context_delivery(
+                self.session_id,
+                decision.provider,
+                context_digest,
+                pre_dispatch_checkpoint.checkpoint_id,
+            )
+        self.store.append_event(
+            self.session_id,
+            "checkpoint.created",
+            status="pre-dispatch",
+            metadata={
+                **pre_dispatch_checkpoint.as_dict(),
+                "command_id": command_id,
+                "attempt_id": attempt_id,
+            },
+            turn_id=turn_id,
+        )
+        self.store.mark_provider_boundary(attempt_id)
         run_task = asyncio.create_task(
             adapter.run_turn(
                 workspace=Path(session.worktree),
@@ -687,14 +746,17 @@ class SessionWorker:
         except SafetyGuardError:
             self.store.update_attempt(attempt_id, status="interrupted")
             self.store.finish_turn(turn_id, "interrupted")
+            self.store.complete_dispatch(attempt_id, "interrupted")
             raise
         except (ProviderExhaustedError, ProviderUnavailableError):
             self.store.update_attempt(attempt_id, status="exhausted")
             self.store.finish_turn(turn_id, "exhausted")
+            self.store.complete_dispatch(attempt_id, "exhausted")
             raise
         except BaseException:
             self.store.update_attempt(attempt_id, status="failed")
             self.store.finish_turn(turn_id, "failed")
+            self.store.complete_dispatch(attempt_id, "failed")
             raise
         finally:
             self._active_adapter = None
@@ -716,6 +778,7 @@ class SessionWorker:
             native_session_id=result.native_session_id,
         )
         self.store.finish_turn(turn_id, result.status)
+        self.store.complete_dispatch(attempt_id, "complete")
         current = self.store.get_session(self.session_id)
         checkpoint = await asyncio.to_thread(
             checkpoint_workspace,
@@ -770,7 +833,10 @@ class SessionWorker:
             role = "user"
         metadata = {}
         if event.metadata is not None:
-            metadata = event.metadata
+            metadata = dict(event.metadata)
+        turn_ref = self.store.turn_ref(turn_id)
+        if turn_ref:
+            metadata["turn_ref"] = turn_ref
         self.store.append_event(
             self.session_id,
             event.event_type,

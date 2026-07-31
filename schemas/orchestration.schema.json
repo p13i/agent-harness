@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "p13i/agent-harness/orchestration/v1",
+  "$defs": {
+    "external_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "orchestrator",
+        "job_id"
+      ],
+      "properties": {
+        "orchestrator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "job_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "turn_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step_id",
+        "agent_role"
+      ],
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "agent_role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "reconciliation_resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision",
+        "observed_workspace_digest"
+      ],
+      "properties": {
+        "decision": {
+          "enum": [
+            "accept-current",
+            "restore-pre-turn",
+            "stop"
+          ]
+        },
+        "observed_workspace_digest": {
+          "type": "string",
+          "minLength": 1
+        },
+        "approval_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "audit": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

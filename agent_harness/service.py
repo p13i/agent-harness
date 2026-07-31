@@ -8,6 +8,7 @@ import datetime
 from pathlib import Path
 import signal
 import subprocess
+import threading
 from typing import Any
 
 from agent_harness.blobs import BlobStore
@@ -15,6 +16,8 @@ from agent_harness.config import HarnessPaths
 from agent_harness.config import host_id
 from agent_harness.context import compile_context
 from agent_harness.context import workspace_instructions
+from agent_harness.errors import ConflictError
+from agent_harness.errors import HarnessError
 from agent_harness.errors import SafetyGuardError
 from agent_harness.goals import create_goal
 from agent_harness.goals import make_evidence
@@ -22,13 +25,14 @@ from agent_harness.ids import new_uuid
 from agent_harness.ids import require_uuid
 from agent_harness.ids import utc_now
 from agent_harness.models import Attention
-from agent_harness.models import CommandStatus
 from agent_harness.models import Lifecycle
 from agent_harness.models import PermissionMode
 from agent_harness.models import Session
+from agent_harness.orchestration import normalize_external_ref
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
 from agent_harness.projections import write_session_projections
+from agent_harness.reconciliation import ReconciliationManager
 from agent_harness.scheduler import Scheduler
 from agent_harness.safety import UNATTENDED
 from agent_harness.safety import effective_effort
@@ -95,7 +99,13 @@ class HarnessService:
             "codex": CodexAdapter(),
         }
         self.scheduler = Scheduler(self.store, self.adapters)
+        self.reconciliations = ReconciliationManager(
+            self.store,
+            self.blobs,
+        )
         self.machine_keys = load_machine_keys(paths.machine_keys)
+        self._session_creation_lock = threading.Lock()
+        self._reconciliation_resolution_lock = asyncio.Lock()
         self.workers = worker_manager
         if self.workers is None:
             self.workers = WorkerManager(paths)
@@ -126,13 +136,81 @@ class HarnessService:
             )
         return session
 
-    def create_session(self, payload: dict[str, Any]) -> Session:
+    def create_session(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> Session:
+        with self._session_creation_lock:
+            return self._create_session(
+                payload,
+                idempotency_key=idempotency_key,
+            )
+
+    def _create_session(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> Session:
         workspace_text = str(payload.get("workspace", "")).strip()
         if not workspace_text:
             raise ValueError("workspace is required")
         workspace = Path(workspace_text).expanduser().resolve()
-        inherited_ui_state = self._workspace_ui_state(str(workspace))
         direct = bool(payload.get("direct", False))
+        requested_name = str(payload.get("name", "")).strip()
+        permission_mode = str(
+            payload.get("permission_mode", PermissionMode.APPROVAL)
+        )
+        if permission_mode not in set(PermissionMode):
+            raise ValueError("unsupported permission mode")
+        execution_profile = validate_profile(
+            str(payload.get("execution_profile", UNATTENDED))
+        )
+        external_ref = normalize_external_ref(
+            payload.get("external_ref")
+        )
+        objective = str(payload.get("goal", "")).strip()
+        predicates = payload.get("predicates", [])
+        if not isinstance(predicates, list):
+            raise ValueError("predicates must be an array")
+        constraints = payload.get("constraints", [])
+        if not isinstance(constraints, list):
+            raise ValueError("constraints must be an array")
+        budgets = payload.get("budgets", {})
+        if not isinstance(budgets, dict):
+            raise ValueError("budgets must be an object")
+        creation_input: dict[str, Any] = {
+            "workspace": str(workspace),
+            "name": requested_name,
+            "permission_mode": permission_mode,
+            "execution_profile": execution_profile,
+            "direct": direct,
+            "external_ref": external_ref,
+            "routing": {
+                "model": str(payload.get("model", "")),
+                "effort": str(payload.get("effort", "")),
+            },
+        }
+        if objective:
+            creation_input["goal"] = {
+                "objective": objective,
+                "kind": str(payload.get("goal_kind", "finite")),
+                "constraints": [str(item) for item in constraints],
+                "predicates": [
+                    item for item in predicates if isinstance(item, dict)
+                ],
+                "budgets": budgets,
+            }
+        existing = self.store.existing_ensured_session(
+            creation_input,
+            idempotency_key=idempotency_key,
+            external_ref=external_ref,
+        )
+        if existing is not None:
+            return existing
+        inherited_ui_state = self._workspace_ui_state(str(workspace))
         session_id = new_uuid()
         worktree = create_worktree(
             workspace,
@@ -140,14 +218,9 @@ class HarnessService:
             session_id,
             direct=direct,
         )
-        name = str(payload.get("name", "")).strip()
+        name = requested_name
         if not name:
             name = workspace.name + " " + session_id[:8]
-        permission_mode = str(
-            payload.get("permission_mode", PermissionMode.APPROVAL)
-        )
-        if permission_mode not in set(PermissionMode):
-            raise ValueError("unsupported permission mode")
         now = utc_now()
         session = Session(
             session_id=session_id,
@@ -165,31 +238,28 @@ class HarnessService:
             owner_epoch=1,
             created_at=now,
             updated_at=now,
+            external_ref=external_ref,
         )
-        self.store.create_session(session)
+        session, created = self.store.ensure_session(
+            session,
+            creation_input,
+            idempotency_key=idempotency_key,
+        )
+        if not created:
+            return session
         if inherited_ui_state:
             self.store.set_ui_state(
                 "session:" + session_id,
                 inherited_ui_state,
             )
-        execution_profile = validate_profile(
-            str(payload.get("execution_profile", UNATTENDED))
-        )
         self.store.set_session_safety(session_id, execution_profile)
-        objective = str(payload.get("goal", "")).strip()
         if objective:
-            predicates = payload.get("predicates", [])
-            if not isinstance(predicates, list):
-                predicates = []
-            budgets = payload.get("budgets", {})
-            if not isinstance(budgets, dict):
-                budgets = {}
             goal = create_goal(
                 session_id,
                 objective,
                 kind=str(payload.get("goal_kind", "finite")),
                 constraints=tuple(
-                    str(item) for item in payload.get("constraints", [])
+                    str(item) for item in constraints
                 ),
                 predicates=tuple(
                     item for item in predicates if isinstance(item, dict)
@@ -225,13 +295,13 @@ class HarnessService:
         text = str(payload.get("text", "")).strip()
         if not text:
             raise ValueError("message text is required")
-        receipt = self.store.enqueue_command(
+        receipt, created = self.store.ensure_command(
             session_id,
             "message",
             payload,
             idempotency_key,
         )
-        if receipt.status == CommandStatus.QUEUED:
+        if created:
             session = self.store.get_session(session_id)
             if _automatic_session_name(session):
                 self.store.update_session(
@@ -244,7 +314,10 @@ class HarnessService:
                 role="user",
                 text=text,
                 status="accepted",
-                metadata={"command_id": receipt.command_id},
+                metadata={
+                    "command_id": receipt.command_id,
+                    "turn_ref": receipt.turn_ref,
+                },
             )
         self.workers.ensure(session_id)
         return receipt.as_dict()
@@ -287,6 +360,191 @@ class HarnessService:
             metadata={"fields": configured_fields},
         )
         return session
+
+    def set_session_archived(
+        self,
+        session_id: str,
+        archived: bool,
+    ) -> Session:
+        require_uuid(session_id, "session_id")
+        session = self.store.get_session(session_id)
+        if session.archived == archived:
+            return session
+        session = self.store.update_session(
+            session_id,
+            archived=archived,
+        )
+        event_type = "session.archived"
+        if not archived:
+            event_type = "session.unarchived"
+        self.store.append_event(
+            session_id,
+            event_type,
+            status="complete",
+            metadata={"archived": archived},
+        )
+        return session
+
+    def pending_reconciliations(
+        self,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        require_uuid(session_id, "session_id")
+        self.store.get_session(session_id)
+        return [
+            item.as_dict()
+            for item in self.store.pending_reconciliations(session_id)
+        ]
+
+    def inspect_reconciliation(
+        self,
+        reconciliation_id: str,
+    ) -> dict[str, Any]:
+        require_uuid(reconciliation_id, "reconciliation_id")
+        return self.reconciliations.inspect(
+            reconciliation_id
+        ).as_dict()
+
+    async def resolve_reconciliation(
+        self,
+        reconciliation_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        async with self._reconciliation_resolution_lock:
+            return await self._resolve_reconciliation(
+                reconciliation_id,
+                payload,
+            )
+
+    async def _resolve_reconciliation(
+        self,
+        reconciliation_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        require_uuid(reconciliation_id, "reconciliation_id")
+        decision = str(payload.get("decision", "")).strip()
+        observed_digest = str(
+            payload.get("observed_workspace_digest", "")
+        ).strip()
+        if not observed_digest:
+            raise ValueError("observed workspace digest is required")
+        audit = payload.get("audit")
+        if audit is not None and not isinstance(audit, dict):
+            raise ValueError("reconciliation audit must be an object")
+        record = self.reconciliations.inspect(reconciliation_id)
+        approved = self._reconciliation_restore_approved(
+            record.session_id,
+            reconciliation_id,
+            decision,
+            str(payload.get("approval_id", "")).strip(),
+        )
+        record = await self.reconciliations.resolve(
+            reconciliation_id,
+            decision,
+            observed_digest,
+            audit=audit,
+            approved=approved,
+        )
+        self.store.append_event(
+            record.session_id,
+            "reconciliation.resolved",
+            status=record.status,
+            metadata={
+                "reconciliation_id": record.reconciliation_id,
+                "command_id": record.command_id,
+                "decision": record.resolution,
+                "workspace_digest": (
+                    record.current_workspace_digest
+                ),
+            },
+        )
+        if record.resolution != "stop":
+            self.workers.ensure(record.session_id)
+        return record.as_dict()
+
+    def _reconciliation_restore_approved(
+        self,
+        session_id: str,
+        reconciliation_id: str,
+        decision: str,
+        approval_id: str,
+    ) -> bool:
+        if decision != "restore-pre-turn":
+            return False
+        session = self.store.get_session(session_id)
+        if session.permission_mode != PermissionMode.APPROVAL:
+            return False
+        if not approval_id:
+            approval_id = self._pending_reconciliation_approval(
+                session_id,
+                reconciliation_id,
+            )
+            if not approval_id:
+                approval_id = self.store.create_approval(
+                    session_id,
+                    "",
+                    reconciliation_id,
+                    "reconciliation.restore",
+                    "Restore the exact pre-turn workspace checkpoint?",
+                    [
+                        {"id": "approve", "label": "Restore"},
+                        {"id": "decline", "label": "Keep current"},
+                    ],
+                )
+                self.store.append_event(
+                    session_id,
+                    "approval.requested",
+                    status="pending",
+                    metadata={
+                        "approval_id": approval_id,
+                        "method": "reconciliation.restore",
+                        "reconciliation_id": reconciliation_id,
+                    },
+                )
+            raise HarnessError(
+                "E_APPROVAL_REQUIRED",
+                "reconciliation restore requires approval "
+                + approval_id,
+                status=409,
+            )
+        approval = self.store.approval(approval_id)
+        if (
+            approval["session_id"] != session_id
+            or approval["provider_request_id"] != reconciliation_id
+            or approval["kind"] != "reconciliation.restore"
+        ):
+            raise ConflictError(
+                "approval does not authorize this reconciliation"
+            )
+        if approval["status"] != "resolved":
+            raise HarnessError(
+                "E_APPROVAL_REQUIRED",
+                "reconciliation restore approval is pending",
+                status=409,
+            )
+        approval_decision = approval.get("decision")
+        if not isinstance(approval_decision, dict):
+            raise ConflictError("approval decision is invalid")
+        if approval_decision.get("decision") != "approve":
+            raise HarnessError(
+                "E_APPROVAL_DECLINED",
+                "reconciliation restore was not approved",
+                status=409,
+            )
+        return True
+
+    def _pending_reconciliation_approval(
+        self,
+        session_id: str,
+        reconciliation_id: str,
+    ) -> str:
+        for approval in self.store.pending_approvals(session_id):
+            if (
+                approval["provider_request_id"] == reconciliation_id
+                and approval["kind"] == "reconciliation.restore"
+            ):
+                return str(approval["approval_id"])
+        return ""
 
     def safety_state(self, session_id: str) -> dict[str, Any]:
         require_uuid(session_id, "session_id")
@@ -477,12 +735,17 @@ class HarnessService:
         self.store.get_session(session_id)
         allowed = {
             "active_pane",
+            "composer_cursor",
             "composer",
             "effort",
             "events",
+            "expanded_blocks",
+            "inspector_tab",
             "model",
             "provider",
+            "request_id",
             "session_filter",
+            "session_query",
             "sidebar_width",
             "theme",
         }
@@ -497,7 +760,7 @@ class HarnessService:
             if not isinstance(value, str):
                 raise ValueError("UI state values must be strings")
             limit = 128
-            if name == "composer":
+            if name in {"composer", "expanded_blocks"}:
                 limit = 131_072
             if len(value) > limit:
                 raise ValueError("UI state value is too long")
@@ -509,6 +772,7 @@ class HarnessService:
         inherited_fields = {
             "events",
             "session_filter",
+            "session_query",
             "sidebar_width",
             "theme",
         }
@@ -676,6 +940,8 @@ class HarnessService:
             "permission_mode": source.permission_mode,
             "execution_profile": source_profile,
         }
+        if "external_ref" in payload:
+            create_payload["external_ref"] = payload["external_ref"]
         if not create_payload["name"]:
             create_payload["name"] = source.name + " fork"
         if goal is not None:

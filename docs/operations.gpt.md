@@ -17,6 +17,23 @@ The durable service starts on demand. Closing the TUI leaves
 workers running. The following commands provide non-TUI
 control:
 
+```sh
+make install
+agent-harness service install
+agent-harness service start
+agent-harness service status
+agent-harness service restart
+agent-harness service stop
+agent-harness service uninstall
+```
+
+The installer creates a versioned, self-contained bundle
+under `~/.local/lib/p13i-agent-harness/` and atomically
+updates the launcher under `~/.local/bin/`. Service removal
+preserves all chat state. `service install` reports when a
+systemd user manager is unavailable or lingering is
+inactive; it does not modify either system setting.
+
 The session sidebar starts in a focused view that retains
 the current session, attention-required sessions, and five
 recent idle sessions. `/sessions all` exposes complete
@@ -27,17 +44,45 @@ press `Ctrl+Shift+Left` and `Ctrl+Shift+Right` to resize it.
 restored with the session and inherited by new chats in the
 same workspace.
 
+Use the sidebar search field to match session UUID, name,
+provider, or exact external job reference. `/rename`,
+`/archive`, and `/unarchive` update lifecycle state without
+deleting history. Archived sessions appear in their own
+group when the complete view is active.
+
 The transcript reconciles streamed deltas with the provider
 final message. Provider protocol lifecycle events remain
 hidden unless `/events on` activates the diagnostic view.
 `/theme system` tracks the host appearance; `/theme light`
 and `/theme dark` select an explicit appearance.
 
+The composer accepts multiple lines. `Enter` sends,
+`Shift+Enter` and `Ctrl+J` insert a newline, and pasted text
+never submits by itself. During a connection loss the
+harness retains the draft, cursor, and request identifier;
+reconnection queries or repeats that same idempotent
+request rather than creating a second turn.
+
+The inspector separates Context, Goal, Usage, Approvals,
+Recovery, and Storage. The Recovery tab shows ambiguous
+commands and their checkpoint, worktree, usage, and
+resolution state. The Storage tab shows identifiers, paths,
+and synchronization state without credentials.
+
 Health responses carry a control protocol version and a
 build fingerprint derived from the harness Python package.
 Before opening chat, a new CLI replaces an older managed
 daemon when either value differs. This prevents a rebuilt
 client from silently using stale in-memory service code.
+
+`make doctor` checks the selected bundle, systemd user
+service, daemon compatibility, SQLite integrity, Git and
+`npx`, disk headroom, synchronization lag, and the pinned
+provider launch commands. It fails closed when the state
+directory, runtime directory, or live Unix socket has
+non-private permissions, and when worker heartbeats or
+active process leases are stale. The diagnostic reports the
+affected records without repairing or deleting them.
 
 ## Chat data
 
@@ -165,6 +210,36 @@ rejected. The fleet integration normally keeps the harness
 on its Unix socket and exposes only a narrow authenticated
 machines bridge.
 
+External orchestrators can bind one stable job to one
+session and submit retry-safe turns through the Python SDK:
+
+```python
+session = client.ensure_session(
+    external_ref={
+        "orchestrator": "p13i/machines",
+        "job_id": "build-42",
+    },
+    workspace="/absolute/workspace",
+    idempotency_key="create-build-42",
+)
+receipt = client.submit_managed_turn(
+    session["id"],
+    "Execute the bounded build step.",
+    turn_ref={
+        "step_id": "compile",
+        "agent_role": "implementer",
+    },
+    idempotency_key="build-42-compile",
+)
+result = client.wait_command(
+    receipt["command_id"],
+    timeout_seconds=300,
+)
+```
+
+Managed methods require caller-supplied idempotency keys.
+Interactive conveniences may generate keys automatically.
+
 ## Recovery
 
 The stable resume identifier is the harness session UUID,
@@ -177,6 +252,23 @@ If a provider mutation has an ambiguous result, the session
 enters reconciliation instead of replaying the mutation on
 another provider. Read-only or clearly unstarted work can
 fail over automatically.
+
+Inspect and resolve an ambiguous turn:
+
+```sh
+agent-harness reconcile list <session-uuid>
+agent-harness reconcile inspect <reconciliation-id>
+agent-harness reconcile resolve <reconciliation-id> \
+  accept-current \
+  --workspace-digest <observed-digest> \
+  --idempotency-key <stable-key>
+```
+
+The other decisions are `restore-pre-turn` and `stop`.
+Approval-mode restores first return an approval ID. Resolve
+that approval, then retry with the same observed digest and
+a new reconciliation idempotency key carrying the approval
+ID.
 
 Hard safety limits do not fail over. Recoverable soft
 violations can lower effort once and switch provider once,
@@ -202,16 +294,30 @@ make lint
 make test
 make build
 make doctor
+make ui-gallery
 ```
 
 These targets use scripted adapters and do not invoke live
-providers. A separate smoke validates one initial and one
-native-resumed turn, with low effort, read-only permission,
-one attempt per turn, and a 50 percent binding ceiling:
+providers. The gallery renders every declared interface
+fixture in both themes and all four breakpoints without
+network or provider access.
+
+On WSL, the opt-in service journey installs and exercises an
+isolated user unit:
 
 ```sh
-make live-smoke ARGS="codex --confirm-spend"
-make live-smoke ARGS="claude --confirm-spend"
+make wsl-e2e ARGS=--confirm
+```
+
+On other platforms or without `--confirm`, it reports the
+journey as pending rather than passing.
+
+A separate smoke validates one Claude and one Codex turn,
+with low effort, read-only permission, one attempt per turn,
+and a 50 percent binding ceiling:
+
+```sh
+make live-smoke ARGS="--confirm-spend"
 ```
 
 Without `--confirm-spend`, the smoke exits before creating a

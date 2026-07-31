@@ -11,15 +11,23 @@ from typing import Any
 
 import pytest
 
+import agent_harness.reconciliation as reconciliation_module
 import agent_harness.safety as safety_module
+import agent_harness.worker as worker_module
 from agent_harness.blobs import BlobStore
 from agent_harness.config import paths
 from agent_harness.config import prepare_paths
 from agent_harness.errors import ProviderExhaustedError
+from agent_harness.errors import ConflictError
+from agent_harness.errors import HarnessError
 from agent_harness.goals import create_goal
 from agent_harness.goals import make_evidence
 from agent_harness.ids import new_uuid
+from agent_harness.ids import utc_now
 from agent_harness.models import CommandReceipt
+from agent_harness.models import ProviderAttempt
+from agent_harness.models import ReconciliationDecision
+from agent_harness.models import ReconciliationRecord
 from agent_harness.providers.base import ApprovalHandler
 from agent_harness.providers.base import EventHandler
 from agent_harness.providers.base import ProviderAdapter
@@ -28,9 +36,12 @@ from agent_harness.providers.base import ProviderModel
 from agent_harness.providers.base import ProviderResult
 from agent_harness.providers.base import ProviderStatus
 from agent_harness.scheduler import Scheduler
+from agent_harness.reconciliation import ReconciliationManager
+from agent_harness.reconciliation import inspect_workspace
 from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
 from agent_harness.worker import SessionWorker
+from agent_harness.workspace import checkpoint_workspace
 from tests.test_support import session
 
 
@@ -360,7 +371,454 @@ async def test_e2e_provider_resume_and_cross_provider_continuity(
         assert "codex completed the turn" in claude.prompts[0]
         assert "# Next instruction" in claude.prompts[0]
         assert "UNIQUE_PROVIDER_NATIVE_INSTRUCTION" not in claude.prompts[0]
-        assert len(rig.store.checkpoints(rig.session.session_id)) == 3
+        assert len(rig.store.checkpoints(rig.session.session_id)) == 6
+        dispatches = rig.store._connection.execute(
+            """
+            SELECT crossed_boundary, state, checkpoint_id
+            FROM command_dispatches ORDER BY created_at
+            """
+        ).fetchall()
+        assert len(dispatches) == 3
+        assert all(row["crossed_boundary"] == 1 for row in dispatches)
+        assert all(row["state"] == "complete" for row in dispatches)
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_managed_turn_ref_stays_out_of_provider_prompt(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    turn_ref = {
+        "step_id": "step-private-correlation",
+        "agent_role": "implementer",
+    }
+    try:
+        receipt = await rig.message(
+            "Implement the bounded step.",
+            provider="codex",
+            turn_ref=turn_ref,
+        )
+
+        assert receipt.turn_ref == turn_ref
+        codex = rig.adapters["codex"]
+        assert "step-private-correlation" not in codex.prompts[0]
+        provider_events = [
+            item
+            for item in rig.store.all_events(rig.session.session_id)
+            if item.event_type == "agent.message"
+        ]
+        assert provider_events[0].metadata["turn_ref"] == turn_ref
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_empty_messages_and_unclaimed_safety(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    try:
+        empty = rig.store.enqueue_command(
+            rig.session.session_id,
+            "message",
+            {"text": "   "},
+            "empty-message",
+        )
+        claimed = rig.store.claim_command(rig.session.session_id)
+        assert claimed is not None
+        await rig.worker._execute_message(claimed)
+        empty_result = rig.store.get_command(empty.command_id)
+        assert empty_result.status == "failed"
+        assert empty_result.result["code"] == "E_INPUT"
+
+        with rig.store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM session_safety WHERE session_id = ?",
+                (rig.session.session_id,),
+            )
+        unclaimed = rig.store.enqueue_command(
+            rig.session.session_id,
+            "message",
+            {"text": "continue"},
+            "unclaimed-safety",
+        )
+        claimed = rig.store.claim_command(rig.session.session_id)
+        assert claimed is not None
+        await rig.worker._execute_message(claimed)
+        unclaimed_result = rig.store.get_command(unclaimed.command_id)
+        assert unclaimed_result.status == "failed"
+        assert unclaimed_result.result["code"] == "E_SAFETY_PROFILE"
+        current = rig.store.get_session(rig.session.session_id)
+        assert current.lifecycle == "paused"
+        assert current.attention == "needs-input"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_controls_interrupt_steer_pause_resume_and_stop(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+
+    async def control(
+        command_type: str,
+        payload: dict[str, object] | None = None,
+    ) -> CommandReceipt:
+        value = payload
+        if value is None:
+            value = {}
+        receipt = rig.store.enqueue_command(
+            rig.session.session_id,
+            command_type,
+            value,
+            "control-" + command_type + "-" + new_uuid(),
+        )
+        await rig.worker._control(receipt)
+        return rig.store.get_command(receipt.command_id)
+
+    try:
+        adapter = rig.adapters["codex"]
+        rig.worker._active_adapter = adapter
+        assert (await control("interrupt")).status == "complete"
+        assert adapter.interruptions == 1
+
+        rig.worker._active_adapter = None
+        steer = await control("steer", {"text": "change direction"})
+        assert steer.status == "failed"
+        assert steer.result["code"] == "E_NO_ACTIVE_TURN"
+
+        rig.worker._active_adapter = adapter
+        assert (await control("steer", {"text": "new plan"})).status == (
+            "complete"
+        )
+        assert adapter.steered == ["new plan"]
+
+        assert (await control("pause")).status == "complete"
+        assert (
+            rig.store.get_session(rig.session.session_id).lifecycle
+            == "paused"
+        )
+        assert (await control("resume")).status == "complete"
+        assert (
+            rig.store.get_session(rig.session.session_id).lifecycle
+            == "running"
+        )
+
+        rig.worker._active_adapter = adapter
+        assert (await control("stop")).status == "complete"
+        assert adapter.interruptions == 2
+        assert rig.worker._stopping
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_run_surfaces_restart_recovery_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = [
+        SimpleNamespace(
+            reconciliations=(object(),),
+            requeued_command_ids=(),
+            as_dict=lambda: {"reconciliations": ["one"]},
+        ),
+        SimpleNamespace(
+            reconciliations=(),
+            requeued_command_ids=("command-1",),
+            as_dict=lambda: {"requeued_command_ids": ["command-1"]},
+        ),
+    ]
+
+    class Manager:
+        def __init__(self, store: object, blobs: object) -> None:
+            del store
+            del blobs
+
+        async def recover_after_restart(
+            self,
+            session_id: str,
+        ) -> object:
+            del session_id
+            return results.pop(0)
+
+    monkeypatch.setattr(worker_module, "ReconciliationManager", Manager)
+
+    for index in range(2):
+        root = tmp_path / ("recovery-" + str(index))
+        root.mkdir()
+        rig = JourneyRig(root)
+
+        async def no_loop() -> None:
+            return
+
+        monkeypatch.setattr(rig.worker, "_loop", no_loop)
+        try:
+            await rig.worker.run()
+            events = rig.store.all_events(rig.session.session_id)
+            assert events[-1].event_type == "worker.recovered"
+            if index == 0:
+                current = rig.store.get_session(rig.session.session_id)
+                assert current.attention == "needs-reconciliation"
+            assert rig.store.worker_registrations() == []
+        finally:
+            rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_loop_handles_idle_control_barriers_and_unknown_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    try:
+        with monkeypatch.context() as context:
+            context.setattr(
+                rig.store,
+                "heartbeat_worker",
+                lambda unused_session, unused_incarnation: False,
+            )
+            await rig.worker._loop()
+
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="stopped",
+        )
+        with monkeypatch.context() as context:
+            context.setattr(
+                rig.store,
+                "heartbeat_worker",
+                lambda unused_session, unused_incarnation: True,
+            )
+            await rig.worker._loop()
+
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="paused",
+            attention="idle",
+        )
+        rig.worker._stopping = False
+
+        async def stop_after_sleep(unused: float) -> None:
+            del unused
+            rig.worker._stopping = True
+
+        with monkeypatch.context() as context:
+            context.setattr(
+                rig.store,
+                "heartbeat_worker",
+                lambda unused_session, unused_incarnation: True,
+            )
+            context.setattr(
+                worker_module.asyncio,
+                "sleep",
+                stop_after_sleep,
+            )
+            await rig.worker._loop()
+
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="starting",
+            attention="needs-input",
+        )
+        rig.worker._stopping = False
+        with monkeypatch.context() as context:
+            context.setattr(
+                rig.store,
+                "heartbeat_worker",
+                lambda unused_session, unused_incarnation: True,
+            )
+            context.setattr(
+                rig.store,
+                "pending_reconciliations",
+                lambda unused_session: [],
+            )
+            context.setattr(
+                worker_module.asyncio,
+                "sleep",
+                stop_after_sleep,
+            )
+            await rig.worker._loop()
+        normalized = rig.store.get_session(rig.session.session_id)
+        assert normalized.lifecycle == "running"
+        assert normalized.attention == "idle"
+
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="running",
+            attention="idle",
+        )
+        rig.worker._stopping = False
+        with monkeypatch.context() as context:
+            context.setattr(
+                rig.store,
+                "heartbeat_worker",
+                lambda unused_session, unused_incarnation: True,
+            )
+            context.setattr(
+                rig.store,
+                "pending_reconciliations",
+                lambda unused_session: [object()],
+            )
+            context.setattr(
+                worker_module.asyncio,
+                "sleep",
+                stop_after_sleep,
+            )
+            await rig.worker._loop()
+        assert (
+            rig.store.get_session(rig.session.session_id).attention
+            == "needs-reconciliation"
+        )
+
+        rig.store.update_session(
+            rig.session.session_id,
+            attention="idle",
+        )
+        unknown = rig.store.enqueue_command(
+            rig.session.session_id,
+            "unknown",
+            {},
+            "unknown-work",
+        )
+        rig.worker._stopping = False
+        with monkeypatch.context() as context:
+            context.setattr(
+                rig.store,
+                "heartbeat_worker",
+                lambda unused_session, unused_incarnation: True,
+            )
+            context.setattr(
+                rig.store,
+                "pending_reconciliations",
+                lambda unused_session: [],
+            )
+            context.setattr(
+                worker_module.asyncio,
+                "sleep",
+                stop_after_sleep,
+            )
+            await rig.worker._loop()
+        failed = rig.store.get_command(unknown.command_id)
+        assert failed.status == "failed"
+        assert failed.result["code"] == "E_COMMAND"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_approval_defaults_and_user_event_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    try:
+        monkeypatch.setattr(
+            rig.store,
+            "approval_decision",
+            lambda unused_approval: {"decision": "accept"},
+        )
+        decision = await rig.worker._approval(
+            "",
+            "tool.execute",
+            {
+                "id": "request-1",
+                "prompt": "Run the tool?",
+                "choices": "invalid",
+            },
+        )
+        assert decision == {"decision": "accept"}
+        assert (
+            rig.store.get_session(rig.session.session_id).attention
+            == "working"
+        )
+        monkeypatch.setattr(
+            rig.store,
+            "turn_ref",
+            lambda unused_turn: {},
+        )
+        await rig.worker._provider_event(
+            "",
+            ProviderEvent(
+                "user.message",
+                text="steered",
+                raw={"provider": "scripted"},
+            ),
+        )
+        projected = rig.store.all_events(rig.session.session_id)[-1]
+        assert projected.role == "user"
+        assert projected.blob_digest
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_guard_interrupt_cleanup_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+
+    class FailingInterrupt:
+        async def interrupt(self) -> None:
+            raise RuntimeError("already stopped")
+
+    class Interrupt:
+        async def interrupt(self) -> None:
+            return
+
+    async def complete() -> None:
+        return
+
+    async def fail() -> None:
+        raise RuntimeError("provider failed")
+
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+
+    try:
+        completed = asyncio.create_task(complete())
+        await asyncio.sleep(0)
+        await rig.worker._interrupt_guarded_turn(
+            FailingInterrupt(),  # type: ignore[arg-type]
+            completed,
+        )
+
+        failed = asyncio.create_task(fail())
+        await asyncio.sleep(0)
+        await rig.worker._interrupt_guarded_turn(
+            Interrupt(),  # type: ignore[arg-type]
+            failed,
+        )
+
+        waiting = asyncio.create_task(wait_forever())
+
+        async def timeout(
+            awaitable: object,
+            *,
+            timeout: float,
+        ) -> None:
+            del awaitable
+            del timeout
+            raise asyncio.TimeoutError
+
+        with monkeypatch.context() as context:
+            context.setattr(
+                worker_module.asyncio,
+                "wait_for",
+                timeout,
+            )
+            await rig.worker._interrupt_guarded_turn(
+                Interrupt(),  # type: ignore[arg-type]
+                waiting,
+            )
+        assert waiting.cancelled()
+        assert worker_module._optional_number(True) is None
+        assert worker_module._optional_number(7) == 7.0
     finally:
         rig.close()
 
@@ -554,6 +1012,12 @@ async def test_e2e_exhausted_goal_budget_pauses_before_provider_work(
         current = rig.store.get_session(rig.session.session_id)
         assert current.lifecycle == "paused"
         assert current.attention == "needs-input"
+        await rig.worker._evaluate_goal()
+        assert rig.store.get_goal(goal.goal_id).status == "waiting"
+        assert any(
+            item.event_type == "goal.budget_exhausted"
+            for item in rig.store.all_events(rig.session.session_id)
+        )
     finally:
         rig.close()
 
@@ -685,6 +1149,373 @@ async def test_e2e_xhigh_requires_and_consumes_one_authorization(
         assert safety["xhigh_authorizations"] == 0
     finally:
         rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_reconciliation_restores_pre_dispatch_checkpoint(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    manager, record, command = await _ambiguous_reconciliation(rig)
+    queued = rig.store.enqueue_command(
+        rig.session.session_id,
+        "message",
+        {"text": "wait behind the barrier"},
+        "queued-after-ambiguous",
+    )
+    try:
+        assert manager.inspect(record.reconciliation_id) == record
+        assert rig.store.claim_command(rig.session.session_id) is None
+        with pytest.raises(ConflictError):
+            await manager.resolve(
+                record.reconciliation_id,
+                ReconciliationDecision.RESTORE_PRE_TURN,
+                "stale-digest",
+                approved=True,
+            )
+        with pytest.raises(HarnessError) as approval:
+            await manager.resolve(
+                record.reconciliation_id,
+                ReconciliationDecision.RESTORE_PRE_TURN,
+                record.current_workspace_digest,
+            )
+        assert approval.value.detail.code == "E_APPROVAL_REQUIRED"
+
+        resolved = await manager.resolve(
+            record.reconciliation_id,
+            ReconciliationDecision.RESTORE_PRE_TURN,
+            record.current_workspace_digest,
+            audit={"actor": "journey"},
+            approved=True,
+        )
+        replay = await manager.resolve(
+            record.reconciliation_id,
+            ReconciliationDecision.RESTORE_PRE_TURN,
+            record.current_workspace_digest,
+            approved=True,
+        )
+
+        assert resolved == replay
+        assert resolved.status == "resolved"
+        assert resolved.resolution == "restore-pre-turn"
+        assert "checkpoint_id" in resolved.audit
+        assert (Path(rig.session.worktree) / "file.txt").read_text(
+            encoding="utf-8"
+        ) == "base\n"
+        assert (
+            rig.store.get_command(command.command_id).result["code"]
+            == "E_NEEDS_RECONCILIATION"
+        )
+        claimed = rig.store.claim_command(rig.session.session_id)
+        assert claimed is not None
+        assert claimed.command_id == queued.command_id
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_reconciliation_accepts_current_or_stops(
+    tmp_path: Path,
+) -> None:
+    accept_root = tmp_path / "accept"
+    accept_root.mkdir()
+    accept_rig = JourneyRig(accept_root)
+    accept_manager, accept_record, unused_command = (
+        await _ambiguous_reconciliation(accept_rig)
+    )
+    del unused_command
+    try:
+        accept_rig.store.begin_reconciliation_resolution(
+            accept_record.reconciliation_id,
+            ReconciliationDecision.ACCEPT_CURRENT,
+            accept_record.current_workspace_digest,
+        )
+        accepted = await accept_manager.resolve(
+            accept_record.reconciliation_id,
+            ReconciliationDecision.ACCEPT_CURRENT,
+            accept_record.current_workspace_digest,
+        )
+        assert accepted.resolution == "accept-current"
+        assert "checkpoint_id" in accepted.audit
+        assert (Path(accept_rig.session.worktree) / "file.txt").read_text(
+            encoding="utf-8"
+        ) == "ambiguous effect\n"
+        assert (
+            accept_rig.store.get_session(
+                accept_rig.session.session_id
+            ).attention
+            == "idle"
+        )
+        with pytest.raises(ConflictError):
+            await accept_manager.resolve(
+                accept_record.reconciliation_id,
+                ReconciliationDecision.STOP,
+                accept_record.current_workspace_digest,
+            )
+    finally:
+        accept_rig.close()
+
+    stop_root = tmp_path / "stop"
+    stop_root.mkdir()
+    stop_rig = JourneyRig(stop_root)
+    stop_manager, stop_record, unused_command = (
+        await _ambiguous_reconciliation(stop_rig)
+    )
+    del unused_command
+    try:
+        stopped = await stop_manager.resolve(
+            stop_record.reconciliation_id,
+            ReconciliationDecision.STOP,
+            stop_record.current_workspace_digest,
+        )
+        assert stopped.resolution == "stop"
+        assert (
+            stop_rig.store.get_session(stop_rig.session.session_id).lifecycle
+            == "stopped"
+        )
+        assert (Path(stop_rig.session.worktree) / "file.txt").read_text(
+            encoding="utf-8"
+        ) == "ambiguous effect\n"
+        with pytest.raises(ValueError):
+            await stop_manager.resolve(
+                stop_record.reconciliation_id,
+                "unsupported",
+                stop_record.current_workspace_digest,
+            )
+    finally:
+        stop_rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_reconciliation_rejects_changes_and_conflicting_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changed_root = tmp_path / "changed"
+    changed_root.mkdir()
+    changed_rig = JourneyRig(changed_root)
+    manager, record, unused_command = await _ambiguous_reconciliation(
+        changed_rig
+    )
+    del unused_command
+    try:
+        (Path(changed_rig.session.worktree) / "file.txt").write_text(
+            "changed after inspection\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConflictError):
+            await manager.resolve(
+                record.reconciliation_id,
+                ReconciliationDecision.ACCEPT_CURRENT,
+                record.current_workspace_digest,
+            )
+    finally:
+        changed_rig.close()
+
+    race_root = tmp_path / "race"
+    race_root.mkdir()
+    race_rig = JourneyRig(race_root)
+    manager, record, unused_command = await _ambiguous_reconciliation(
+        race_rig
+    )
+    del unused_command
+    race_rig.store.begin_reconciliation_resolution(
+        record.reconciliation_id,
+        ReconciliationDecision.ACCEPT_CURRENT,
+        record.current_workspace_digest,
+    )
+    monkeypatch.setattr(
+        reconciliation_module,
+        "inspect_workspace",
+        lambda unused: ("different-digest", "second"),
+    )
+    try:
+        with pytest.raises(ConflictError, match="during"):
+            await manager.resolve(
+                record.reconciliation_id,
+                ReconciliationDecision.ACCEPT_CURRENT,
+                record.current_workspace_digest,
+            )
+    finally:
+        race_rig.close()
+
+    intent_root = tmp_path / "intent"
+    intent_root.mkdir()
+    intent_rig = JourneyRig(intent_root)
+    manager, record, unused_command = await _ambiguous_reconciliation(
+        intent_rig
+    )
+    del unused_command
+    try:
+        intent_rig.store.begin_reconciliation_resolution(
+            record.reconciliation_id,
+            ReconciliationDecision.STOP,
+            record.current_workspace_digest,
+        )
+        with pytest.raises(ConflictError):
+            await manager.resolve(
+                record.reconciliation_id,
+                ReconciliationDecision.ACCEPT_CURRENT,
+                record.current_workspace_digest,
+            )
+    finally:
+        intent_rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_reconciliation_rejects_read_only_restore(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.store.update_session(
+        rig.session.session_id,
+        permission_mode="read-only",
+    )
+    manager, record, unused_command = await _ambiguous_reconciliation(rig)
+    del unused_command
+    try:
+        with pytest.raises(HarnessError) as denied:
+            await manager.resolve(
+                record.reconciliation_id,
+                ReconciliationDecision.RESTORE_PRE_TURN,
+                record.current_workspace_digest,
+                approved=True,
+            )
+        assert denied.value.detail.code == "E_PERMISSION"
+    finally:
+        rig.close()
+
+
+def test_reconciliation_workspace_inspection_defenses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _repository(workspace)
+    (workspace / "untracked.txt").write_text(
+        "untracked\n",
+        encoding="utf-8",
+    )
+    (workspace / "untracked-link").symlink_to("untracked.txt")
+
+    digest, summary = inspect_workspace(workspace)
+
+    assert len(digest) == 64
+    assert '"commit"' in summary
+    original_git = reconciliation_module._git
+
+    def unsafe_paths(path: Path, *arguments: str) -> bytes:
+        if arguments[0] == "ls-files":
+            return b"../escape\0missing\0"
+        return original_git(path, *arguments)
+
+    monkeypatch.setattr(reconciliation_module, "_git", unsafe_paths)
+    second_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    assert len(second_digest) == 64
+
+    monkeypatch.setattr(reconciliation_module, "_git", original_git)
+    monkeypatch.setattr(
+        reconciliation_module.subprocess,
+        "run",
+        lambda *unused_args, **unused_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+        ),
+    )
+    with pytest.raises(HarnessError):
+        reconciliation_module._git(workspace, "status")
+    reconciliation_module._require_restore_permission(
+        "full",
+        approved=False,
+    )
+
+
+async def _ambiguous_reconciliation(
+    rig: JourneyRig,
+) -> tuple[ReconciliationManager, ReconciliationRecord, CommandReceipt]:
+    command = rig.store.enqueue_command(
+        rig.session.session_id,
+        "message",
+        {
+            "text": "perform one effect",
+            "turn_ref": {
+                "step_id": "step-ambiguous",
+                "agent_role": "implementer",
+            },
+        },
+        new_uuid(),
+    )
+    assert rig.store.claim_command(rig.session.session_id) is not None
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=rig.session.session_id,
+        provider="claude",
+        native_session_id="claude-native",
+        model="claude-default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    rig.store.create_attempt(attempt)
+    turn_id = rig.store.start_turn(
+        rig.session.session_id,
+        attempt.attempt_id,
+        turn_ref=command.turn_ref,
+    )
+    checkpoint = checkpoint_workspace(
+        rig.session,
+        rig.blobs,
+        sequence=rig.store.last_sequence(rig.session.session_id),
+        provider="claude",
+        native_session_id="claude-native",
+        context_text="context",
+    )
+    rig.store.add_checkpoint(checkpoint)
+    rig.store.record_dispatch_checkpoint(
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        checkpoint.checkpoint_id,
+    )
+    rig.store.create_command_envelope(
+        command.command_id,
+        rig.session.session_id,
+        "unattended",
+        {"max_seconds": 900},
+    )
+    rig.store.update_command_envelope(
+        command.command_id,
+        consumption={"total_tokens": 73},
+    )
+    rig.store.mark_provider_boundary(attempt.attempt_id)
+    workspace = Path(rig.session.worktree)
+    before_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    (workspace / "file.txt").write_text(
+        "ambiguous effect\n",
+        encoding="utf-8",
+    )
+    (workspace / "untracked-effect.txt").write_text(
+        "untracked effect\n",
+        encoding="utf-8",
+    )
+    (workspace / "untracked-effect-link").symlink_to(
+        "untracked-effect.txt"
+    )
+    after_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    assert before_digest != after_digest
+    manager = ReconciliationManager(rig.store, rig.blobs)
+    recovery = await manager.recover_after_restart(
+        rig.session.session_id
+    )
+    assert len(recovery.reconciliations) == 1
+    record = recovery.reconciliations[0]
+    assert record.safety_consumption["total_tokens"] == 73
+    return manager, record, command
 
 
 async def _wait_for_approval(

@@ -9,6 +9,9 @@ test_suite(
         ":integration_tests",
         ":parity_test",
         ":unit_tests",
+        "//tools:install_test",
+        "//tools:ui_gallery_test",
+        "//tools:wsl_e2e_test",
     ],
 )
 

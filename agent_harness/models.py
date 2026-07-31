@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from dataclasses import dataclass
+from dataclasses import field
 from enum import StrEnum
 from typing import Any
 
@@ -57,6 +58,18 @@ class CommandStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ReconciliationStatus(StrEnum):
+    PENDING = "pending"
+    RESOLVING = "resolving"
+    RESOLVED = "resolved"
+
+
+class ReconciliationDecision(StrEnum):
+    ACCEPT_CURRENT = "accept-current"
+    RESTORE_PRE_TURN = "restore-pre-turn"
+    STOP = "stop"
+
+
 @dataclass(frozen=True)
 class Session:
     session_id: str
@@ -75,6 +88,7 @@ class Session:
     created_at: str
     updated_at: str
     archived: bool = False
+    external_ref: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -125,6 +139,7 @@ class CommandReceipt:
     result: dict[str, Any]
     created_at: str
     updated_at: str
+    turn_ref: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -215,3 +230,38 @@ class Checkpoint:
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+
+@dataclass(frozen=True)
+class ReconciliationRecord:
+    reconciliation_id: str
+    session_id: str
+    command_id: str
+    pre_dispatch_checkpoint_id: str
+    current_workspace_digest: str
+    current_workspace_summary: str
+    provider_attempts: tuple[dict[str, Any], ...]
+    safety_consumption: dict[str, Any]
+    status: str
+    resolution: str
+    audit: dict[str, Any]
+    created_at: str
+    resolved_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["provider_attempts"] = list(self.provider_attempts)
+        return value
+
+
+@dataclass(frozen=True)
+class RestartRecovery:
+    requeued_command_ids: tuple[str, ...]
+    reconciliations: tuple[ReconciliationRecord, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "requeued_command_ids": list(self.requeued_command_ids),
+            "reconciliations": [
+                item.as_dict() for item in self.reconciliations
+            ],
+        }

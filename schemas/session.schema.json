@@ -39,6 +39,17 @@
     "owner_epoch": {
       "type": "integer",
       "minimum": 1
+    },
+    "external_ref": {
+      "oneOf": [
+        {
+          "$ref": "orchestration.schema.json#/$defs/external_ref"
+        },
+        {
+          "type": "object",
+          "maxProperties": 0
+        }
+      ]
     }
   }
 }

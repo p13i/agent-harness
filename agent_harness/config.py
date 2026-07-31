@@ -10,7 +10,8 @@ import secrets
 import socket
 
 
-CONTROL_PROTOCOL_VERSION = 2
+API_VERSION = "1.3.0"
+CONTROL_PROTOCOL_VERSION = 3
 
 
 def _control_build_id() -> str:
@@ -71,6 +72,23 @@ def paths(state_dir: Path | None = None) -> HarnessPaths:
         sync_lock=runtime / "sync.lock",
         sync_status=runtime / "sync-status.json",
     )
+
+
+def public_paths(value: HarnessPaths) -> dict[str, str]:
+    """Return discoverable locations without secret contents."""
+
+    return {
+        "state_root": str(value.state_dir),
+        "runtime": str(value.runtime),
+        "database": str(value.database),
+        "socket": str(value.socket),
+        "token_path": str(value.token),
+        "sessions": str(value.sessions),
+        "blobs": str(value.blobs),
+        "worktrees": str(value.worktrees),
+        "exports": str(value.exports),
+        "logs": str(value.logs),
+    }
 
 
 def prepare_paths(value: HarnessPaths) -> None:
