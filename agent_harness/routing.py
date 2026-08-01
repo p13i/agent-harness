@@ -136,6 +136,12 @@ def _fairness_score(candidate: RoutingCandidate, workload: str) -> float:
     if normalized in {"implementation", "debugging"}:
         if candidate.provider == "claude":
             role_weight = 1.25
+    # Review leans Kimi: with two providers "an independent
+    # perspective" collapsed to "whichever one did not implement it",
+    # which a third provider is what actually fixes.
+    if normalized in {"review", "code_review", "code review"}:
+        if candidate.provider == "kimi":
+            role_weight = 1.25
     weight = headroom * role_weight
     fairness = (candidate.queue_count + 1.0) / weight
     if candidate.affinity:

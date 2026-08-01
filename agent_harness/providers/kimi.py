@@ -1,0 +1,168 @@
+"""Kimi Code CLI adapter over a one-shot ``--output-format stream-json`` run.
+
+Unlike the Claude and Codex adapters there is no SDK and no long-lived
+server here. Kimi exposes an Agent Client Protocol mode (``kimi acp``)
+and a local REST server (``kimi web``), but both are heavier surfaces
+than this harness needs, and the subprocess path shares one wire format
+with ``tools/ingest_agent.gpt.py`` in the consuming repo.
+
+Two consequences of that choice, both deliberate:
+
+- ``steer`` and ``interrupt`` stay the base class's no-ops. A one-shot
+  ``kimi --prompt`` has no turn to steer into.
+- ``--yolo`` is NOT passed. Kimi rejects it together with ``--prompt``,
+  so tool permissions come from ``~/.kimi-code/config.toml`` instead.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+import shutil
+
+from agent_harness.providers.base import ApprovalHandler
+from agent_harness.providers.base import EventHandler
+from agent_harness.providers.base import ProviderAdapter
+from agent_harness.providers.base import ProviderEvent
+from agent_harness.providers.base import ProviderModel
+from agent_harness.providers.base import ProviderResult
+from agent_harness.providers.base import ProviderStatus
+from agent_harness.providers.base import provider_environment
+from agent_harness.providers.normalize import kimi_payload
+
+KIMI_CODE_PACKAGE = "@moonshot-ai/kimi-code"
+
+
+def _launch_argv(prompt: str, model: str, session_id: str) -> list[str]:
+    argv = [
+        "npx",
+        "--yes",
+        "--package",
+        KIMI_CODE_PACKAGE,
+        "kimi",
+        "--prompt",
+        prompt,
+        "--output-format",
+        "stream-json",
+    ]
+    if model:
+        argv.extend(["--model", model])
+    if session_id:
+        argv.extend(["--session", session_id])
+    return argv
+
+
+class KimiAdapter(ProviderAdapter):
+    provider_id = "kimi"
+
+    async def run_turn(
+        self,
+        *,
+        workspace: Path,
+        prompt: str,
+        native_session_id: str,
+        permission_mode: str,
+        model: str,
+        effort: str,
+        event_handler: EventHandler,
+        approval_handler: ApprovalHandler,
+    ) -> ProviderResult:
+        # Kimi Code exposes no reasoning-effort control and approves
+        # tools from its own config, so both arguments are accepted for
+        # the contract and unused.
+        del effort, permission_mode, approval_handler
+
+        argv = _launch_argv(prompt, model, native_session_id)
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(workspace),
+            env=provider_environment(self.provider_id),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        session_id = native_session_id
+        status = "complete"
+        assert process.stdout is not None
+        async for line in process.stdout:
+            text = line.decode("utf-8", "replace").strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for event in kimi_payload(payload):
+                if event.native_session_id:
+                    session_id = event.native_session_id
+                await event_handler(event)
+
+        stderr = b""
+        if process.stderr is not None:
+            stderr = await process.stderr.read()
+        returncode = await process.wait()
+        if returncode != 0:
+            status = "failed"
+            await event_handler(
+                ProviderEvent(
+                    "turn.failed",
+                    text=stderr.decode("utf-8", "replace").strip(),
+                    status="failed",
+                    native_session_id=session_id,
+                )
+            )
+
+        return ProviderResult(
+            provider=self.provider_id,
+            native_session_id=session_id,
+            native_turn_id="",
+            status=status,
+            usage={},
+        )
+
+    async def models(self, workspace: Path) -> tuple[ProviderModel, ...]:
+        del workspace
+        return (
+            ProviderModel(
+                model_id="k3",
+                display_name="Kimi K3",
+                efforts=(),
+                context_window=1_048_576,
+                default=True,
+            ),
+            ProviderModel(
+                model_id="kimi-for-coding",
+                display_name="Kimi for Coding",
+                efforts=(),
+                context_window=262_144,
+            ),
+        )
+
+    def status(self) -> ProviderStatus:
+        ready = shutil.which("npx") is not None
+        detail = "npx is available"
+        if not ready:
+            detail = "npx was not found"
+        return ProviderStatus(
+            provider=self.provider_id,
+            ready=ready,
+            detail=detail,
+            # No approval: --yolo cannot accompany --prompt, so tool
+            # permissions are config-driven rather than interactive. No
+            # steering or interrupt: a one-shot run has no live turn.
+            capabilities=frozenset(
+                {
+                    "mcp",
+                    "resume",
+                    "skills",
+                    "streaming",
+                    "subagents",
+                    "tools",
+                    "worktree",
+                }
+            ),
+        )
