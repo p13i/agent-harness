@@ -15,6 +15,8 @@ from agent_harness.errors import HarnessError
 from agent_harness.errors import ProviderExhaustedError
 from agent_harness.errors import ProviderUnavailableError
 from agent_harness.providers import claude
+from agent_harness.providers import kimi
+from agent_harness.providers import normalize
 from agent_harness.providers import codex
 from agent_harness.providers import base
 from agent_harness import terminal
@@ -1246,3 +1248,126 @@ if __name__ == "__main__":
             ]
         )
     )
+
+
+# Kimi's stream-json envelope is flat {"role", "content"}, not Claude's
+# {"type": "assistant", "message": {"content": [blocks]}}. Reusing the
+# Claude normalizer here silently yields nothing.
+def test_kimi_payload_normalizes_the_flat_envelope() -> None:
+    events = normalize.kimi_payload({"role": "assistant", "content": "ok"})
+    assert [(e.event_type, e.text) for e in events] == [("agent.message", "ok")]
+
+    events = normalize.kimi_payload({"role": "user", "content": "hi"})
+    assert events[0].event_type == "user.message"
+
+    events = normalize.kimi_payload(
+        {
+            "role": "meta",
+            "type": "session.resume_hint",
+            "session_id": "session_abc",
+        }
+    )
+    assert events[0].event_type == "turn.completed"
+    assert events[0].native_session_id == "session_abc"
+
+    assert normalize.kimi_payload({"role": "meta", "type": "other"})[0].event_type == (
+        "provider.event"
+    )
+
+
+# --yolo is rejected together with --prompt, so the launcher must not
+# pass it; tool permissions come from ~/.kimi-code/config.toml.
+def test_kimi_launch_argv_omits_yolo_and_pins_the_package() -> None:
+    argv = kimi._launch_argv("do it", "k3", "session_abc")
+
+    assert "--yolo" not in argv
+    assert argv[:6] == [
+        "npx",
+        "--yes",
+        "--package",
+        "@moonshot-ai/kimi-code",
+        "kimi",
+        "--prompt",
+    ]
+    assert argv[-4:] == ["--model", "k3", "--session", "session_abc"]
+    assert "--session" not in kimi._launch_argv("do it", "", "")
+
+
+def test_kimi_status_and_models(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(kimi.shutil, "which", lambda _name: "/usr/bin/npx")
+    status = kimi.KimiAdapter().status()
+    assert status.ready
+    assert status.provider == "kimi"
+    # A one-shot run has no live turn to steer and cannot prompt for
+    # approval, so neither capability is claimed.
+    assert "approval" not in status.capabilities
+    assert "streaming" in status.capabilities
+
+    monkeypatch.setattr(kimi.shutil, "which", lambda _name: None)
+    assert not kimi.KimiAdapter().status().ready
+
+    async def scenario() -> None:
+        models = await kimi.KimiAdapter().models(tmp_path)
+        assert models[0].model_id == "k3"
+        assert models[0].default
+
+    asyncio.run(scenario())
+
+
+def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) -> None:
+    lines = [
+        b'{"role":"assistant","content":"ok"}\n',
+        b'{"role":"meta","type":"session.resume_hint","session_id":"session_z"}\n',
+        b"not json\n",
+    ]
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                for line in lines:
+                    yield line
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class Process:
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*_argv, **_kwargs):
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    seen: list[ProviderEvent] = []
+
+    async def handler(event: ProviderEvent) -> None:
+        seen.append(event)
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        result = await kimi.KimiAdapter().run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="",
+            permission_mode="auto",
+            model="k3",
+            effort="",
+            event_handler=handler,
+            approval_handler=approvals,
+        )
+        assert result.status == "complete"
+        # The session id arrives on the trailing meta line, not up front.
+        assert result.native_session_id == "session_z"
+
+    asyncio.run(scenario())
+
+    assert [e.event_type for e in seen] == ["agent.message", "turn.completed"]

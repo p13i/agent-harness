@@ -309,6 +309,40 @@ def _claude_stream_event(
     return [ProviderEvent("provider.event", raw=raw)]
 
 
+def kimi_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
+    """Normalize one Kimi Code ``--output-format stream-json`` line.
+
+    Kimi's envelope is flat ``{"role": ..., "content": ...}`` with a
+    string content, NOT Claude's ``{"type": "assistant", "message":
+    {"content": [blocks]}}``. Reusing the Claude normalizer here silently
+    yields nothing, which is why this is its own function.
+
+    The stream ends with a ``role: "meta"`` line of type
+    ``session.resume_hint`` carrying the session id, so the turn's
+    completion and its native session id arrive together.
+    """
+    role = str(payload.get("role", ""))
+    if role == "meta":
+        if str(payload.get("type", "")) != "session.resume_hint":
+            return [ProviderEvent("provider.event", raw=payload)]
+        return [
+            ProviderEvent(
+                "turn.completed",
+                status="complete",
+                raw=payload,
+                native_session_id=_optional_text(payload.get("session_id")),
+            )
+        ]
+    text = payload_text(payload.get("content"))
+    if not text:
+        return [ProviderEvent("provider.event", raw=payload)]
+    if role == "assistant":
+        return [ProviderEvent("agent.message", text=text, raw=payload)]
+    if role == "user":
+        return [ProviderEvent("user.message", text=text, raw=payload)]
+    return [ProviderEvent("provider.event", text=text, raw=payload)]
+
+
 def payload_text(value: object) -> str:
     if isinstance(value, str):
         return sanitize(value)
