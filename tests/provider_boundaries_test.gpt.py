@@ -1278,7 +1278,7 @@ def test_kimi_payload_normalizes_the_flat_envelope() -> None:
 # --yolo is rejected together with --prompt, so the launcher must not
 # pass it; tool permissions come from ~/.kimi-code/config.toml.
 def test_kimi_launch_argv_omits_yolo_and_pins_the_package() -> None:
-    argv = kimi._launch_argv("do it", "k3", "session_abc")
+    argv = kimi._launch_argv("do it", "kimi-code/k3", "session_abc")
 
     assert "--yolo" not in argv
     assert argv[:6] == [
@@ -1289,7 +1289,12 @@ def test_kimi_launch_argv_omits_yolo_and_pins_the_package() -> None:
         "kimi",
         "--prompt",
     ]
-    assert argv[-4:] == ["--model", "k3", "--session", "session_abc"]
+    assert argv[-4:] == [
+        "--model",
+        "kimi-code/k3",
+        "--session",
+        "session_abc",
+    ]
     assert "--session" not in kimi._launch_argv("do it", "", "")
 
 
@@ -1308,8 +1313,13 @@ def test_kimi_status_and_models(monkeypatch, tmp_path: Path) -> None:
 
     async def scenario() -> None:
         models = await kimi.KimiAdapter().models(tmp_path)
-        assert models[0].model_id == "k3"
+        # `--model` resolves a config.toml alias key, not the upstream
+        # API model id, so every id here must carry its provider
+        # namespace. A bare "k3" fails with config.invalid.
+        assert models[0].model_id == "kimi-code/k3"
         assert models[0].default
+        for model in models:
+            assert model.model_id.startswith("kimi-code/")
 
     asyncio.run(scenario())
 
@@ -1359,7 +1369,7 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
             prompt="do it",
             native_session_id="",
             permission_mode="auto",
-            model="k3",
+            model="kimi-code/k3",
             effort="",
             event_handler=handler,
             approval_handler=approvals,
