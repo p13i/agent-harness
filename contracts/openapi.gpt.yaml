@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: p13i agent harness
-  version: 1.4.0
+  version: 1.10.0
   description: >-
     Durable provider-neutral agent sessions, goals, events,
     approvals, routing, checkpoints, terminals, and fleet
@@ -15,6 +15,10 @@ paths:
   /healthz:
     get:
       operationId: health
+      description: >-
+        Reports the running control-source digest, selected
+        bundle build identifier, and fail-closed restart
+        quiescence for active commands and proof captures.
       responses:
         "200":
           $ref: "#/components/responses/JsonResponse"
@@ -141,6 +145,58 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/proof:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getProofSnapshot
+      description: >-
+        Return a bounded canonical proof projection
+        containing identifiers, digests, state, usage
+        provenance, and bound reconciliation discovery and
+        resolution checkpoints without prompts, raw provider
+        arguments, credentials, or host paths. The first
+        request materializes an immutable snapshot retained
+        for at least 336 hours. A snapshot is limited to
+        50000 events and a session to 128 retained
+        snapshots; either bound fails closed.
+      parameters:
+        - $ref: "#/components/parameters/AfterSequence"
+        - name: event_limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - name: through_sequence
+          in: query
+          description: >-
+            Fixed inclusive event-sequence boundary copied
+            from the first page's event_range value. Later
+            pages use the same value to form one stable
+            event snapshot. The top-level truncated field is
+            a sorted list of bounded record-set names.
+          schema:
+            type: integer
+            minimum: 0
+        - name: snapshot_id
+          in: query
+          description: >-
+            Durable materialized proof snapshot identifier
+            returned by the first page. Later pages pass
+            this identifier and the same through_sequence so
+            all event pages and non-event projections come
+            from one immutable sanitized snapshot.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+        "409":
+          $ref: "#/components/responses/JsonResponse"
+        "413":
+          $ref: "#/components/responses/JsonResponse"
   /v1/sessions/{session_id}/turns:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -235,7 +291,11 @@ paths:
     post:
       operationId: submitSessionCommand
       requestBody:
-        $ref: "#/components/requestBodies/JsonObject"
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ControlCommandRequest"
       responses:
         "202":
           $ref: "#/components/responses/JsonResponse"
@@ -275,12 +335,94 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/goal/promotions:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      operationId: promoteGoal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GoalPromotion"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/contract-adoptions:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      operationId: adoptSessionContract
+      description: >-
+        Atomically bind a legacy exact-UUID session to a
+        complete p13i/machines goal and creation envelope.
+        The operation requires quiescence and typed retained
+        authorization and preserves native resume history.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContractAdoption"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+        "409":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/dispatch-invalidations:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      operationId: invalidateDispatchGeneration
+      description: >-
+        Start one explicit repetition-guard generation at a
+        quiescent boundary. Interactive operator
+        invalidations retain typed authorization. Managed
+        transitions additionally bind the current goal,
+        external reference, prior terminal checkpoint and
+        generation, monotonic sequence, exact next stage,
+        and exact normalized command envelope. Reservation
+        is retryable until atomic provider admission. This
+        never erases prior fingerprints.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DispatchInvalidation"
+      responses:
+        "201":
+          $ref: "#/components/responses/JsonResponse"
+        "409":
+          $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/dispatch-transition-anchor:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getDispatchTransitionAnchor
+      description: >-
+        Return the bounded prompt-free current transition
+        anchor, including eligibility, latest command and
+        typed anchor, certified checkpoint, live material,
+        generation, goal, epoch, and reconciliation binding.
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
   /v1/sessions/{session_id}/evidence:
     parameters:
       - $ref: "#/components/parameters/SessionId"
       - $ref: "#/components/parameters/OptionalIdempotencyKey"
     post:
       operationId: addGoalEvidence
+      description: >-
+        Add evidence and reevaluate milestones and goal
+        completion atomically. p13i/machines sessions
+        require Idempotency-Key and retain exactly one
+        evidence row, event, and mutation receipt per key.
       requestBody:
         $ref: "#/components/requestBodies/JsonObject"
       responses:
@@ -615,6 +757,32 @@ components:
           schema:
             type: object
   schemas:
+    ControlCommandRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Payload selected by the command_type path value.
+        interrupt accepts target_command_id; the field may
+        be omitted only for a backward-compatible
+        interactive interrupt, while an interrupt retained
+        to advance beyond an interrupted predecessor must
+        name that exact active dispatching command. steer
+        requires text. pause, resume, and stop require an
+        empty object.
+      properties:
+        target_command_id:
+          type: string
+          format: uuid
+          description: >-
+            Exact active dispatching command interrupted by
+            this control. Required when a later managed
+            transition advances beyond that interrupted
+            command.
+        text:
+          type: string
+          minLength: 1
+          maxLength: 65536
+          description: Required only for steer.
     PresentationAttempt:
       type: object
       additionalProperties: false
@@ -842,9 +1010,42 @@ components:
         predicates:
           type: array
           items:
-            type: object
+            $ref: "#/components/schemas/GoalPredicate"
+        milestones:
+          type: array
+          items:
+            $ref: "#/components/schemas/GoalMilestone"
         budgets:
-          type: object
+          $ref: "#/components/schemas/GoalBudgets"
+        permitted_providers:
+          type: array
+          items:
+            type: string
+            enum:
+              - claude
+              - codex
+        permitted_efforts:
+          type: array
+          items:
+            type: string
+            enum:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+        max_concurrency:
+          type: integer
+          minimum: 1
+          maximum: 2
+        completion_policy:
+          type: string
+          enum:
+            - evidence-all
+            - never
+        incident_policy:
+          type: string
+          const: recover-then-pause
         permission_mode:
           type: string
           enum:
@@ -852,6 +1053,53 @@ components:
             - full
             - read-only
             - plan
+        safety_limits:
+          $ref: "#/components/schemas/SafetyLimitTightening"
+    SafetyLimitTightening:
+      type: object
+      additionalProperties: false
+      description: >-
+        Optional per-command bounds. Every supplied value
+        must be no greater than the effective session,
+        profile, and goal limit. A widening request fails
+        before provider admission.
+      properties:
+        max_seconds:
+          type: integer
+          minimum: 1
+        max_context_tokens:
+          type: integer
+          minimum: 1
+        max_output_tokens:
+          type: integer
+          minimum: 1
+        max_total_tokens:
+          type: integer
+          minimum: 1
+        max_tool_calls:
+          type: integer
+          minimum: 0
+        max_child_agents:
+          type: integer
+          minimum: 0
+        max_dollars:
+          type: number
+          minimum: 0
+        stagnation_seconds:
+          type: integer
+          minimum: 1
+        binding_ceiling:
+          type: number
+          minimum: 0
+        max_attempts:
+          type: integer
+          minimum: 1
+        repeated_tool_limit:
+          type: integer
+          minimum: 1
+        repeated_cycle_limit:
+          type: integer
+          minimum: 1
         direct:
           type: boolean
         execution_profile:
@@ -909,6 +1157,392 @@ components:
           type: string
         turn_ref:
           $ref: "#/components/schemas/TurnRef"
+        permission_mode:
+          type: string
+          description: >-
+            Optional same-or-narrower permission mode for
+            only this turn and every child it launches.
+          enum:
+            - approval
+            - full
+            - read-only
+            - plan
+    GoalPredicate:
+      type: object
+      minProperties: 1
+    GoalMilestone:
+      type: object
+      additionalProperties: false
+      required:
+        - milestone_id
+        - title
+        - dependencies
+        - predicates
+      properties:
+        milestone_id:
+          type: string
+          minLength: 1
+        title:
+          type: string
+          minLength: 1
+        dependencies:
+          type: array
+          items:
+            type: string
+        predicates:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/GoalPredicate"
+    GoalBudgets:
+      type: object
+      additionalProperties: false
+      properties:
+        seconds:
+          type: number
+          minimum: 0
+        turns:
+          type: number
+          minimum: 0
+        tokens:
+          type: number
+          minimum: 0
+        context_tokens:
+          type: number
+          minimum: 0
+        output_tokens:
+          type: number
+          minimum: 0
+        tool_calls:
+          type: number
+          minimum: 0
+        attempts:
+          type: number
+          minimum: 0
+        child_agents:
+          type: number
+          minimum: 0
+        dollars:
+          type: number
+          minimum: 0
+    RetainedAuthorization:
+      type: object
+      required:
+        - schema
+        - receipt
+        - receipt_sha256
+      properties:
+        schema:
+          type: string
+        receipt:
+          type: object
+          minProperties: 1
+        receipt_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    GoalPromotion:
+      type: object
+      required:
+        - from_goal_id
+        - stage
+        - objective
+        - constraints
+        - predicates
+        - milestones
+        - budgets
+        - permitted_providers
+        - permitted_efforts
+        - max_concurrency
+        - completion_policy
+        - incident_policy
+        - authorization
+      properties:
+        from_goal_id:
+          type: string
+          format: uuid
+        stage:
+          type: string
+          minLength: 1
+        objective:
+          type: string
+          minLength: 1
+        goal_kind:
+          const: finite
+        constraints:
+          type: array
+          items:
+            type: string
+        predicates:
+          type: array
+          items:
+            $ref: "#/components/schemas/GoalPredicate"
+        milestones:
+          type: array
+          items:
+            $ref: "#/components/schemas/GoalMilestone"
+        budgets:
+          $ref: "#/components/schemas/GoalBudgets"
+        permitted_providers:
+          type: array
+          items:
+            type: string
+        permitted_efforts:
+          type: array
+          items:
+            type: string
+        max_concurrency:
+          type: integer
+          minimum: 1
+          maximum: 2
+        completion_policy:
+          const: evidence-all
+        incident_policy:
+          const: recover-then-pause
+        authorization:
+          allOf:
+            - $ref: "#/components/schemas/RetainedAuthorization"
+    ContractAdoption:
+      allOf:
+        - $ref: "#/components/schemas/CreateSession"
+        - type: object
+          required:
+            - name
+            - direct
+            - goal
+            - goal_kind
+            - constraints
+            - predicates
+            - milestones
+            - budgets
+            - permitted_providers
+            - permitted_efforts
+            - max_concurrency
+            - completion_policy
+            - incident_policy
+            - permission_mode
+            - execution_profile
+            - external_ref
+            - authorization
+          properties:
+            authorization:
+              allOf:
+                - $ref: "#/components/schemas/RetainedAuthorization"
+    DispatchInvalidation:
+      oneOf:
+        - $ref: "#/components/schemas/OperatorDispatchInvalidation"
+        - $ref: "#/components/schemas/ManagedDispatchTransition"
+    OperatorDispatchInvalidation:
+      type: object
+      additionalProperties: false
+      required:
+        - reason
+        - authorization
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+        authorization:
+          allOf:
+            - $ref: "#/components/schemas/RetainedAuthorization"
+            - type: object
+              properties:
+                schema:
+                  const: p13i/agent-harness/dispatch-invalidation-authorization/v1
+    ManagedDispatchTransition:
+      type: object
+      additionalProperties: false
+      required:
+        - reason
+        - prior_command_id
+        - prior_command_type
+        - prior_anchor_kind
+        - prior_reconciliation_id
+        - prior_reconciliation_resolution
+        - prior_checkpoint_id
+        - prior_generation_digest
+        - prior_material_digest
+        - next_turn_ref
+        - transition_sequence
+        - next_command_digest
+        - authorization
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+        prior_command_id:
+          type: string
+          format: uuid
+        prior_command_type:
+          type: string
+          minLength: 1
+          maxLength: 64
+        prior_anchor_kind:
+          type: string
+          enum:
+            - provider-result
+            - control-command
+            - resolved-reconciliation
+        prior_reconciliation_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - const: ""
+        prior_reconciliation_resolution:
+          type: string
+          enum:
+            - ""
+            - accept-current
+            - restore-pre-turn
+        prior_checkpoint_id:
+          type: string
+          format: uuid
+        prior_generation_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        prior_material_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        next_turn_ref:
+          $ref: "#/components/schemas/TurnRef"
+        transition_sequence:
+          type: integer
+          minimum: 1
+        next_command_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        authorization:
+          allOf:
+            - $ref: "#/components/schemas/RetainedAuthorization"
+            - type: object
+              required:
+                - session_id
+                - goal_id
+                - reason
+                - prior_command_id
+                - prior_command_type
+                - prior_anchor_kind
+                - prior_reconciliation_id
+                - prior_reconciliation_resolution
+                - prior_checkpoint_id
+                - prior_generation_digest
+                - prior_material_digest
+                - next_turn_ref
+                - transition_sequence
+                - epoch_id
+                - external_orchestrator
+                - external_job_id
+                - policy_sha256
+                - next_command_digest
+              properties:
+                schema:
+                  const: p13i/agent-harness/dispatch-generation-transition-authorization/v1
+                goal_id:
+                  type: string
+                  format: uuid
+                policy:
+                  $ref: "#/components/schemas/DispatchTransitionPolicy"
+                policy_ref:
+                  $ref: "#/components/schemas/DispatchTransitionPolicyRef"
+                policy_sha256:
+                  type: string
+                  pattern: "^[0-9a-f]{64}$"
+                epoch_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  pattern: "^\\S+$"
+    DispatchTransitionPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - session_id
+        - external_ref
+        - epoch_id
+        - allowed_agent_roles
+        - allowed_step_prefixes
+        - max_transitions
+        - transitions
+      properties:
+        schema:
+          const: p13i/agent-harness/dispatch-generation-transition-policy/v1
+        session_id:
+          type: string
+          format: uuid
+        external_ref:
+          $ref: "#/components/schemas/ExternalRef"
+        epoch_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^\\S+$"
+        allowed_agent_roles:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        allowed_step_prefixes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+        max_transitions:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        transitions:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/DispatchTransitionEntry"
+    DispatchTransitionPolicyRef:
+      type: object
+      additionalProperties: false
+      required:
+        - policy_sha256
+        - session_id
+        - goal_id
+        - epoch_id
+      properties:
+        policy_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        session_id:
+          type: string
+          format: uuid
+        goal_id:
+          type: string
+          format: uuid
+        epoch_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^\\S+$"
+    DispatchTransitionEntry:
+      type: object
+      additionalProperties: false
+      required:
+        - sequence
+        - next_turn_ref
+        - next_command_digest
+      properties:
+        sequence:
+          type: integer
+          minimum: 1
+        next_turn_ref:
+          $ref: "#/components/schemas/TurnRef"
+        next_command_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
     ReconciliationResolution:
       type: object
       additionalProperties: false
@@ -948,6 +1582,14 @@ components:
           maximum: 300000
         allow_xhigh_once:
           type: boolean
+        command_id:
+          type: string
+          format: uuid
+        provider:
+          type: string
+          enum:
+            - claude
+            - codex
     CreateProcessLease:
       type: object
       required:

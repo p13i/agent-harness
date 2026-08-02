@@ -1,11 +1,14 @@
 {
   "schema": "p13i/agent-harness/acceptance/v1",
-  "contract_version": "1.4.0",
+  "contract_version": "1.10.0",
   "journeys": [
     {
       "id": "AH-AC-001",
       "title": "Start chat from a product workspace",
-      "local_evidence": ["//tests:chat_pty_test", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:chat_pty_test",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-002",
@@ -15,7 +18,10 @@
     {
       "id": "AH-AC-003",
       "title": "Resume every user-visible state",
-      "local_evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:integration_tests"
+      ]
     },
     {
       "id": "AH-AC-004",
@@ -25,7 +31,10 @@
     {
       "id": "AH-AC-005",
       "title": "Continue after a provider switch",
-      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-006",
@@ -45,7 +54,10 @@
     {
       "id": "AH-AC-009",
       "title": "Stream messages and tool events",
-      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-010",
@@ -66,17 +78,26 @@
     {
       "id": "AH-AC-012",
       "title": "Checkpoint, fork, and export",
-      "local_evidence": ["//tests:integration_tests", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-013",
       "title": "Complete work through formal evidence",
-      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-014",
       "title": "Use normalized extensions and native escape hatches",
-      "local_evidence": ["//tests:parity_test", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:parity_test",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-015",
@@ -95,7 +116,10 @@
     {
       "id": "AH-AC-016",
       "title": "Recover daemon and worker ownership",
-      "local_evidence": ["//tests:unit_tests", "//tests:e2e_tests"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:e2e_tests"
+      ]
     },
     {
       "id": "AH-AC-017",
@@ -105,7 +129,10 @@
     {
       "id": "AH-AC-018",
       "title": "Operate an adaptive, accessible terminal UI",
-      "local_evidence": ["//tests:unit_tests", "//tests:chat_pty_test"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:chat_pty_test"
+      ]
     },
     {
       "id": "AH-AC-019",
@@ -203,7 +230,10 @@
     {
       "id": "AH-AC-028",
       "title": "Keep portable chat records in a configurable private repository",
-      "local_evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:integration_tests"
+      ]
     },
     {
       "id": "AH-AC-029",
@@ -213,37 +243,58 @@
     {
       "id": "AH-AC-030",
       "title": "Synchronize chats without force-push or silent loss",
-      "local_evidence": ["//tests:unit_tests", "//tests:integration_tests"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:integration_tests"
+      ]
     },
     {
       "id": "AH-AC-031",
       "title": "Bind one durable session to an external job",
-      "local_evidence": ["//tests:integration_tests", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-032",
       "title": "Retry a managed turn without duplicate model work",
-      "local_evidence": ["//tests:integration_tests", "//tests:e2e_tests"]
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:e2e_tests"
+      ]
     },
     {
       "id": "AH-AC-033",
       "title": "Barrier ambiguous provider work after restart",
-      "local_evidence": ["//tests:e2e_tests", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-034",
       "title": "Inspect and explicitly reconcile interrupted work",
-      "local_evidence": ["//tests:integration_tests", "//tests:e2e_tests"]
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:e2e_tests"
+      ]
     },
     {
       "id": "AH-AC-035",
       "title": "Retain multiline drafts and recover an unacknowledged send",
-      "local_evidence": ["//tests:unit_tests", "//tests:chat_pty_test"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:chat_pty_test"
+      ]
     },
     {
       "id": "AH-AC-036",
       "title": "Search, archive, resize, and theme the responsive workspace",
-      "local_evidence": ["//tests:unit_tests", "//tools:ui_gallery_test"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tools:ui_gallery_test"
+      ]
     },
     {
       "id": "AH-AC-037",
@@ -253,12 +304,18 @@
     {
       "id": "AH-AC-038",
       "title": "Manage the isolated systemd user-service lifecycle",
-      "local_evidence": ["//tools:install_test", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tools:install_test",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-039",
       "title": "Render every declared UI state without provider or network use",
-      "local_evidence": ["//tools:ui_gallery_test", "//tests:unit_tests"]
+      "local_evidence": [
+        "//tools:ui_gallery_test",
+        "//tests:unit_tests"
+      ]
     },
     {
       "id": "AH-AC-040",
@@ -274,12 +331,18 @@
     {
       "id": "AH-AC-041",
       "title": "Resume the same durable state in Focus and Control modes",
-      "local_evidence": ["//tests:unit_tests", "//tests:chat_pty_test"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:chat_pty_test"
+      ]
     },
     {
       "id": "AH-AC-042",
       "title": "Present terse deduplicated notifications without transcript noise",
-      "local_evidence": ["//tests:unit_tests", "//tools:ui_gallery_test"]
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tools:ui_gallery_test"
+      ]
     },
     {
       "id": "AH-AC-043",
@@ -293,6 +356,244 @@
         "//tests:integration_tests",
         "//tests:unit_tests",
         "//tools:ui_gallery_test"
+      ]
+    },
+    {
+      "id": "AH-AC-045",
+      "title": "Bound child agents, goal remainder, and metered spend",
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:e2e_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-046",
+      "title": "Gate and normalize provider child-agent lifecycle",
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:provider_boundaries_test"
+      ],
+      "external_evidence": [
+        {
+          "target": "external://p13i/machines:agent-harness-proof/delegation",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "AH-AC-047",
+      "title": "Exchange bounded live messages with Claude and Codex",
+      "local_evidence": ["//tools:live_smoke_test"],
+      "external_evidence": [
+        {
+          "target": "external://p13i/agent-harness:live-smoke",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "AH-AC-048",
+      "title": "Capture retained immutable bounded proof without prompts or host paths",
+      "local_evidence": [
+        "//tests:unit_tests",
+        "//tests:integration_tests"
+      ],
+      "external_evidence": [
+        {
+          "target": "external://p13i/machines:agent-harness-proof/verifier",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "AH-AC-049",
+      "title": "Adopt a legacy exact-UUID session into a typed Machines contract",
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-050",
+      "title": "Retain promotion evidence and authorization through export and recovery",
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-051",
+      "title": "Create Machines evidence exactly once across response-loss retries",
+      "local_evidence": ["//tests:integration_tests"]
+    },
+    {
+      "id": "AH-AC-052",
+      "title": "Pause repeated dispatches until material progress or retained invalidation",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-053",
+      "title": "Acknowledge cross-provider context only after provider prompt acceptance",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:provider_boundaries_test"
+      ]
+    },
+    {
+      "id": "AH-AC-054",
+      "title": "Narrow one managed turn and all delegated children without widening the session",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-055",
+      "title": "Bind cross-provider context lifecycle to command, attempt, checkpoint, and stable digests",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-056",
+      "title": "Retain idempotent child launch admissions across hook replay, transport loss, and provider failover",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:provider_boundaries_test"
+      ]
+    },
+    {
+      "id": "AH-AC-057",
+      "title": "Fail closed when proof event history is noncontiguous",
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-058",
+      "title": "Commit keyed API mutations and their replay receipts atomically",
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-059",
+      "title": "Bind reconciliation discovery and resolution material in proof",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-060",
+      "title": "Advance no-op stages and recurring ticks through exact one-use goal-authorized transitions",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-061",
+      "title": "Allow zero-dollar subscription parent turns while rejecting metered routes and child launches",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-062",
+      "title": "Require a fresh live usage probe after every scheduler restart",
+      "local_evidence": ["//tests:unit_tests"]
+    },
+    {
+      "id": "AH-AC-063",
+      "title": "Fence displaced workers across atomic provider admission and reconciliation",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-064",
+      "title": "Project prompt-free command session ownership and exact immutable envelope digests in proof",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-065",
+      "title": "Rotate bounded invariant epochs through quiescent exact contract adoption lineage",
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-066",
+      "title": "Persist and enforce monotone per-command safety-limit tightening before provider admission",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-067",
+      "title": "Reject managed transition reservation when live workspace material differs from the authorized prior checkpoint",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-068",
+      "title": "Reject non-finite or negative quota, cost, and provider-usage values before routing or provider admission",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-069",
+      "title": "Expose and consume exact provider, control, and resolved-reconciliation transition anchors",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests",
+        "//tests:integration_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-070",
+      "title": "Retain one immutable transition policy and certify one thousand compact exact transitions with linear indexed state",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:unit_tests",
+        "//tests:integration_scale_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-071",
+      "title": "Preserve original managed session creation replay across contract adoption",
+      "local_evidence": [
+        "//tests:integration_tests",
+        "//tests:unit_tests"
+      ]
+    },
+    {
+      "id": "AH-AC-072",
+      "title": "Advance a later transition through an exact interrupted-command control lineage",
+      "local_evidence": [
+        "//tests:e2e_tests",
+        "//tests:integration_tests"
       ]
     }
   ]
