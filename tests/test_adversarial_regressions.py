@@ -18,7 +18,7 @@ from agent_harness.blobs import BlobStore
 from agent_harness.config import paths
 from agent_harness.errors import ConflictError, HarnessError, SafetyGuardError
 from agent_harness.ids import new_uuid, utc_now
-from agent_harness.models import Checkpoint, ProviderAttempt
+from agent_harness.models import Checkpoint, CommandStatus, ProviderAttempt
 from agent_harness.process_control import ProcessGroupIdentity
 from agent_harness.providers import claude, codex, kimi
 from agent_harness.providers.base import ChildLaunchGate, ProviderEvent
@@ -228,13 +228,13 @@ def test_adapters_publish_the_canonical_process_group_identity() -> None:
     assert claude_adapter.process_identity() == (0, "")
 
 
-def test_default_service_registry_includes_the_shipped_kimi_adapter(
+def test_default_service_registry_excludes_kimi_until_it_is_safety_mapped(
     tmp_path: Path,
 ) -> None:
     service = HarnessService(paths(tmp_path / "state"))
     try:
-        assert set(service.adapters) == {"claude", "codex", "kimi"}
-        assert isinstance(service.adapters["kimi"], kimi.KimiAdapter)
+        assert set(service.adapters) == {"claude", "codex"}
+        assert not kimi.KimiAdapter().status().ready
     finally:
         service.close()
 
@@ -253,7 +253,11 @@ def test_max_effort_uses_exact_single_use_xhigh_authorization(
     assert effective_effort("max", limits, xhigh_authorized=True) == "max"
 
     store, created = _store(tmp_path)
-    payload = {"text": "maximum effort", "provider": "claude", "effort": "max"}
+    payload = {
+        "text": "maximum effort",
+        "provider": "claude",
+        "effort": " MAX ",
+    }
     command = store.enqueue_command(
         created.session_id,
         "message",
@@ -472,12 +476,11 @@ async def test_kimi_accepts_neutral_hooks_and_uses_process_containment(
         workspace=tmp_path,
         prompt="one prompt",
         native_session_id="",
-        permission_mode="approval",
+        permission_mode="full",
         model="kimi-code/k3",
         effort="high",
         event_handler=event_handler,
         approval_handler=approval_handler,
-        child_launch_gate=ChildLaunchGate(tmp_path / "state.sqlite3", "command", 0),
         pre_prompt_gate=gate,
     )
     assert result.status == "complete"
@@ -494,6 +497,34 @@ async def test_kimi_accepts_neutral_hooks_and_uses_process_containment(
     adapter._active_process = None
     adapter._process_group = None
 
+    with pytest.raises(RuntimeError, match="permission mode"):
+        await adapter.run_turn(
+            workspace=tmp_path,
+            prompt="one prompt",
+            native_session_id="",
+            permission_mode="read-only",
+            model="kimi-code/k3",
+            effort="high",
+            event_handler=event_handler,
+            approval_handler=approval_handler,
+        )
+    with pytest.raises(RuntimeError, match="child-agent limit"):
+        await adapter.run_turn(
+            workspace=tmp_path,
+            prompt="one prompt",
+            native_session_id="",
+            permission_mode="full",
+            model="kimi-code/k3",
+            effort="high",
+            event_handler=event_handler,
+            approval_handler=approval_handler,
+            child_launch_gate=ChildLaunchGate(
+                tmp_path / "state.sqlite3",
+                "command",
+                0,
+            ),
+        )
+
     def unavailable_identity(unused_pid: int) -> ProcessGroupIdentity:
         del unused_pid
         raise RuntimeError("identity unavailable")
@@ -504,7 +535,7 @@ async def test_kimi_accepts_neutral_hooks_and_uses_process_containment(
             workspace=tmp_path,
             prompt="one prompt",
             native_session_id="",
-            permission_mode="approval",
+            permission_mode="full",
             model="kimi-code/k3",
             effort="high",
             event_handler=event_handler,
@@ -631,6 +662,14 @@ def test_cross_provider_context_excludes_the_current_instruction(
         status="accepted",
         metadata={"command_id": command_id},
     )
+    store.append_event(
+        created.session_id,
+        "user.message",
+        role="user",
+        text="Future queued instruction.",
+        status="accepted",
+        metadata={"command_id": "future"},
+    )
     worker = SessionWorker(
         store,
         BlobStore(tmp_path / "blobs"),
@@ -646,7 +685,80 @@ def test_cross_provider_context_excludes_the_current_instruction(
     )
     prompt = context.text + "\n\n# Next instruction\n\n" + current_text
     assert "Earlier instruction." in prompt
+    assert "Future queued instruction." not in prompt
     assert prompt.count(current_text) == 1
+    store.close()
+
+
+def test_known_undelivered_terminal_dispatch_requeues_after_restart(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    limits = limits_for("unattended", "implementation")
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "retry only when not delivered"},
+        new_uuid(),
+    )
+    assert store.claim_command(created.session_id) is not None
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        limits.as_dict(),
+    )
+    attempt, unused_turn_id, checkpoint = _dispatch(
+        store,
+        created,
+        command.command_id,
+    )
+    del unused_turn_id
+    store.prepare_context_delivery(
+        created.session_id,
+        "claude",
+        "context-digest",
+        checkpoint.checkpoint_id,
+        command.command_id,
+        attempt.attempt_id,
+        "payload-digest",
+    )
+    store.mark_provider_boundary(attempt.attempt_id)
+    store.update_attempt(attempt.attempt_id, status="failed")
+    store.complete_dispatch(attempt.attempt_id, "failed")
+
+    recovery = store.recover_interrupted_commands(
+        created.session_id,
+        "unchanged-material",
+        "unchanged summary",
+    )
+
+    assert recovery.requeued_command_ids == (command.command_id,)
+    assert recovery.reconciliations == ()
+    assert store.get_command(command.command_id).status == CommandStatus.QUEUED
+    next_attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="claude",
+        native_session_id="",
+        model="",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    store.create_attempt(next_attempt)
+    prepared = store.prepare_context_delivery(
+        created.session_id,
+        "claude",
+        "next-context-digest",
+        checkpoint.checkpoint_id,
+        command.command_id,
+        next_attempt.attempt_id,
+        "next-payload-digest",
+    )
+    assert prepared["attempt_id"] == next_attempt.attempt_id
     store.close()
 
 

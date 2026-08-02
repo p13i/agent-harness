@@ -1588,7 +1588,7 @@ async def test_worker_attempt_guard_event_lease_and_failure_boundaries(
         )
         with pytest.raises(SafetyGuardError, match="context-tokens"):
             await rig.worker._execute_attempt(
-                "command",
+                result.command_id,
                 {"provider": "codex"},
                 "message",
                 frozenset(),

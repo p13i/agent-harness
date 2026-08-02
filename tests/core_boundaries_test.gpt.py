@@ -1727,6 +1727,12 @@ def test_service_turn_and_budget_extension_boundaries(tmp_path: Path) -> None:
                 {"text": "Run one turn.", "permission_mode": "root"},
                 idempotency_key="unsupported-mode",
             )
+        with pytest.raises(ValueError, match="message effort"):
+            service.submit_message(
+                session.session_id,
+                {"text": "Run one turn.", "effort": "unsupported"},
+                idempotency_key="unsupported-effort",
+            )
         with pytest.raises(ValueError, match="only one proof fault probe"):
             service.submit_message(
                 session.session_id,
@@ -3454,9 +3460,10 @@ def test_worker_context_repetition_goal_and_reconciliation_boundaries(
 
     captured: dict[str, Any] = {}
     context_store = SimpleNamespace(
-        goal_for_session=lambda unused: None,
-        fork_lineage=lambda unused: {"source_context_digest": "inherited"},
-        context_events=lambda *unused, **values: [],
+            goal_for_session=lambda unused: None,
+            fork_lineage=lambda unused: {"source_context_digest": "inherited"},
+            command_instruction_sequence=lambda *unused: 2,
+            context_events=lambda *unused, **values: [],
         context_history_summary=lambda *unused: {},
         event_count=lambda unused: 0,
         context_unresolved_decisions=lambda unused: [],

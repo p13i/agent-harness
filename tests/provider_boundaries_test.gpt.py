@@ -2136,12 +2136,15 @@ def test_kimi_launch_argv_omits_yolo_and_pins_the_package() -> None:
 def test_kimi_status_and_models(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(kimi.shutil, "which", lambda _name: "/usr/bin/npx")
     status = kimi.KimiAdapter().status()
-    assert status.ready
+    assert not status.ready
     assert status.provider == "kimi"
+    assert "permission and tool accounting" in status.detail
     # A one-shot run has no live turn to steer and cannot prompt for
     # approval, so neither capability is claimed.
     assert "approval" not in status.capabilities
     assert "streaming" in status.capabilities
+    assert "tools" not in status.capabilities
+    assert "subagents" not in status.capabilities
 
     monkeypatch.setattr(kimi.shutil, "which", lambda _name: None)
     assert not kimi.KimiAdapter().status().ready
@@ -2203,7 +2206,7 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
             workspace=tmp_path,
             prompt="do it",
             native_session_id="",
-            permission_mode="auto",
+            permission_mode="full",
             model="kimi-code/k3",
             effort="",
             event_handler=handler,
@@ -2264,7 +2267,7 @@ def test_kimi_run_turn_reports_a_nonzero_exit_as_a_failed_turn(
             workspace=tmp_path,
             prompt="do it",
             native_session_id="session_prior",
-            permission_mode="auto",
+            permission_mode="full",
             model="kimi-code/k3",
             effort="",
             event_handler=handler,
