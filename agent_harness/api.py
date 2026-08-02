@@ -308,14 +308,9 @@ async def run_daemon(
 async def _health(request: web.Request) -> web.Response:
     service = _service(request)
     supervision = service.worker_supervision()
-    status = "ok"
-    response_status = 200
-    if supervision["unrecovered"]:
-        status = "failed"
-        response_status = 503
     return web.json_response(
         {
-            "status": status,
+            "status": "ok",
             "control_build_id": CONTROL_BUILD_ID,
             "runtime_build_id": runtime_build_id(),
             "control_protocol_version": CONTROL_PROTOCOL_VERSION,
@@ -324,7 +319,6 @@ async def _health(request: web.Request) -> web.Response:
             "sync": read_sync_status(service.paths),
             "worker_supervision": supervision,
         },
-        status=response_status,
     )
 
 

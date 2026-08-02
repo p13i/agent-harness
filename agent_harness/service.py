@@ -52,6 +52,7 @@ from agent_harness.projections import write_session_projections
 from agent_harness.proof import proof_snapshot
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
+from agent_harness.providers.kimi import KimiAdapter
 from agent_harness.reconciliation import (
     ReconciliationManager,
     validate_reconciliation_audit,
@@ -291,6 +292,7 @@ def _validate_proof_fault_probe(
     goal: Goal | None,
     payload: dict[str, Any],
     idempotency_key: str,
+    supported_providers: frozenset[str],
 ) -> None:
     probe = payload.get("proof_fault_probe")
     if probe is None:
@@ -320,7 +322,7 @@ def _validate_proof_fault_probe(
         raise ValueError("proof fault probe requires proof-fault-barrier")
     if str(probe.get("stage", "")) != "after-lease-before-acceptance":
         raise ValueError("proof fault probe stage is unsupported")
-    if str(probe.get("provider", "")) not in {"claude", "codex"}:
+    if str(probe.get("provider", "")) not in supported_providers:
         raise ValueError("proof fault probe provider is unsupported")
     authorization_digest = str(probe.get("authorization_digest", ""))
     if len(authorization_digest) != 64:
@@ -356,6 +358,7 @@ def _validate_service_fault_probe(
     goal: Goal | None,
     payload: dict[str, Any],
     idempotency_key: str,
+    supported_providers: frozenset[str],
 ) -> None:
     probe = payload.get("proof_service_fault_probe")
     if probe is None:
@@ -386,7 +389,7 @@ def _validate_service_fault_probe(
     if str(probe.get("stage", "")) != "after-acceptance-before-terminal":
         raise ValueError("proof service fault probe stage is unsupported")
     provider = str(probe.get("provider", ""))
-    if provider not in {"claude", "codex"}:
+    if provider not in supported_providers:
         raise ValueError("proof service fault probe provider is unsupported")
     requested_provider = str(payload.get("provider", ""))
     if requested_provider and requested_provider != provider:
@@ -437,6 +440,7 @@ class HarnessService:
         self.adapters = {
             "claude": ClaudeAdapter(),
             "codex": CodexAdapter(),
+            "kimi": KimiAdapter(),
         }
         self.scheduler = Scheduler(self.store, self.adapters)
         self.reconciliations = ReconciliationManager(
@@ -639,6 +643,7 @@ class HarnessService:
                 permitted_providers=permitted_providers,
                 permitted_efforts=permitted_efforts,
                 budgets=budgets,
+                supported_providers=frozenset(self.adapters),
             )
         creation_input: dict[str, Any] = {
             "workspace": str(workspace),
@@ -787,12 +792,14 @@ class HarnessService:
             self.store.goal_for_session(session_id),
             payload,
             idempotency_key,
+            frozenset(self.adapters),
         )
         _validate_service_fault_probe(
             session,
             self.store.goal_for_session(session_id),
             payload,
             idempotency_key,
+            frozenset(self.adapters),
         )
         if "proof_fault_probe" in payload and "proof_service_fault_probe" in payload:
             raise ValueError("only one proof fault probe may be requested")
@@ -1209,7 +1216,7 @@ class HarnessService:
             command_id = str(payload.get("command_id", ""))
             require_uuid(command_id, "xhigh command_id")
             provider = str(payload.get("provider", ""))
-            if provider not in {"claude", "codex"}:
+            if provider not in self.adapters:
                 raise ValueError("xhigh authorization provider is unsupported")
             if not idempotency_key:
                 raise ValueError("xhigh authorization idempotency key is required")
@@ -1265,7 +1272,7 @@ class HarnessService:
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         provider = str(payload.get("provider", "")).strip()
-        if provider not in {"claude", "codex"}:
+        if provider not in self.adapters:
             raise ValueError("unsupported lease provider")
         profile = validate_profile(str(payload.get("execution_profile", UNATTENDED)))
         if profile == "interactive":
@@ -1826,6 +1833,7 @@ class HarnessService:
             permitted_providers=permitted_providers_value,
             permitted_efforts=permitted_efforts_value,
             budgets=budgets,
+            supported_providers=frozenset(self.adapters),
         )
         execution_profile = validate_profile(str(payload.get("execution_profile", "")))
         permission_mode = str(payload.get("permission_mode", ""))
@@ -2569,6 +2577,7 @@ def _require_machines_goal_envelope(
     permitted_providers: list[Any],
     permitted_efforts: list[Any],
     budgets: dict[str, Any],
+    supported_providers: frozenset[str],
 ) -> None:
     required_fields = {
         "goal_kind",
@@ -2598,7 +2607,7 @@ def _require_machines_goal_envelope(
         raise ValueError("p13i/machines requires typed goal milestones")
     if not permitted_providers or not permitted_efforts:
         raise ValueError("p13i/machines requires explicit routing bounds")
-    if set(str(item) for item in permitted_providers) - {"claude", "codex"}:
+    if set(str(item) for item in permitted_providers) - supported_providers:
         raise ValueError("p13i/machines contains an unsupported provider")
     required_budgets = {
         "seconds",

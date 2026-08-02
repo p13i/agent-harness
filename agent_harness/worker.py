@@ -57,10 +57,12 @@ from agent_harness.providers.normalize import redact_observable, sanitize
 from agent_harness.reconciliation import ReconciliationManager
 from agent_harness.safety import (
     INTERACTIVE,
+    SafetyConsumption,
     SafetyLimits,
     TurnGuard,
     apply_extension,
     effective_effort,
+    effort_requires_xhigh_authorization,
     limits_for,
     lower_effort,
     require_state_headroom,
@@ -323,11 +325,21 @@ class SessionWorker:
                 result,
             )
             return
+        existing_envelope: dict[str, Any] | None = None
+        try:
+            existing_envelope = self.store.command_envelope(command.command_id)
+        except NotFoundError:
+            existing_envelope = None
         workload = str(payload.get("workload", "implementation"))
-        limits = limits_for(profile, workload)
-        requested_effort = str(payload.get("effort", ""))
+        if existing_envelope is None:
+            limits = limits_for(profile, workload)
+        else:
+            profile = str(existing_envelope["profile"])
+            limits = SafetyLimits(**existing_envelope["limits"])
+        requested_effort = str(payload.get("effort", "")).strip().casefold()
         xhigh_authorization = None
-        if requested_effort == "xhigh" and profile != "interactive":
+        requires_xhigh = effort_requires_xhigh_authorization(requested_effort)
+        if requires_xhigh and profile != "interactive":
             xhigh_authorization = self.store.xhigh_authorization_or_park(
                 command.command_id
             )
@@ -346,27 +358,28 @@ class SessionWorker:
                 return
         else:
             xhigh_authorization = self.store.xhigh_authorization(command.command_id)
-        extension = self.store.consume_session_extensions(self.session_id)
-        limits = apply_extension(limits, extension)
-        try:
-            metered_budget = _optional_number(payload.get("metered_budget"))
-            limits = self._goal_limited_limits(
-                limits,
-                metered_budget=metered_budget,
-            )
-            limits = tighten_limits(limits, payload.get("safety_limits"))
-        except ValueError as error:
-            self.store.resolve_command(
-                command.command_id,
-                CommandStatus.FAILED,
-                {
-                    "code": "E_SAFETY_BUDGET",
-                    "message": str(error),
-                },
-            )
-            return
+        if existing_envelope is None:
+            extension = self.store.consume_session_extensions(self.session_id)
+            limits = apply_extension(limits, extension)
+            try:
+                metered_budget = _optional_number(payload.get("metered_budget"))
+                limits = self._goal_limited_limits(
+                    limits,
+                    metered_budget=metered_budget,
+                )
+                limits = tighten_limits(limits, payload.get("safety_limits"))
+            except ValueError as error:
+                self.store.resolve_command(
+                    command.command_id,
+                    CommandStatus.FAILED,
+                    {
+                        "code": "E_SAFETY_BUDGET",
+                        "message": str(error),
+                    },
+                )
+                return
         xhigh_authorized = xhigh_authorization is not None
-        if requested_effort == "xhigh" and xhigh_authorization is not None:
+        if requires_xhigh and xhigh_authorization is not None:
             authorized_provider = str(xhigh_authorization.get("provider", ""))
             requested_provider = str(payload.get("provider", ""))
             if requested_provider and requested_provider != authorized_provider:
@@ -390,7 +403,7 @@ class SessionWorker:
                 },
             )
             return
-        if effort == "xhigh" and profile != "interactive":
+        if effort_requires_xhigh_authorization(effort) and profile != "interactive":
             limits = replace(limits, max_attempts=1)
         payload = dict(payload)
         payload["_effort_pinned"] = bool(requested_effort)
@@ -406,17 +419,19 @@ class SessionWorker:
             self.session_id,
             limits.max_child_agents,
         )
-        self.store.append_event(
-            self.session_id,
-            "usage.reserved",
-            status="complete",
-            metadata={
-                "command_id": command.command_id,
-                "profile": profile,
-                "limits": envelope["limits"],
-            },
-        )
-        guard = TurnGuard(limits)
+        if existing_envelope is None:
+            self.store.append_event(
+                self.session_id,
+                "usage.reserved",
+                status="complete",
+                metadata={
+                    "command_id": command.command_id,
+                    "profile": profile,
+                    "limits": envelope["limits"],
+                },
+            )
+        consumption = SafetyConsumption(**envelope["consumption"])
+        guard = TurnGuard(limits, consumption)
         self.store.update_session(
             self.session_id,
             lifecycle=Lifecycle.RUNNING,
@@ -481,14 +496,11 @@ class SessionWorker:
                 },
             )
             return
-        self.store.update_command_envelope(
+        self.store.complete_command_execution(
             command.command_id,
-            state="complete",
-            consumption=guard.consumption.as_dict(),
-        )
-        self.store.resolve_command(
-            command.command_id,
-            CommandStatus.COMPLETE,
+            str(result["turn_id"]),
+            str(result["native_session_id"]),
+            guard.consumption.as_dict(),
             result,
         )
         await self._evaluate_goal()
@@ -602,7 +614,7 @@ class SessionWorker:
         turn_permission_mode = str(
             payload.get("permission_mode", session.permission_mode)
         )
-        context = self._compile_context(session, guard.limits)
+        context = self._compile_context(session, guard.limits, command_id)
         turn_ref = payload.get("turn_ref")
         if not isinstance(turn_ref, dict):
             turn_ref = {}
@@ -1329,13 +1341,6 @@ class SessionWorker:
                 decision.provider + " returned a non-complete result",
                 status=502,
             )
-        self.store.update_attempt(
-            attempt_id,
-            status="complete",
-            native_session_id=result.native_session_id,
-        )
-        self.store.finish_turn(turn_id, "complete")
-        self.store.complete_dispatch(attempt_id, "complete")
         current = self.store.get_session(self.session_id)
         checkpoint = await asyncio.to_thread(
             checkpoint_workspace,
@@ -1664,6 +1669,7 @@ class SessionWorker:
         self,
         session: Session,
         limits: SafetyLimits,
+        command_id: str,
     ):
         goal = self.store.goal_for_session(self.session_id)
         evidence = []
@@ -1677,6 +1683,14 @@ class SessionWorker:
             inherited_context_digest = str(lineage["source_context_digest"])
             inherited_context = self.blobs.get_text(inherited_context_digest)
         context_events = self.store.context_events(self.session_id, limit=5000)
+        context_events = [
+            event
+            for event in context_events
+            if not (
+                event.event_type == "user.message"
+                and str(event.metadata.get("command_id", "")) == command_id
+            )
+        ]
         before_sequence = 0
         if context_events:
             before_sequence = context_events[0].sequence - 1
@@ -1799,6 +1813,11 @@ class SessionWorker:
                 continue
             if str(event.metadata.get("generation_digest", "")) != generation_digest:
                 continue
+            if step_digest:
+                if str(event.metadata.get("step_digest", "")) != step_digest:
+                    continue
+                if str(event.metadata.get("fingerprint", "")) != fingerprint:
+                    continue
             repeated_component = ""
             for name, digest in components.items():
                 if execution_profile == INTERACTIVE and name != "instruction_digest":

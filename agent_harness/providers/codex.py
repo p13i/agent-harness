@@ -542,8 +542,10 @@ class CodexAdapter(ProviderAdapter):
             return (0, "")
         if server.process.returncode is not None:
             return (0, "")
-        pid = server.process.pid
-        return (pid, _process_start(pid))
+        identity = server._process_group
+        if identity is None or identity.pid != server.process.pid:
+            return (0, "")
+        return (identity.pid, identity.pid_start)
 
     def native_session_available(
         self,
@@ -576,17 +578,6 @@ def _object(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
-
-
-def _process_start(pid: int) -> str:
-    path = Path("/proc") / str(pid) / "stat"
-    try:
-        fields = path.read_text(encoding="utf-8").split()
-    except OSError:
-        return str(pid)
-    if len(fields) <= 21:
-        return str(pid)
-    return fields[21]
 
 
 def _nested_id(value: dict[str, Any], field: str) -> str:

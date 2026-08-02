@@ -8,8 +8,8 @@ with ``tools/ingest_agent.gpt.py`` in the consuming repo.
 
 Two consequences of that choice, both deliberate:
 
-- ``steer`` and ``interrupt`` stay the base class's no-ops. A one-shot
-  ``kimi --prompt`` has no turn to steer into.
+- ``steer`` stays the base class's no-op. The active one-shot process can
+  still be interrupted and is contained in an isolated process group.
 - ``--yolo`` is NOT passed. Kimi rejects it together with ``--prompt``,
   so tool permissions come from ``~/.kimi-code/config.toml`` instead.
 """
@@ -22,7 +22,9 @@ from pathlib import Path
 import shutil
 
 from agent_harness.providers.base import ApprovalHandler
+from agent_harness.providers.base import ChildLaunchGate
 from agent_harness.providers.base import EventHandler
+from agent_harness.providers.base import PrePromptGate
 from agent_harness.providers.base import ProviderAdapter
 from agent_harness.providers.base import ProviderEvent
 from agent_harness.providers.base import ProviderModel
@@ -30,6 +32,9 @@ from agent_harness.providers.base import ProviderResult
 from agent_harness.providers.base import ProviderStatus
 from agent_harness.providers.base import provider_environment
 from agent_harness.providers.normalize import kimi_payload
+from agent_harness.process_control import ProcessGroupIdentity
+from agent_harness.process_control import process_group_identity
+from agent_harness.process_control import terminate_process_group
 
 KIMI_CODE_PACKAGE = "@moonshot-ai/kimi-code"
 
@@ -56,6 +61,10 @@ def _launch_argv(prompt: str, model: str, session_id: str) -> list[str]:
 class KimiAdapter(ProviderAdapter):
     provider_id = "kimi"
 
+    def __init__(self) -> None:
+        self._active_process: asyncio.subprocess.Process | None = None
+        self._process_group: ProcessGroupIdentity | None = None
+
     async def run_turn(
         self,
         *,
@@ -67,11 +76,16 @@ class KimiAdapter(ProviderAdapter):
         effort: str,
         event_handler: EventHandler,
         approval_handler: ApprovalHandler,
+        child_launch_gate: ChildLaunchGate | None = None,
+        pre_prompt_gate: PrePromptGate | None = None,
     ) -> ProviderResult:
         # Kimi Code exposes no reasoning-effort control and approves
         # tools from its own config, so both arguments are accepted for
         # the contract and unused.
-        del effort, permission_mode, approval_handler
+        del effort, permission_mode, approval_handler, child_launch_gate
+
+        if pre_prompt_gate is not None:
+            await pre_prompt_gate()
 
         argv = _launch_argv(prompt, model, native_session_id)
         process = await asyncio.create_subprocess_exec(
@@ -81,40 +95,54 @@ class KimiAdapter(ProviderAdapter):
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
+        pid = int(getattr(process, "pid", 0) or 0)
+        if pid > 0:
+            try:
+                self._process_group = process_group_identity(pid)
+            except BaseException:
+                process.terminate()
+                await process.wait()
+                raise
+        self._active_process = process
 
         session_id = native_session_id
         status = "complete"
-        assert process.stdout is not None
-        async for line in process.stdout:
-            text = line.decode("utf-8", "replace").strip()
-            if not text:
-                continue
-            try:
-                payload = json.loads(text)
-            except ValueError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            for event in kimi_payload(payload):
-                if event.native_session_id:
-                    session_id = event.native_session_id
-                await event_handler(event)
+        try:
+            assert process.stdout is not None
+            async for line in process.stdout:
+                text = line.decode("utf-8", "replace").strip()
+                if not text:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                for event in kimi_payload(payload):
+                    if event.native_session_id:
+                        session_id = event.native_session_id
+                    await event_handler(event)
 
-        stderr = b""
-        if process.stderr is not None:
-            stderr = await process.stderr.read()
-        returncode = await process.wait()
-        if returncode != 0:
-            status = "failed"
-            await event_handler(
-                ProviderEvent(
-                    "turn.failed",
-                    text=stderr.decode("utf-8", "replace").strip(),
-                    status="failed",
-                    native_session_id=session_id,
+            stderr = b""
+            if process.stderr is not None:
+                stderr = await process.stderr.read()
+            returncode = await process.wait()
+            if returncode != 0:
+                status = "failed"
+                await event_handler(
+                    ProviderEvent(
+                        "turn.failed",
+                        text=stderr.decode("utf-8", "replace").strip(),
+                        status="failed",
+                        native_session_id=session_id,
+                    )
                 )
-            )
+        finally:
+            self._active_process = None
+            self._process_group = None
 
         return ProviderResult(
             provider=self.provider_id,
@@ -123,6 +151,24 @@ class KimiAdapter(ProviderAdapter):
             status=status,
             usage={},
         )
+
+    async def interrupt(self) -> None:
+        process = self._active_process
+        identity = self._process_group
+        if process is None or identity is None:
+            return
+        await terminate_process_group(process, identity)
+
+    def process_identity(self) -> tuple[int, str]:
+        process = self._active_process
+        identity = self._process_group
+        if process is None or identity is None:
+            return (0, "")
+        if process.returncode is not None:
+            return (0, "")
+        if process.pid != identity.pid:
+            return (0, "")
+        return (identity.pid, identity.pid_start)
 
     async def models(self, workspace: Path) -> tuple[ProviderModel, ...]:
         # These ids go straight into `--model`, which resolves an alias
@@ -161,7 +207,7 @@ class KimiAdapter(ProviderAdapter):
             detail=detail,
             # No approval: --yolo cannot accompany --prompt, so tool
             # permissions are config-driven rather than interactive. No
-            # steering or interrupt: a one-shot run has no live turn.
+            # steering: a one-shot run has no live protocol turn.
             capabilities=frozenset(
                 {
                     "mcp",

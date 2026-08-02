@@ -46,6 +46,7 @@ from agent_harness.orchestration import (
     normalize_turn_ref,
     normalized_digest,
 )
+from agent_harness.safety import effort_requires_xhigh_authorization
 from agent_harness.workspace_state import inspect_workspace
 
 SCHEMA_VERSION = 4
@@ -4243,6 +4244,83 @@ class StateStore:
             if cursor.rowcount != 1:
                 raise NotFoundError("provider dispatch")
 
+    def complete_command_execution(
+        self,
+        command_id: str,
+        turn_id: str,
+        native_session_id: str,
+        consumption: dict[str, Any],
+        result: dict[str, Any],
+    ) -> CommandReceipt:
+        now = utc_now()
+        with self.transaction() as connection:
+            dispatch = connection.execute(
+                """
+                SELECT command_dispatches.attempt_id, commands.session_id,
+                    commands.status
+                FROM command_dispatches
+                JOIN commands USING(command_id)
+                WHERE command_dispatches.command_id = ? AND turn_id = ?
+                    AND crossed_boundary = 1
+                """,
+                (command_id, turn_id),
+            ).fetchone()
+            if dispatch is None:
+                raise ConflictError("completed command dispatch boundary is missing")
+            checkpoint = connection.execute(
+                "SELECT session_id FROM checkpoints WHERE checkpoint_id = ?",
+                (str(result.get("checkpoint_id", "")),),
+            ).fetchone()
+            if checkpoint is None or str(checkpoint["session_id"]) != str(
+                dispatch["session_id"]
+            ):
+                raise ConflictError("completed command checkpoint is missing")
+            if str(dispatch["status"]) != CommandStatus.DISPATCHING:
+                raise ConflictError("completed command is not dispatching")
+            attempt_id = str(dispatch["attempt_id"])
+            connection.execute(
+                """
+                UPDATE provider_attempts SET status = 'complete',
+                    native_session_id = ?, ended_at = ?
+                WHERE attempt_id = ?
+                """,
+                (native_session_id, now, attempt_id),
+            )
+            connection.execute(
+                """
+                UPDATE turns SET status = 'complete', completed_at = ?
+                WHERE turn_id = ?
+                """,
+                (now, turn_id),
+            )
+            connection.execute(
+                """
+                UPDATE command_dispatches SET state = 'complete', updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (now, attempt_id),
+            )
+            connection.execute(
+                """
+                UPDATE command_envelopes SET state = 'complete',
+                    consumption_json = ?, updated_at = ?
+                WHERE command_id = ?
+                """,
+                (_dump(consumption), now, command_id),
+            )
+            connection.execute(
+                """
+                UPDATE commands SET status = ?, result_json = ?, updated_at = ?
+                WHERE command_id = ?
+                """,
+                (CommandStatus.COMPLETE, _dump(result), now, command_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+        return _command(row)
+
     def recover_interrupted_commands(
         self,
         session_id: str,
@@ -4266,7 +4344,6 @@ class StateStore:
                     """
                     SELECT * FROM command_dispatches
                     WHERE command_id = ? AND crossed_boundary = 1
-                    AND state IN ('dispatched', 'prepared')
                     ORDER BY created_at DESC LIMIT 1
                     """,
                     (command["command_id"],),
@@ -4464,11 +4541,10 @@ class StateStore:
             """
             UPDATE provider_attempts SET status = 'ambiguous',
                 ended_at = ?
-            WHERE attempt_id IN (
-                SELECT attempt_id FROM command_dispatches
-                WHERE command_id = ? AND crossed_boundary = 1
-                AND state IN ('dispatched', 'prepared')
-            )
+                WHERE attempt_id IN (
+                    SELECT attempt_id FROM command_dispatches
+                    WHERE command_id = ? AND crossed_boundary = 1
+                )
             """,
             (now, command["command_id"]),
         )
@@ -4477,7 +4553,6 @@ class StateStore:
             UPDATE command_dispatches SET state = 'ambiguous',
                 updated_at = ?
             WHERE command_id = ? AND crossed_boundary = 1
-            AND state IN ('dispatched', 'prepared')
             """,
             (now, command["command_id"]),
         )
@@ -5287,7 +5362,7 @@ class StateStore:
         idempotency_key: str,
         expires_at: str,
     ) -> dict[str, Any]:
-        if provider not in {"claude", "codex"}:
+        if not provider.strip():
             raise ValueError("xhigh authorization provider is unsupported")
         if not idempotency_key:
             raise ValueError("xhigh authorization idempotency key is required")
@@ -5325,7 +5400,8 @@ class StateStore:
             }:
                 raise ConflictError("xhigh authorization command is not active")
             command_payload = _load_object(str(command["payload_json"]))
-            if str(command_payload.get("effort", "")) != "xhigh":
+            requested_effort = str(command_payload.get("effort", ""))
+            if not effort_requires_xhigh_authorization(requested_effort):
                 raise ConflictError("xhigh authorization command effort changed")
             requested_provider = str(command_payload.get("provider", ""))
             if requested_provider and requested_provider != provider:
@@ -5344,7 +5420,7 @@ class StateStore:
             connection.execute(
                 """
                 INSERT INTO xhigh_authorization_receipts VALUES (
-                    ?, ?, ?, ?, 'xhigh', ?, ?, ?, ?, '', '', ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?
                 )
                 """,
                 (
@@ -5352,6 +5428,7 @@ class StateStore:
                     session_id,
                     command_id,
                     provider,
+                    requested_effort,
                     command_request_digest,
                     authorization_request_digest,
                     idempotency_key,
@@ -5462,6 +5539,17 @@ class StateStore:
                     now,
                 ),
             )
+            row = connection.execute(
+                "SELECT * FROM command_envelopes WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is not None:
+                if str(row["session_id"]) != session_id:
+                    raise ConflictError("command envelope session changed")
+                if str(row["profile"]) != profile:
+                    raise ConflictError("command envelope profile changed")
+                if _load_object(str(row["limits_json"])) != limits:
+                    raise ConflictError("command envelope limits changed")
         return self.command_envelope(command_id)
 
     def command_envelope(self, command_id: str) -> dict[str, Any]:
@@ -5666,7 +5754,9 @@ class StateStore:
                         "reason": "goal-concurrency",
                         "lease_id": "",
                     }
-            if profile != "interactive" and effort == "xhigh":
+            if profile != "interactive" and effort_requires_xhigh_authorization(
+                effort
+            ):
                 command = connection.execute(
                     "SELECT payload_json FROM commands WHERE command_id = ?",
                     (command_id,),
@@ -5679,11 +5769,11 @@ class StateStore:
                     """
                     SELECT authorization_id
                     FROM xhigh_authorization_receipts
-                    WHERE command_id = ? AND provider = ? AND effort = 'xhigh'
+                    WHERE command_id = ? AND provider = ? AND effort = ?
                     AND command_request_digest = ? AND consumed_at = ''
                     AND expires_at > ?
                     """,
-                    (command_id, provider, command_request_digest, now),
+                    (command_id, provider, effort, command_request_digest, now),
                 ).fetchone()
                 if authorization is None or not attempt_id:
                     return {

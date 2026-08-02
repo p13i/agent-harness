@@ -20,6 +20,7 @@ UNATTENDED = "unattended"
 LIVE_SMOKE = "live-smoke"
 PROFILES = frozenset({INTERACTIVE, UNATTENDED, LIVE_SMOKE})
 MINIMUM_STATE_FREE_BYTES = 2 * 1024 * 1024 * 1024
+EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 
 
 @dataclass(frozen=True)
@@ -166,12 +167,19 @@ def effective_effort(
     effort = requested.strip().casefold()
     if not effort:
         return limits.default_effort
-    if effort == "xhigh" and limits.profile != INTERACTIVE:
+    if effort_requires_xhigh_authorization(effort) and limits.profile != INTERACTIVE:
         if not xhigh_authorized:
             raise ValueError(
                 "xhigh effort requires an explicit unattended authorization"
             )
     return effort
+
+
+def effort_requires_xhigh_authorization(value: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized not in EFFORT_ORDER:
+        return False
+    return EFFORT_ORDER.index(normalized) >= EFFORT_ORDER.index("xhigh")
 
 
 def apply_extension(
@@ -251,14 +259,13 @@ def tighten_limits(
 
 
 def lower_effort(value: str) -> str:
-    order = ("low", "medium", "high", "xhigh")
     normalized = value.strip().casefold()
-    if normalized not in order:
+    if normalized not in EFFORT_ORDER:
         return "medium"
-    index = order.index(normalized)
+    index = EFFORT_ORDER.index(normalized)
     if index == 0:
         return "low"
-    return order[index - 1]
+    return EFFORT_ORDER[index - 1]
 
 
 def normalize_usage(value: object) -> dict[str, Any]:
@@ -428,6 +435,7 @@ class TurnGuard:
             monotonic = time.monotonic
         self._monotonic = monotonic
         self._started = monotonic()
+        self._elapsed_offset = max(0.0, float(consumption.elapsed_seconds))
         self._last_progress = self._started
         self._tool_pairs: list[str] = []
         self._pending_tools: dict[str, list[str]] = {}
@@ -525,7 +533,7 @@ class TurnGuard:
         if self._violation:
             return self._violation
         now = self._monotonic()
-        self.consumption.elapsed_seconds = now - self._started
+        self.consumption.elapsed_seconds = self._elapsed_offset + now - self._started
         if self.consumption.attempts > self.limits.max_attempts:
             self._violation = "attempts"
         elif self.consumption.elapsed_seconds >= self.limits.max_seconds:

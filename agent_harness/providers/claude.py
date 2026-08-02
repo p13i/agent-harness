@@ -405,7 +405,10 @@ class ClaudeAdapter(ProviderAdapter):
         pid = int(getattr(process, "pid", 0) or 0)
         if pid <= 0:
             return (0, "")
-        return (pid, _process_start(pid))
+        identity = transport._process_group
+        if identity is None or identity.pid != pid:
+            return (0, "")
+        return (identity.pid, identity.pid_start)
 
     def native_session_available(
         self,
@@ -418,17 +421,6 @@ class ClaudeAdapter(ProviderAdapter):
 async def _empty_stream() -> AsyncIterator[dict[str, Any]]:
     if False:
         yield {}
-
-
-def _process_start(pid: int) -> str:
-    stat_path = Path("/proc") / str(pid) / "stat"
-    try:
-        fields = stat_path.read_text(encoding="utf-8").split()
-    except OSError:
-        return str(pid)
-    if len(fields) <= 21:
-        return str(pid)
-    return fields[21]
 
 
 async def _prompt_stream(

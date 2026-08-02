@@ -459,6 +459,13 @@ def _proof_page(
     event_limit: int,
 ) -> dict[str, Any]:
     payload = _object(retained.get("payload"))
+    retained_digest = str(retained.get("digest", ""))
+    if not retained_digest or _digest(payload) != retained_digest:
+        raise HarnessError(
+            "E_PROOF_INTEGRITY",
+            "retained proof snapshot failed its integrity check",
+            status=500,
+        )
     all_events = [item for item in payload.get("events", []) if isinstance(item, dict)]
     retained_through = _integer(retained.get("through_sequence"))
     if after_sequence > retained_through:
@@ -485,7 +492,7 @@ def _proof_page(
     result.update(
         {
             "snapshot_id": str(retained.get("snapshot_id", "")),
-            "snapshot_digest": str(retained.get("digest", "")),
+            "snapshot_digest": retained_digest,
             "complete": not truncated and complete,
             "truncated": sorted(set(truncated)),
             "state_stable": True,
