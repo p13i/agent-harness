@@ -42,10 +42,10 @@ lint:
 	@$(BAZEL) test //tests:style_test
 
 test:
-	@$(BAZEL) test //tests:acceptance_test //tests:unit_tests //tests:integration_tests //tests:integration_scale_tests //tests:e2e_tests //tests:chat_pty_test //tests:core_boundaries_test //tests:parity_test //tests:provider_boundaries_test //tests:storage_boundaries_test //tests:style_test //tests:tui_boundaries_test //tools:coverage_gate_test //tools:install_test //tools:live_smoke_test //tools:ui_gallery_test //tools:wsl_e2e_test
+	@$(BAZEL) test //tests:acceptance_test //tests:unit_tests //tests:integration_tests //tests:integration_scale_tests //tests:e2e_tests //tests:chat_pty_test //tests:core_boundaries_test //tests:parity_test //tests:provider_boundaries_test //tests:storage_boundaries_test //tests:storage_service_boundaries_test //tests:style_test //tests:tui_boundaries_test //tools:coverage_gate_test //tools:install_test //tools:live_smoke_test //tools:ui_gallery_test //tools:wsl_e2e_test
 
 coverage:
-	@$(BAZEL) coverage //tests:unit_tests //tests:integration_tests //tests:integration_scale_tests //tests:e2e_tests //tests:acceptance_test //tests:core_boundaries_test //tests:parity_test //tests:provider_boundaries_test //tests:storage_boundaries_test //tests:style_test //tests:tui_boundaries_test //tools:coverage_gate_test //tools:install_test //tools:live_smoke_test //tools:ui_gallery_test //tools:wsl_e2e_test --combined_report=lcov --instrumentation_filter='//agent_harness[/:],//cmd[/:],//tools[/:]'
+	@$(BAZEL) coverage //tests:unit_tests //tests:integration_tests //tests:integration_scale_tests //tests:e2e_tests //tests:acceptance_test //tests:core_boundaries_test //tests:parity_test //tests:provider_boundaries_test //tests:storage_boundaries_test //tests:storage_service_boundaries_test //tests:style_test //tests:tui_boundaries_test //tools:coverage_gate_test //tools:install_test //tools:live_smoke_test //tools:ui_gallery_test //tools:wsl_e2e_test --combined_report=lcov --instrumentation_filter='//agent_harness[/:],//cmd[/:],//tools[/:]'
 	@$(BAZEL) run //tools:coverage_gate -- \
 		--lcov "$(CURDIR)/bazel-out/_coverage/_coverage_report.dat" \
 		--minimum 100 \

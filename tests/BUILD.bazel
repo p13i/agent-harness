@@ -79,6 +79,19 @@ py_test(
 )
 
 py_test(
+    name = "storage_service_boundaries_test",
+    srcs = [
+        "storage_service_boundaries_test.py",
+        "test_support.py",
+    ],
+    main = "storage_service_boundaries_test.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//pytest",
+    ],
+)
+
+py_test(
     name = "core_boundaries_test",
     srcs = ["core_boundaries_test.gpt.py"],
     main = "core_boundaries_test.gpt.py",
