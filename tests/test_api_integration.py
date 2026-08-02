@@ -3163,10 +3163,29 @@ def test_durable_dispatch_invalidations_bind_every_transition_field(
             "sequence is out of order",
             lambda item: authorization(item).__setitem__("transition_sequence", 3),
         )
-        rejected(
-            "predecessor is missing",
-            lambda item: authorization(item).__setitem__("transition_sequence", 2),
-        )
+        durable_connection = service.store._connection
+
+        class MissingPredecessorConnection:
+            def execute(
+                self,
+                statement: str,
+                parameters: tuple[object, ...] = (),
+            ) -> object:
+                if "SELECT COALESCE(MAX(transition_sequence)" in statement:
+                    return SimpleNamespace(fetchone=lambda: {"count": 1})
+                return durable_connection.execute(statement, parameters)
+
+        service.store._connection = MissingPredecessorConnection()
+        try:
+            rejected(
+                "predecessor is missing",
+                lambda item: authorization(item).__setitem__(
+                    "transition_sequence",
+                    2,
+                ),
+            )
+        finally:
+            service.store._connection = durable_connection
         rejected(
             "orchestrator changed",
             lambda item: authorization(item).__setitem__(
@@ -3296,21 +3315,22 @@ def test_durable_dispatch_invalidations_bind_every_transition_field(
         assert receipt["prior_command_id"] == base["prior_command_id"]
         replayed = invalidate(copy.deepcopy(base), "durable-accepted")
         assert replayed["invalidation_id"] == receipt["invalidation_id"]
-        assert (
-            service.store.dispatch_invalidation_by_key("durable-accepted")[
-                "invalidation_id"
-            ]
-            == receipt["invalidation_id"]
+        durable_replay = service.store.dispatch_invalidation_replay(
+            current.session_id,
+            "durable-accepted",
+            normalized_digest(base),
         )
+        assert durable_replay is not None
+        assert durable_replay["invalidation_id"] == receipt["invalidation_id"]
         with pytest.raises(ConflictError, match="idempotency key was reused"):
             invalidate(
                 {**copy.deepcopy(base), "reason": "another reason"},
                 "durable-accepted",
             )
         with pytest.raises(ConflictError, match="idempotency key was reused"):
-            service.store.dispatch_invalidation_by_key_and_digest(
-                "durable-accepted",
+            service.store.dispatch_invalidation_replay(
                 current.session_id,
+                "durable-accepted",
                 "b" * 64,
             )
     finally:
