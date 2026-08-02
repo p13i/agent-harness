@@ -349,6 +349,112 @@ def test_portable_validation_import_and_merge_boundaries(
     merge_store.close()
 
 
+def test_portable_import_migrates_legacy_context_delivery_identity(
+    tmp_path: Path,
+) -> None:
+    source = StateStore(tmp_path / "source.sqlite3")
+    created = session(tmp_path)
+    source.create_session(created)
+    record = source.portable_session(created.session_id)
+    source.close()
+    _, global_record = _portable_empty()
+
+    missing_attempt = {
+        "session_id": created.session_id,
+        "provider": "codex",
+        "context_digest": "legacy-missing-attempt",
+        "checkpoint_id": "",
+        "delivered_at": "2026-08-02T00:00:00+00:00",
+    }
+    colliding_attempt_id = "legacy-" + normalized_digest(
+        {
+            "attempt_id": "",
+            "row": missing_attempt,
+        }
+    )
+    source_rows = [
+        missing_attempt,
+        copy.deepcopy(missing_attempt),
+        {
+            **missing_attempt,
+            "context_digest": "legacy-null-attempt",
+            "attempt_id": None,
+        },
+        {
+            **missing_attempt,
+            "provider": "claude",
+            "context_digest": "legacy-duplicate-one",
+            "attempt_id": "duplicate-attempt",
+        },
+        {
+            **missing_attempt,
+            "context_digest": "legacy-duplicate-two",
+            "attempt_id": "duplicate-attempt",
+        },
+        {
+            **missing_attempt,
+            "context_digest": "preserved-explicit-attempt",
+            "attempt_id": colliding_attempt_id,
+        },
+    ]
+    record["tables"]["context_deliveries"] = source_rows
+    original_record = copy.deepcopy(record)
+
+    first = StateStore(tmp_path / "first.sqlite3")
+    first.import_portable([record], global_record)
+    first_record = first.portable_session(created.session_id)
+    first.close()
+
+    reordered_record = copy.deepcopy(record)
+    reordered_record["tables"]["context_deliveries"].reverse()
+    second = StateStore(tmp_path / "second.sqlite3")
+    second.import_portable([reordered_record], global_record)
+    second_record = second.portable_session(created.session_id)
+    second.close()
+
+    assert record == original_record
+    assert reordered_record["tables"]["context_deliveries"] == list(
+        reversed(source_rows)
+    )
+    assert first_record == second_record
+    rows = first_record["tables"]["context_deliveries"]
+    assert len(rows) == 6
+    by_context = {str(row["context_digest"]): row for row in rows}
+    missing_rows = [
+        row
+        for row in rows
+        if row["context_digest"] == "legacy-missing-attempt"
+    ]
+    assert len(missing_rows) == 2
+    missing_ids = {str(row["attempt_id"]) for row in missing_rows}
+    assert len(missing_ids) == 2
+    assert all(value.startswith("legacy-") for value in missing_ids)
+    assert colliding_attempt_id not in missing_ids
+    null_id = str(by_context["legacy-null-attempt"]["attempt_id"])
+    assert null_id.startswith("legacy-")
+    assert not null_id.startswith("legacy-duplicate-")
+    first_duplicate = str(by_context["legacy-duplicate-one"]["attempt_id"])
+    second_duplicate = str(by_context["legacy-duplicate-two"]["attempt_id"])
+    assert first_duplicate.startswith("legacy-duplicate-")
+    assert second_duplicate.startswith("legacy-duplicate-")
+    assert first_duplicate != second_duplicate
+    assert (
+        by_context["preserved-explicit-attempt"]["attempt_id"]
+        == colliding_attempt_id
+    )
+    preserved = missing_rows[0]
+    assert preserved["session_id"] == created.session_id
+    assert preserved["provider"] == "codex"
+    assert preserved["checkpoint_id"] == ""
+    assert preserved["delivered_at"] == "2026-08-02T00:00:00+00:00"
+    assert preserved["command_id"] == ""
+    assert preserved["state"] == "delivered"
+    assert preserved["payload_digest"] == ""
+    assert preserved["accepted_at"] == ""
+    assert preserved["transport"] == "context-package"
+    assert by_context["legacy-duplicate-one"]["provider"] == "claude"
+
+
 def test_session_import_and_reconciliation_decode_boundaries(
     tmp_path: Path,
 ) -> None:
