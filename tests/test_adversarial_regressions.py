@@ -383,6 +383,14 @@ def test_distinct_managed_steps_may_reuse_every_governing_digest(
             first_ref,
             "unattended",
         )
+    worker._guard_repeated_dispatch(
+        "command-with-empty-components",
+        "new instruction",
+        "new context",
+        tmp_path,
+        {},
+        "unattended",
+    )
 
 
 @pytest.mark.asyncio
