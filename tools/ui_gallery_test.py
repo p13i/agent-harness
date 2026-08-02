@@ -1,39 +1,34 @@
 import asyncio
-from pathlib import Path
 import runpy
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from agent_harness import ui_gallery
-from agent_harness.ui_gallery import BREAKPOINTS
-from agent_harness.ui_gallery import FIXTURES
-from agent_harness.ui_gallery import GalleryClient
-from agent_harness.ui_gallery import MODES
-from agent_harness.ui_gallery import _render_mode_theme
-from agent_harness.ui_gallery import _self_contained_svg
-from agent_harness.ui_gallery import _validate_layout
-from agent_harness.ui_gallery import render_gallery
-from agent_harness.ui_gallery import render_svg
-from agent_harness.ui_gallery import THEMES
+from agent_harness.ui_gallery import (
+    BREAKPOINTS,
+    FIXTURES,
+    MODES,
+    THEMES,
+    GalleryClient,
+    _render_mode_theme,
+    _self_contained_svg,
+    _validate_layout,
+    render_gallery,
+    render_svg,
+)
 
 
 def test_gallery_renders_every_normalized_surface(tmp_path: Path) -> None:
     gallery = render_gallery(tmp_path / "gallery")
 
-    expected = (
-        len(FIXTURES)
-        * len(MODES)
-        * len(THEMES)
-        * len(BREAKPOINTS)
-    )
+    expected = len(FIXTURES) * len(MODES) * len(THEMES) * len(BREAKPOINTS)
     assert len(gallery["files"]) == expected
     assert gallery["renderer"] == "textual-widget-tree"
     for name in gallery["files"]:
-        value = (tmp_path / "gallery" / name).read_text(
-            encoding="utf-8"
-        )
+        value = (tmp_path / "gallery" / name).read_text(encoding="utf-8")
         assert value.startswith("<svg")
         assert "P13I" in value
         assert "secret" not in value.casefold()
@@ -69,9 +64,7 @@ def test_gallery_client_static_request_boundaries() -> None:
     client = GalleryClient("empty", "dark")
 
     async def requests() -> None:
-        assert "codex" in (
-            await client.request("GET", "/v1/providers")
-        )["providers"]
+        assert "codex" in (await client.request("GET", "/v1/providers"))["providers"]
         assert "safety" in await client.request(
             "GET",
             "/v1/sessions/gallery-session/usage",
@@ -85,6 +78,11 @@ def test_gallery_client_static_request_boundaries() -> None:
             "/v1/sessions/gallery-session",
         )
         assert "sync" in await client.request("POST", "/v1/sync")
+        assert await client.request(
+            "GET",
+            "/v1/sessions/gallery-session/events?after=42",
+        ) == {"events": []}
+        assert await client.request("GET", "/unknown") == {}
 
     asyncio.run(requests())
 
@@ -202,9 +200,7 @@ def test_gallery_removes_only_known_export_resources() -> None:
     assert "http" not in rendered
 
     with pytest.raises(ValueError, match="outbound"):
-        _self_contained_svg(
-            '<svg><image href="http://example.test/image.png"/></svg>'
-        )
+        _self_contained_svg('<svg><image href="http://example.test/image.png"/></svg>')
 
 
 def test_gallery_main_and_module_entrypoint(

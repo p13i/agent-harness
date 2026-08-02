@@ -1,41 +1,459 @@
-from dataclasses import replace
 import copy
+import datetime
 import json
-from pathlib import Path
 import sqlite3
 import subprocess
+import threading
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_support import session
 
 import agent_harness.migration as migration_module
+import agent_harness.proof as proof_module
 import agent_harness.records as records_module
 import agent_harness.storage as storage_module
 import agent_harness.sync as sync_module
-from agent_harness.config import paths
-from agent_harness.config import prepare_paths
-from agent_harness.errors import ConflictError
-from agent_harness.errors import NotFoundError
-from agent_harness.goals import create_goal
-from agent_harness.goals import make_evidence
-from agent_harness.ids import new_uuid
-from agent_harness.ids import utc_now
-from agent_harness.models import Checkpoint
-from agent_harness.models import CommandStatus
-from agent_harness.models import ProviderAttempt
-from agent_harness.orchestration import creation_digest
-from agent_harness.orchestration import normalize_creation_input
-from agent_harness.orchestration import normalize_external_ref
-from agent_harness.orchestration import normalize_turn_ref
+from agent_harness import child_gate
+from agent_harness.config import paths, prepare_paths
+from agent_harness.errors import ConflictError, NotFoundError
+from agent_harness.goals import create_goal, make_evidence
+from agent_harness.ids import new_uuid, utc_now
 from agent_harness.migration import migrate_state
+from agent_harness.models import Checkpoint, CommandStatus, ProviderAttempt
+from agent_harness.orchestration import (
+    creation_digest,
+    normalize_creation_input,
+    normalize_external_ref,
+    normalize_turn_ref,
+    normalized_digest,
+)
+from agent_harness.proof import proof_snapshot
 from agent_harness.records import load_portable_records
 from agent_harness.storage import StateStore
-from agent_harness.sync import publish_all
-from agent_harness.sync import publish_session
-from agent_harness.sync import read_sync_status
-from agent_harness.sync import sync_repository
+from agent_harness.sync import (
+    publish_all,
+    publish_session,
+    read_sync_status,
+    sync_repository,
+)
 from agent_harness.workspace import create_worktree
-from test_support import session
+
+
+def test_proof_snapshots_retain_bound_ids_and_fail_closed_at_quota(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    snapshots = []
+    for sequence in range(storage_module.PROOF_SNAPSHOT_MAX_PER_SESSION):
+        snapshots.append(
+            store.create_proof_snapshot(
+                created.session_id,
+                sequence,
+                {"sequence": sequence},
+                "digest-" + str(sequence),
+            )
+        )
+
+    first = snapshots[0]
+    assert store.proof_snapshot(first["snapshot_id"])["payload"] == {"sequence": 0}
+    with pytest.raises(ConflictError, match="retention quota"):
+        store.create_proof_snapshot(
+            created.session_id,
+            129,
+            {"sequence": 129},
+            "digest-129",
+        )
+
+    aggregate_age = datetime.datetime.now(datetime.UTC)
+    aggregate_age -= datetime.timedelta(hours=168)
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE proof_snapshots SET created_at = ? WHERE snapshot_id = ?",
+            (aggregate_age.isoformat(), first["snapshot_id"]),
+        )
+    with pytest.raises(ConflictError, match="retention quota"):
+        store.create_proof_snapshot(
+            created.session_id,
+            130,
+            {"sequence": 130},
+            "digest-130",
+        )
+    expired = datetime.datetime.now(datetime.UTC)
+    expired -= datetime.timedelta(hours=337)
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE proof_snapshots SET created_at = ? WHERE snapshot_id = ?",
+            (expired.isoformat(), first["snapshot_id"]),
+        )
+    replacement = store.create_proof_snapshot(
+        created.session_id,
+        131,
+        {"sequence": 131},
+        "digest-131",
+    )
+    assert store.proof_snapshot(replacement["snapshot_id"])["payload"] == {
+        "sequence": 131
+    }
+    with pytest.raises(NotFoundError):
+        store.proof_snapshot(first["snapshot_id"])
+    store.close()
+
+
+def test_proof_source_is_atomic_across_command_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    queued = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "bounded proof"},
+        "proof-command",
+    )
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+    store.append_event(
+        created.session_id,
+        "turn.started",
+        status="running",
+    )
+
+    source_blocked = threading.Event()
+    release_source = threading.Event()
+    original_portable_session = store.portable_session
+
+    def blocking_portable_session(
+        session_id: str,
+        *,
+        include_events: bool = True,
+    ) -> dict[str, object]:
+        source_blocked.set()
+        assert release_source.wait(timeout=2)
+        return original_portable_session(
+            session_id,
+            include_events=include_events,
+        )
+
+    monkeypatch.setattr(store, "portable_session", blocking_portable_session)
+    first: dict[str, object] = {}
+
+    def capture() -> None:
+        first.update(proof_snapshot(store, created.session_id))
+
+    proof_thread = threading.Thread(target=capture)
+    proof_thread.start()
+    assert source_blocked.wait(timeout=2)
+
+    def complete() -> None:
+        store.resolve_command(
+            queued.command_id,
+            CommandStatus.COMPLETE,
+            {"status": "complete"},
+        )
+
+    completion_thread = threading.Thread(target=complete)
+    completion_thread.start()
+    completion_thread.join(timeout=0.05)
+    assert completion_thread.is_alive()
+    release_source.set()
+    proof_thread.join(timeout=2)
+    completion_thread.join(timeout=2)
+    assert not proof_thread.is_alive()
+    assert not completion_thread.is_alive()
+
+    first_commands = first["commands"]
+    assert isinstance(first_commands, list)
+    assert first_commands[0]["status"] == CommandStatus.DISPATCHING
+    second = proof_snapshot(store, created.session_id)
+    assert second["commands"][0]["status"] == CommandStatus.COMPLETE
+    with pytest.raises(ValueError, match="after_sequence"):
+        proof_snapshot(store, created.session_id, after_sequence=-1)
+    with pytest.raises(ValueError, match="through_sequence"):
+        proof_snapshot(store, created.session_id, through_sequence=-1)
+    with pytest.raises(ValueError, match="exceeds"):
+        proof_snapshot(store, created.session_id, through_sequence=99)
+    with pytest.raises(ValueError, match="does not match"):
+        proof_snapshot(
+            store,
+            created.session_id,
+            through_sequence=99,
+            snapshot_id=str(second["snapshot_id"]),
+        )
+    other = session(tmp_path)
+    store.create_session(other)
+    with pytest.raises(ValueError, match="another session"):
+        proof_snapshot(
+            store,
+            other.session_id,
+            snapshot_id=str(second["snapshot_id"]),
+        )
+    with pytest.raises(ValueError, match="positive"):
+        store.proof_event_rows(created.session_id, 1, 0)
+    with pytest.raises(ValueError, match="positive"):
+        store.proof_source(created.session_id, None, 0)
+    assert store.completed_command_results(created.session_id) == [
+        {"status": "complete"}
+    ]
+
+    store.append_event(
+        created.session_id,
+        "agent.child.started",
+        status="running",
+        metadata={"child_id": "child-one"},
+    )
+    store.create_process_lease(
+        created.session_id,
+        "codex",
+        "unattended",
+        "2026-08-01T00:00:00+00:00",
+    )
+    store.register_worker(created.session_id, 123, "worker-one")
+    monkeypatch.setattr(proof_module, "MAX_PROOF_RECORDS", 0)
+    bounded = proof_snapshot(store, created.session_id)
+    assert {"children", "leases", "workers"}.issubset(bounded["truncated"])
+    store.close()
+
+
+def test_proof_fails_closed_on_event_sequence_gap(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    store.append_event(created.session_id, "event.one")
+    store.append_event(created.session_id, "event.two")
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            DELETE FROM events WHERE session_id = ? AND sequence = 1
+            """,
+            (created.session_id,),
+        )
+
+    with pytest.raises(ValueError, match="not contiguous"):
+        proof_snapshot(store, created.session_id)
+
+    store.close()
+
+
+def test_thousand_transition_ledger_is_complete_and_policy_storage_is_linear(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    transitions = [
+        {
+            "sequence": sequence,
+            "next_turn_ref": {
+                "step_id": "tick-" + str(sequence),
+                "agent_role": "sre",
+            },
+            "next_command_digest": normalized_digest({"sequence": sequence}),
+        }
+        for sequence in range(1, 1_001)
+    ]
+    policy = {
+        "schema": "p13i/agent-harness/dispatch-generation-transition-policy/v1",
+        "session_id": created.session_id,
+        "external_ref": {
+            "orchestrator": "p13i/machines/cs-sre",
+            "job_id": "thousand-ticks",
+        },
+        "epoch_id": "thousand-tick-epoch",
+        "allowed_agent_roles": ["sre"],
+        "allowed_step_prefixes": ["tick-"],
+        "max_transitions": 1_000,
+        "transitions": transitions,
+    }
+    policy_sha256 = normalized_digest(policy)
+    goal = create_goal(
+        created.session_id,
+        "Keep the invariant healthy for one thousand ticks.",
+        kind="invariant",
+        constraints=(
+            "dispatch-generation-transition-policy-sha256:" + policy_sha256,
+            "dispatch-generation-transition-epoch:thousand-tick-epoch",
+        ),
+    )
+    store.create_goal(goal)
+    policy_json = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+    now = utc_now()
+    with store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO dispatch_transition_policies VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                policy_sha256,
+                created.session_id,
+                goal.goal_id,
+                "thousand-tick-epoch",
+                policy["schema"],
+                policy_json,
+                now,
+            ),
+        )
+        for sequence, transition in enumerate(transitions, start=1):
+            invalidation_id = new_uuid()
+            prior_command_id = new_uuid()
+            prior_checkpoint_id = new_uuid()
+            policy_ref = {
+                "policy_sha256": policy_sha256,
+                "session_id": created.session_id,
+                "goal_id": goal.goal_id,
+                "epoch_id": "thousand-tick-epoch",
+            }
+            receipt = {
+                "session_id": created.session_id,
+                "external_ref": policy["external_ref"],
+                "goal_id": goal.goal_id,
+                "prior_command_id": prior_command_id,
+                "prior_command_type": "message",
+                "prior_anchor_kind": "provider-result",
+                "prior_reconciliation_id": "",
+                "prior_reconciliation_resolution": "",
+                "prior_checkpoint_id": prior_checkpoint_id,
+                "prior_generation_digest": normalized_digest({"generation": sequence}),
+                "prior_material_digest": normalized_digest({"material": sequence}),
+                "next_turn_ref": transition["next_turn_ref"],
+                "transition_sequence": sequence,
+                "epoch_id": "thousand-tick-epoch",
+                "policy_sha256": policy_sha256,
+                "next_command_digest": transition["next_command_digest"],
+            }
+            stored_authorization = {
+                "schema": (
+                    "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+                ),
+                **receipt,
+                "reason": "Advance the bounded invariant tick.",
+                "external_orchestrator": "p13i/machines/cs-sre",
+                "external_job_id": "thousand-ticks",
+                "policy_ref": policy_ref,
+                "receipt": receipt,
+                "receipt_sha256": normalized_digest(receipt),
+            }
+            request_authorization = stored_authorization
+            if sequence == 1:
+                request_authorization = dict(stored_authorization)
+                request_authorization.pop("policy_ref")
+                request_authorization["policy"] = policy
+            authorization_digest = normalized_digest(request_authorization)
+            request_digest = normalized_digest(
+                {"sequence": sequence, "authorization": request_authorization}
+            )
+            connection.execute(
+                "INSERT INTO dispatch_invalidations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    invalidation_id,
+                    created.session_id,
+                    "Advance the bounded invariant tick.",
+                    authorization_digest,
+                    request_digest,
+                    "tick-" + str(sequence),
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO authorization_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    authorization_digest,
+                    created.session_id,
+                    "dispatch-invalidation",
+                    invalidation_id,
+                    stored_authorization["schema"],
+                    stored_authorization["receipt_sha256"],
+                    json.dumps(
+                        stored_authorization,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dispatch_transition_ledger VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    invalidation_id,
+                    created.session_id,
+                    goal.goal_id,
+                    "thousand-tick-epoch",
+                    sequence,
+                    policy_sha256,
+                    authorization_digest,
+                    stored_authorization["receipt_sha256"],
+                    request_digest,
+                    prior_command_id,
+                    "message",
+                    "provider-result",
+                    "",
+                    "",
+                    prior_checkpoint_id,
+                    receipt["prior_generation_digest"],
+                    receipt["prior_material_digest"],
+                    json.dumps(
+                        transition["next_turn_ref"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    transition["next_command_digest"],
+                    "authorized",
+                    "",
+                    "",
+                    now,
+                    now,
+                ),
+            )
+    proof = proof_snapshot(store, created.session_id)
+    ledger = proof["dispatch_transition_ledger"]
+    assert proof["complete"] is True
+    assert proof["truncated"] == []
+    assert proof["authorization_receipts"] == []
+    assert proof["dispatch_invalidations"] == []
+    assert ledger["complete"] is True
+    assert ledger["policy_count"] == 1
+    assert ledger["receipt_count"] == 1_000
+    assert len(ledger["receipts"]) == 1_000
+    with store._lock:
+        receipt_rows = store._connection.execute(
+            "SELECT payload_json FROM authorization_receipts"
+        ).fetchall()
+    assert (
+        sum(str(row["payload_json"]).count('"transitions"') for row in receipt_rows)
+        == 0
+    )
+    assert sum(len(str(row["payload_json"])) for row in receipt_rows) < 3_000_000
+    tampered_policy = copy.deepcopy(policy)
+    tampered_policy["transitions"][499]["next_command_digest"] = "bad"
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE dispatch_transition_policies SET payload_json = ?
+            WHERE policy_sha256 = ?
+            """,
+            (
+                json.dumps(
+                    tampered_policy,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                policy_sha256,
+            ),
+        )
+    tampered_proof = proof_snapshot(store, created.session_id)
+    assert tampered_proof["complete"] is False
+    assert "dispatch_transition_ledger" in tampered_proof["truncated"]
+    assert tampered_proof["dispatch_transition_ledger"]["complete"] is False
+    store.close()
 
 
 def test_migration_copy_helpers_cover_conflicts_and_links(
@@ -167,9 +585,7 @@ def test_migration_source_and_preserved_session_validation(
         },
     }
     expected = copy.deepcopy(record)
-    expected["tables"]["sessions"][0]["worktree"] = str(
-        destination / "one"
-    )
+    expected["tables"]["sessions"][0]["worktree"] = str(destination / "one")
     store.values["one"] = expected
     migration_module._verify_source_sessions(
         store,  # type: ignore[arg-type]
@@ -204,12 +620,8 @@ def test_migration_process_and_pid_boundaries(
             "invalid\n"
             "abc " + str(root) + " agent-harness daemon\n"
             "12 unrelated\n"
-            "13 "
-            + str(root)
-            + " unrelated\n"
-            "14 "
-            + str(root)
-            + " agent-harness daemon\n"
+            "13 " + str(root) + " unrelated\n"
+            "14 " + str(root) + " agent-harness daemon\n"
         ),
         stderr="",
     )
@@ -445,9 +857,7 @@ def test_migration_backup_and_worktree_failure_boundaries(
     original = source.worktrees / "rollback"
     relocated = destination.worktrees / "rollback"
     original.mkdir()
-    migration_module._rollback_worktrees(
-        [(original, relocated, tmp_path)]
-    )
+    migration_module._rollback_worktrees([(original, relocated, tmp_path)])
 
 
 def test_migration_portable_round_trip_detects_drift(
@@ -510,9 +920,7 @@ def test_migration_portable_round_trip_detects_drift(
             SourceStore(),  # type: ignore[arg-type]
         )
 
-    RestoredStore.portable_session = (
-        lambda self, session_id: {"source": True}
-    )
+    RestoredStore.portable_session = lambda self, session_id: {"source": True}
     SourceStore.global_value = {"source": True}
     with pytest.raises(RuntimeError, match="global state"):
         migration_module._verify_portable_round_trip(
@@ -599,7 +1007,71 @@ def test_store_missing_state_paths_fail_closed(tmp_path: Path) -> None:
         store.close()
 
 
-def test_schema_v3_migrates_external_and_turn_columns(
+def test_xhigh_authorization_parks_and_requeues_one_exact_command(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {
+            "text": "one exact attempt",
+            "provider": "codex",
+            "effort": "xhigh",
+        },
+        "xhigh-command",
+    )
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+    assert store.xhigh_authorization_or_park(command.command_id) is None
+    assert store.get_command(command.command_id).status == (
+        CommandStatus.AWAITING_XHIGH_AUTHORIZATION
+    )
+
+    with pytest.raises(ConflictError, match="provider changed"):
+        store.create_xhigh_authorization(
+            created.session_id,
+            command.command_id,
+            "claude",
+            authorization_request_digest="a" * 64,
+            idempotency_key="wrong-provider",
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+    authorization = store.create_xhigh_authorization(
+        created.session_id,
+        command.command_id,
+        "codex",
+        authorization_request_digest="b" * 64,
+        idempotency_key="exact-authorization",
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    assert store.get_command(command.command_id).status == CommandStatus.QUEUED
+    assert store.xhigh_authorization_or_park(command.command_id) == authorization
+    replay = store.create_xhigh_authorization(
+        created.session_id,
+        command.command_id,
+        "codex",
+        authorization_request_digest="b" * 64,
+        idempotency_key="exact-authorization",
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    assert replay == authorization
+    with pytest.raises(ConflictError, match="already has"):
+        store.create_xhigh_authorization(
+            created.session_id,
+            command.command_id,
+            "codex",
+            authorization_request_digest="c" * 64,
+            idempotency_key="second-authorization",
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+    store.close()
+
+
+def test_schema_v4_migrates_external_and_turn_columns(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "state.sqlite3"
@@ -652,20 +1124,17 @@ def test_schema_v3_migrates_external_and_turn_columns(
 
     store = StateStore(database)
 
-    assert store._connection.execute(
-        "SELECT version FROM schema_meta"
-    ).fetchone()["version"] == 3
+    assert (
+        store._connection.execute("SELECT version FROM schema_meta").fetchone()[
+            "version"
+        ]
+        == 4
+    )
     session_columns = {
-        row["name"]
-        for row in store._connection.execute(
-            "PRAGMA table_info(sessions)"
-        )
+        row["name"] for row in store._connection.execute("PRAGMA table_info(sessions)")
     }
     command_columns = {
-        row["name"]
-        for row in store._connection.execute(
-            "PRAGMA table_info(commands)"
-        )
+        row["name"] for row in store._connection.execute("PRAGMA table_info(commands)")
     }
     assert {
         "external_orchestrator",
@@ -674,6 +1143,43 @@ def test_schema_v3_migrates_external_and_turn_columns(
     } <= session_columns
     assert {"turn_step_id", "turn_agent_role"} <= command_columns
     store.close()
+
+
+def test_schema_v4_migrates_v3_and_forces_rollback_rejection(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = StateStore(database)
+    store._connection.execute("UPDATE schema_meta SET version = 3")
+    store.close()
+
+    upgraded = StateStore(database)
+    version = upgraded._connection.execute(
+        "SELECT version FROM schema_meta"
+    ).fetchone()["version"]
+    assert version == 4
+    durable_tables = {
+        str(row["name"])
+        for row in upgraded._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert {
+        "authorization_receipts",
+        "dispatch_transition_ledger",
+        "goal_contract_adoptions",
+        "xhigh_authorization_receipts",
+    } <= durable_tables
+    upgraded.close()
+
+    legacy = sqlite3.connect(database)
+    try:
+        legacy_version = legacy.execute("SELECT version FROM schema_meta").fetchone()[0]
+        with pytest.raises(RuntimeError, match="unsupported database schema"):
+            if legacy_version != 3:
+                raise RuntimeError("unsupported database schema version")
+    finally:
+        legacy.close()
 
 
 def test_external_reference_creation_lookup_fork_and_conflicts(
@@ -711,22 +1217,32 @@ def test_external_reference_creation_lookup_fork_and_conflicts(
     assert was_created
     assert not replay_created
     assert replay.session_id == first.session_id
-    assert store.existing_ensured_session(
-        creation_input,
-        idempotency_key="create-job-42",
-    ) == first
-    assert store.existing_ensured_session(
-        creation_input,
-        external_ref=external_ref,
-    ) == first
-    assert store.existing_ensured_session(
-        {"name": "new", "workspace": str(tmp_path)}
-    ) is None
+    assert (
+        store.existing_ensured_session(
+            creation_input,
+            idempotency_key="create-job-42",
+        )
+        == first
+    )
+    assert (
+        store.existing_ensured_session(
+            creation_input,
+            external_ref=external_ref,
+        )
+        == first
+    )
+    assert (
+        store.existing_ensured_session({"name": "new", "workspace": str(tmp_path)})
+        is None
+    )
     assert by_reference == first
-    assert store.find_session_by_external_ref(
-        "p13i/machines",
-        "job-42",
-    ) == first
+    assert (
+        store.find_session_by_external_ref(
+            "p13i/machines",
+            "job-42",
+        )
+        == first
+    )
     assert store.list_sessions(external_ref=external_ref) == [first]
     with pytest.raises(ValueError):
         store.list_sessions(external_ref={})
@@ -783,26 +1299,21 @@ def test_orchestration_normalization_and_turn_reference(
     with pytest.raises(ValueError):
         normalize_external_ref({"orchestrator": "only"})
     with pytest.raises(ValueError):
-        normalize_external_ref(
-            {"orchestrator": "has space", "job_id": "job"}
-        )
+        normalize_external_ref({"orchestrator": "has space", "job_id": "job"})
     with pytest.raises(ValueError):
-        normalize_external_ref(
-            {"orchestrator": "x" * 129, "job_id": "job"}
-        )
+        normalize_external_ref({"orchestrator": "x" * 129, "job_id": "job"})
     with pytest.raises(ValueError):
         normalize_turn_ref({"step_id": "only"})
     with pytest.raises(ValueError):
         normalize_turn_ref("not-an-object")
     with pytest.raises(ValueError):
         normalize_turn_ref({"step_id": 1, "agent_role": "reviewer"})
-    assert normalize_turn_ref(
-        {"step_id": "step", "agent_role": "x" * 128}
-    )["agent_role"] == "x" * 128
+    assert (
+        normalize_turn_ref({"step_id": "step", "agent_role": "x" * 128})["agent_role"]
+        == "x" * 128
+    )
     with pytest.raises(ValueError):
-        normalize_turn_ref(
-            {"step_id": "step", "agent_role": "x" * 129}
-        )
+        normalize_turn_ref({"step_id": "step", "agent_role": "x" * 129})
     with pytest.raises(ValueError):
         normalize_creation_input({"routing": "automatic"})
     with pytest.raises(ValueError):
@@ -810,9 +1321,7 @@ def test_orchestration_normalization_and_turn_reference(
     with pytest.raises(ValueError):
         creation_digest({"goal": {"unsupported": object()}})
     with pytest.raises(ValueError):
-        normalize_external_ref(
-            {"orchestrator": "control\0", "job_id": "job"}
-        )
+        normalize_external_ref({"orchestrator": "control\0", "job_id": "job"})
     normalized = normalize_creation_input(
         {
             "routing": {"providers": ["codex", "claude"]},
@@ -894,9 +1403,47 @@ def test_safety_envelope_guard_and_lease_are_durable(
         "unattended",
         {"max_seconds": 900},
     )
+    child_gate_state = store.create_child_launch_gate(
+        command.command_id,
+        created.session_id,
+        2,
+    )
 
     assert safety["profile"] == "unattended"
     assert envelope["state"] == "reserved"
+    assert envelope["consumption"]["child_agents"] == 0
+    assert envelope["consumption"]["dollars"] == 0.0
+    assert envelope["consumption"]["exact_dollars"] is False
+    assert child_gate_state["permit_limit"] == 2
+    assert child_gate_state["consumed"] == 0
+    assert (
+        store.create_child_launch_gate(
+            command.command_id,
+            created.session_id,
+            2,
+        )
+        == child_gate_state
+    )
+    with pytest.raises(ValueError, match="must not be negative"):
+        store.create_child_launch_gate(
+            command.command_id,
+            created.session_id,
+            -1,
+        )
+    with pytest.raises(ConflictError, match="permit limit changed"):
+        store.create_child_launch_gate(
+            command.command_id,
+            created.session_id,
+            3,
+        )
+    with pytest.raises(ConflictError, match="session changed"):
+        store.create_child_launch_gate(
+            command.command_id,
+            "other-session",
+            2,
+        )
+    with pytest.raises(NotFoundError):
+        store.child_launch_gate("missing")
     updated = store.update_command_envelope(
         command.command_id,
         provider="claude",
@@ -913,9 +1460,7 @@ def test_safety_envelope_guard_and_lease_are_durable(
         "downgrade",
         {"consumption": {"tool_calls": 3}},
     )
-    assert store.guard_incidents(created.session_id)[0][
-        "incident_id"
-    ] == incident_id
+    assert store.guard_incidents(created.session_id)[0]["incident_id"] == incident_id
 
     lease = store.create_process_lease(
         created.session_id,
@@ -953,6 +1498,322 @@ def test_safety_envelope_guard_and_lease_are_durable(
         "request-digest",
     )
     assert replay == receipt
+    store.close()
+
+
+@pytest.mark.parametrize("same_provider", [True, False])
+def test_route_admission_is_atomic_across_store_connections(
+    tmp_path: Path,
+    same_provider: bool,
+) -> None:
+    database = tmp_path / "route-admission.sqlite3"
+    store = StateStore(database)
+    created = session(tmp_path)
+    store.create_session(created)
+    goal = create_goal(
+        created.session_id,
+        "Admit only one command.",
+        max_concurrency=1,
+    )
+    store.create_goal(goal)
+    commands = []
+    for index in range(2):
+        command = store.enqueue_command(
+            created.session_id,
+            "message",
+            {"text": "command " + str(index)},
+            "route-" + str(index),
+        )
+        store.create_command_envelope(
+            command.command_id,
+            created.session_id,
+            "unattended",
+            {"max_attempts": 1},
+        )
+        commands.append(command)
+    store.register_worker(created.session_id, 123, "reservation-worker")
+    store.close()
+    barrier = threading.Barrier(3)
+    results: list[dict[str, object]] = []
+    failures: list[BaseException] = []
+
+    def reserve(index: int) -> None:
+        connection = StateStore(database)
+        provider = "claude"
+        if not same_provider and index == 1:
+            provider = "codex"
+        barrier.wait()
+        try:
+            results.append(
+                connection.reserve_route_admission(
+                    commands[index].command_id,
+                    provider,
+                    "unattended",
+                    worker_incarnation="reservation-worker",
+                    goal_id=goal.goal_id,
+                    max_concurrency=1,
+                    lease_expires_at="2099-01-01T00:00:00+00:00",
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=reserve, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert sum(bool(item["admitted"]) for item in results) == 1
+    recovered = StateStore(database)
+    assert len(recovered.active_process_leases()) == 1
+    assert recovered.active_goal_command_count(goal.goal_id) == 1
+    if same_provider:
+        assert recovered.active_unattended_provider_count("claude") == 1
+    recovered.close()
+
+
+def test_worker_replacement_after_atomic_boundary_requires_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "incarnation-boundary.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "Cross one provider boundary."},
+        "incarnation-boundary",
+    )
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="codex",
+        native_session_id="",
+        model="default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    store.create_attempt(attempt)
+    turn_id = store.start_turn(created.session_id, attempt.attempt_id)
+    checkpoint = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=store.last_sequence(created.session_id),
+        provider="codex",
+        native_session_id="",
+        base_commit="base",
+        patch_digest="patch",
+        untracked_digest="untracked",
+        context_digest="context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(checkpoint)
+    store.record_dispatch_checkpoint(
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        checkpoint.checkpoint_id,
+    )
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        {"max_attempts": 1},
+    )
+    store.register_worker(created.session_id, 123, "old-incarnation")
+
+    admission = store.reserve_route_admission(
+        command.command_id,
+        "codex",
+        "unattended",
+        effort="high",
+        attempt_id=attempt.attempt_id,
+        worker_incarnation="old-incarnation",
+        goal_id="",
+        max_concurrency=1,
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+    )
+    assert admission["admitted"] is True
+
+    store.register_worker(created.session_id, 456, "new-incarnation")
+    recovery = store.recover_interrupted_commands(
+        created.session_id,
+        "current-workspace-digest",
+        "current workspace",
+    )
+
+    assert recovery.requeued_command_ids == ()
+    assert len(recovery.reconciliations) == 1
+    assert recovery.reconciliations[0].command_id == command.command_id
+    interrupted = store.get_command(command.command_id)
+    assert interrupted.status == CommandStatus.FAILED
+    assert interrupted.result["code"] == "E_NEEDS_RECONCILIATION"
+    store.close()
+
+
+def test_dispatch_transition_anchor_projects_fail_closed_reasons(
+    tmp_path: Path,
+) -> None:
+    missing_workspace = tmp_path / "missing-anchor-workspace"
+    _workspace_repository(missing_workspace)
+    missing_store = StateStore(tmp_path / "missing-anchor.sqlite3")
+    missing = session(missing_workspace)
+    missing_store.create_session(missing)
+    anchor = missing_store.dispatch_transition_anchor(missing.session_id)
+    assert anchor["eligible"] is False
+    assert anchor["reason"] == "missing-goal-epoch"
+    missing_store.create_goal(
+        create_goal(
+            missing.session_id,
+            "Require an external transition owner.",
+            constraints=("dispatch-generation-transition-epoch:test-epoch",),
+        )
+    )
+    anchor = missing_store.dispatch_transition_anchor(missing.session_id)
+    assert anchor["reason"] == "missing-external-reference"
+    missing_store.close()
+
+    workspace = tmp_path / "anchor-workspace"
+    _workspace_repository(workspace)
+    store = StateStore(tmp_path / "anchor.sqlite3")
+    created = replace(
+        session(workspace),
+        external_ref={"orchestrator": "machines", "job_id": "anchor"},
+    )
+    store.create_session(created)
+    store.create_goal(
+        create_goal(
+            created.session_id,
+            "Expose only a quiescent eligible anchor.",
+            constraints=("dispatch-generation-transition-epoch:test-epoch",),
+        )
+    )
+    assert store.dispatch_transition_anchor(created.session_id)["reason"] == (
+        "missing-prior-command"
+    )
+    store.update_session(created.session_id, attention="working")
+    assert store.dispatch_transition_anchor(created.session_id)["reason"] == (
+        "session-is-working"
+    )
+    store.update_session(created.session_id, attention="idle")
+    command = store.enqueue_command(
+        created.session_id,
+        "unsupported-control",
+        {},
+        "unsupported-anchor",
+    )
+    assert store.dispatch_transition_anchor(created.session_id)["reason"] == (
+        "active-command"
+    )
+    store.resolve_command(command.command_id, CommandStatus.COMPLETE, {})
+    assert store.dispatch_transition_anchor(created.session_id)["reason"] == (
+        "missing-certified-checkpoint"
+    )
+    checkpoint = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=store.last_sequence(created.session_id),
+        provider="codex",
+        native_session_id="",
+        base_commit=_git(workspace, "rev-parse", "HEAD"),
+        patch_digest="patch",
+        untracked_digest="untracked",
+        context_digest="context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(checkpoint)
+    anchor = store.dispatch_transition_anchor(created.session_id)
+    assert anchor["eligible"] is False
+    assert anchor["reason"] == ("dispatch transition prior command is not eligible")
+    store.close()
+
+
+def test_idempotent_mutation_serializes_and_rolls_back_nested_state(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    barrier = threading.Barrier(3)
+    callback_lock = threading.Lock()
+    callback_count = 0
+    results: list[dict[str, object]] = []
+    failures: list[BaseException] = []
+
+    def mutate() -> dict[str, object]:
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+        lease = store.create_process_lease(
+            "",
+            "codex",
+            "unattended",
+            "2099-01-01T00:00:00+00:00",
+        )
+        return {"lease": lease}
+
+    def call() -> None:
+        barrier.wait()
+        try:
+            results.append(
+                store.idempotent_mutation(
+                    "concurrent-key",
+                    "lease-create",
+                    "request-digest",
+                    mutate,
+                    201,
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert callback_count == 1
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert len(store.active_process_leases()) == 1
+
+    def failing_mutation() -> dict[str, object]:
+        store.create_process_lease(
+            "",
+            "claude",
+            "unattended",
+            "2099-01-01T00:00:00+00:00",
+        )
+        raise RuntimeError("simulated response construction failure")
+
+    with pytest.raises(RuntimeError, match="simulated response"):
+        store.idempotent_mutation(
+            "rollback-key",
+            "lease-create",
+            "rollback-digest",
+            failing_mutation,
+            201,
+        )
+    assert len(store.active_process_leases()) == 1
+    assert (
+        store.mutation_receipt(
+            "rollback-key",
+            "lease-create",
+            "rollback-digest",
+        )
+        is None
+    )
     store.close()
 
 
@@ -1084,10 +1945,13 @@ def test_dispatch_recovery_requeues_before_boundary_and_barriers_after(
         {},
         "control",
     )
-    assert store.claim_command(
-        created.session_id,
-        frozenset({"stop"}),
-    ).command_id == control.command_id
+    assert (
+        store.claim_command(
+            created.session_id,
+            frozenset({"stop"}),
+        ).command_id
+        == control.command_id
+    )
     assert store.get_command(queued.command_id).status == CommandStatus.QUEUED
     with pytest.raises(ConflictError):
         store.resolve_reconciliation_record(
@@ -1114,11 +1978,14 @@ def test_dispatch_recovery_requeues_before_boundary_and_barriers_after(
         "digest-current",
     )
     assert resolving.status == "resolving"
-    assert store.begin_reconciliation_resolution(
-        record.reconciliation_id,
-        "stop",
-        "digest-current",
-    ) == resolving
+    assert (
+        store.begin_reconciliation_resolution(
+            record.reconciliation_id,
+            "stop",
+            "digest-current",
+        )
+        == resolving
+    )
     with pytest.raises(ConflictError):
         store.begin_reconciliation_resolution(
             record.reconciliation_id,
@@ -1139,12 +2006,15 @@ def test_dispatch_recovery_requeues_before_boundary_and_barriers_after(
         {"actor": "test"},
     )
     assert resolved.status == "resolved"
-    assert store.resolve_reconciliation_record(
-        record.reconciliation_id,
-        "stop",
-        "digest-current",
-        {"actor": "ignored-replay"},
-    ) == resolved
+    assert (
+        store.resolve_reconciliation_record(
+            record.reconciliation_id,
+            "stop",
+            "digest-current",
+            {"actor": "ignored-replay"},
+        )
+        == resolved
+    )
     with pytest.raises(ConflictError):
         store.resolve_reconciliation_record(
             record.reconciliation_id,
@@ -1203,9 +2073,7 @@ def test_session_export_import_preserves_resumable_state(
         predicates=({"type": "test", "outcome": "passed"},),
     )
     source.create_goal(goal)
-    source.add_evidence(
-        make_evidence(goal.goal_id, "test", "unit", "passed")
-    )
+    source.add_evidence(make_evidence(goal.goal_id, "test", "unit", "passed"))
     checkpoint = Checkpoint(
         checkpoint_id=new_uuid(),
         session_id=created.session_id,
@@ -1241,16 +2109,15 @@ def test_session_export_import_preserves_resumable_state(
     assert imported.lifecycle == "paused"
     assert imported.owner_host == "restored-host"
     assert destination.attempts(created.session_id) == [attempt]
-    assert destination.all_events(created.session_id)[0].text == (
-        "durable response"
-    )
+    assert destination.all_events(created.session_id)[0].text == ("durable response")
     assert destination.goal_for_session(created.session_id) is not None
     assert destination.evidence(goal.goal_id)[0].subject == "unit"
     assert destination.checkpoints(created.session_id) == [checkpoint]
     safety = destination.session_safety(created.session_id)
     assert safety["profile"] == "unattended"
-    assert safety["xhigh_authorizations"] == 1
+    assert safety["xhigh_authorizations"] == 0
     assert safety["extensions"]["max_seconds"] == 120
+    assert "allow_xhigh_once" not in safety["extensions"]
     with pytest.raises(ConflictError):
         destination.import_session(
             payload,
@@ -1322,9 +2189,7 @@ def test_registry_worker_ui_and_failure_paths(tmp_path: Path) -> None:
         approval_id,
         {"decision": "approve"},
     )
-    assert store.approval(approval_id)["decision"] == {
-        "decision": "approve"
-    }
+    assert store.approval(approval_id)["decision"] == {"decision": "approve"}
     with pytest.raises(NotFoundError):
         store.approval("missing")
 
@@ -1379,6 +2244,29 @@ def test_portable_records_round_trip_complete_state(
         {"theme": "system"},
     )
     source.set_ui_state("workspace", {"sidebar_width": "40"})
+    command = source.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "retain the child launch gate"},
+        "portable-child-gate",
+    )
+    source.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        {"max_child_agents": 1},
+    )
+    source.create_child_launch_gate(
+        command.command_id,
+        created.session_id,
+        1,
+    )
+    assert child_gate.admit(
+        source.path,
+        command.command_id,
+        1,
+        "codex:Agent:portable",
+    )
 
     publish = publish_all(harness_paths, source)
 
@@ -1505,11 +2393,7 @@ def test_portable_records_reject_missing_blobs_and_bad_documents(
         clean_session.session_id,
     )
     assert pending_sync["detail"] == "repository-synchronization"
-    record_path = (
-        clean_paths.sessions
-        / clean_session.session_id
-        / "record.gpt.json"
-    )
+    record_path = clean_paths.sessions / clean_session.session_id / "record.gpt.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
     record["schema"] = "unsupported"
     record_path.write_text(json.dumps(record), encoding="utf-8")
@@ -1519,6 +2403,59 @@ def test_portable_records_reject_missing_blobs_and_bad_documents(
     with pytest.raises(ValueError, match="JSON object"):
         records_module._read_json(record_path)
     clean.close()
+
+
+def test_context_delivery_survives_restart_and_blocks_ambiguous_resend(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "context-state.sqlite3"
+    store = StateStore(database)
+    created = session(tmp_path)
+    store.create_session(created)
+    prepared = store.prepare_context_delivery(
+        created.session_id,
+        "codex",
+        "context-a",
+        "checkpoint-a",
+        "command-a",
+        "attempt-a",
+        "payload-a",
+    )
+    assert prepared["state"] == "prepared"
+    assert prepared["accepted_at"] == ""
+    retried = store.prepare_context_delivery(
+        created.session_id,
+        "codex",
+        "context-b",
+        "checkpoint-b",
+        "command-a",
+        "attempt-b",
+        "payload-b",
+    )
+    assert retried["state"] == "prepared"
+    assert retried["attempt_id"] == "attempt-b"
+    store.close()
+
+    recovered = StateStore(database)
+    delivered = recovered.accept_context_delivery(
+        created.session_id,
+        "codex",
+        "context-b",
+        "attempt-b",
+    )
+    assert delivered["state"] == "delivered"
+    assert delivered["accepted_at"]
+    with pytest.raises(ConflictError, match="prior context delivery"):
+        recovered.prepare_context_delivery(
+            created.session_id,
+            "codex",
+            "context-c",
+            "checkpoint-c",
+            "command-a",
+            "attempt-c",
+            "payload-c",
+        )
+    recovered.close()
 
 
 def test_portable_record_validation_boundaries(
@@ -1557,9 +2494,7 @@ def test_portable_record_validation_boundaries(
 
     harness_paths = paths(tmp_path / "state")
     prepare_paths(harness_paths)
-    (harness_paths.state_dir / "global.gpt.json").write_text(
-        '{"schema":"invalid"}'
-    )
+    (harness_paths.state_dir / "global.gpt.json").write_text('{"schema":"invalid"}')
     with pytest.raises(ValueError, match="global"):
         load_portable_records(harness_paths)
 
@@ -1673,10 +2608,13 @@ def test_sync_locked_failure_stages(
     assert run_case([0, 0, 1, 1], attempts=2)["detail"] == "git-fetch"
     conflict = run_case([0, 0, 0, 1, 0])
     assert conflict["state"] == "conflict"
-    assert run_case(
-        [0, 0, 0, 0, 1, 0, 0, 1],
-        attempts=2,
-    )["detail"] == "git-push"
+    assert (
+        run_case(
+            [0, 0, 0, 0, 1, 0, 0, 1],
+            attempts=2,
+        )["detail"]
+        == "git-push"
+    )
 
 
 def test_sync_repository_and_git_error_boundaries(
@@ -1771,18 +2709,11 @@ def test_git_sync_commits_and_pushes_portable_records(
 
     assert result["state"] == "synced"
     assert read_sync_status(harness_paths)["pending"] is False
-    assert (
-        chat_root
-        / "sessions"
-        / created.session_id
-        / "record.gpt.json"
-    ).is_file()
+    assert (chat_root / "sessions" / created.session_id / "record.gpt.json").is_file()
     remote_record = _git(
         remote,
         "show",
-        "main:sessions/"
-        + created.session_id
-        + "/transcript.gpt.md",
+        "main:sessions/" + created.session_id + "/transcript.gpt.md",
     )
     assert "durable" in remote_record
     store.close()
@@ -1828,9 +2759,7 @@ def test_legacy_migration_preserves_resume_state_and_git_worktree(
         text="preserve destination state",
     )
     existing = existing_store.get_session(existing.session_id)
-    assert publish_all(destination_paths, existing_store)["state"] == (
-        "synced"
-    )
+    assert publish_all(destination_paths, existing_store)["state"] == ("synced")
     existing_store.close()
 
     trash_path = tmp_path / "trashed-source"
@@ -1853,9 +2782,7 @@ def test_legacy_migration_preserves_resume_state_and_git_worktree(
     destination_store = StateStore(destination_paths.database)
     migrated = destination_store.get_session(created.session_id)
     assert migrated.session_id == created.session_id
-    assert migrated.worktree == str(
-        destination_paths.worktrees / created.session_id
-    )
+    assert migrated.worktree == str(destination_paths.worktrees / created.session_id)
     assert destination_store.all_events(created.session_id)[0].text == (
         "resume after migration"
     )
@@ -1940,9 +2867,7 @@ def test_failed_migration_restores_worktree_and_remains_retryable(
         role="assistant",
         text="keep on rollback",
     )
-    assert publish_all(destination_paths, destination_store)["state"] == (
-        "synced"
-    )
+    assert publish_all(destination_paths, destination_store)["state"] == ("synced")
     destination_store.close()
     monkeypatch.setattr(
         migration_module,
@@ -1969,9 +2894,7 @@ def test_failed_migration_restores_worktree_and_remains_retryable(
     )
     restored_destination.close()
     retry_store = StateStore(source_root / "state.sqlite3")
-    assert retry_store.get_session(created.session_id).worktree == str(
-        worktree
-    )
+    assert retry_store.get_session(created.session_id).worktree == str(worktree)
     retry_store.close()
 
 

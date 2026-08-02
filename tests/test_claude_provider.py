@@ -1,16 +1,22 @@
-from claude_agent_sdk import AssistantMessage
-from claude_agent_sdk import ClaudeAgentOptions
-from claude_agent_sdk import PermissionResultAllow
-from claude_agent_sdk import PermissionResultDeny
-from claude_agent_sdk import TextBlock
-from claude_agent_sdk import ToolPermissionContext
+import sys
 
-from agent_harness.providers.claude import CLAUDE_CODE_PACKAGE
-from agent_harness.providers.claude import NpxClaudeTransport
-from agent_harness.providers.claude import _approval_request
-from agent_harness.providers.claude import _message_exhausted
-from agent_harness.providers.claude import _message_events
-from agent_harness.providers.claude import _permission_result
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    TextBlock,
+    ToolPermissionContext,
+)
+
+from agent_harness.providers.claude import (
+    CLAUDE_CODE_PACKAGE,
+    NpxClaudeTransport,
+    _approval_request,
+    _message_events,
+    _message_exhausted,
+    _permission_result,
+)
 
 
 async def _empty_prompt():
@@ -28,7 +34,14 @@ def test_npx_transport_pins_claude_code_package() -> None:
 
     command = transport._build_command()
 
-    assert command[:2] == ["/usr/bin/npx", CLAUDE_CODE_PACKAGE]
+    assert command[:5] == [
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        "import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])",
+    ]
+    assert command[5:7] == ["/usr/bin/npx", CLAUDE_CODE_PACKAGE]
     assert "--input-format" in command
     assert "stream-json" in command
 

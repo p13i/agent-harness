@@ -1,7 +1,9 @@
-from agent_harness.providers.normalize import claude_payload
-from agent_harness.providers.normalize import codex_notification
-from agent_harness.providers.normalize import payload_text
-from agent_harness.providers.normalize import sanitize
+from agent_harness.providers.normalize import (
+    claude_payload,
+    codex_notification,
+    payload_text,
+    sanitize,
+)
 
 
 def test_codex_agent_message_normalizes() -> None:
@@ -90,8 +92,47 @@ def test_codex_protocol_surface_normalizes() -> None:
             "file.change.completed",
         ),
         (
+            "item/started",
+            {
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "child-1",
+                    "receiverThreadIds": ["thread-2"],
+                    "status": "running",
+                }
+            },
+            "agent.child.started",
+        ),
+        (
             "item/completed",
-            {"item": {"type": "reasoning", "content": "summary"}},
+            {"item": {"type": "subagent", "id": "child-1"}},
+            "agent.child.completed",
+        ),
+        (
+            "item/completed",
+            {
+                "item": {
+                    "type": "collab_agent_tool_call",
+                    "id": "child-2",
+                    "status": "failed",
+                }
+            },
+            "agent.child.failed",
+        ),
+        (
+            "item/completed",
+            {
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "child-3",
+                    "status": "cancelled",
+                }
+            },
+            "agent.child.cancelled",
+        ),
+        (
+            "item/completed",
+            {"item": {"type": "reasoning", "summary": "summary"}},
             "reasoning.summary.completed",
         ),
         (
@@ -120,11 +161,6 @@ def test_codex_protocol_surface_normalizes() -> None:
             "reasoning.summary.delta",
         ),
         (
-            "item/reasoning/textDelta",
-            {"delta": "reason", "itemId": "item-1"},
-            "reasoning.summary.delta",
-        ),
-        (
             "thread/tokenUsage/updated",
             {"tokenUsage": {"totalTokens": 12}},
             "usage.updated",
@@ -142,21 +178,42 @@ def test_codex_protocol_surface_normalizes() -> None:
         assert events[0].event_type == expected
 
     assert (
-        codex_notification("thread/started", {"thread": None})[
-            0
-        ].native_session_id
-        == ""
+        codex_notification(
+            "item/reasoning/textDelta",
+            {"delta": "hidden", "itemId": "item-1"},
+        )
+        == []
     )
     assert (
-        codex_notification("turn/started", {"turn": None})[
-            0
-        ].native_turn_id
+        codex_notification(
+            "item/completed",
+            {"item": {"type": "reasoning", "content": "hidden"}},
+        )
+        == []
+    )
+
+    assert (
+        codex_notification("thread/started", {"thread": None})[0].native_session_id
         == ""
     )
-    assert codex_notification(
-        "item/completed",
-        {"item": {"type": "agent_message", "text": ""}},
-    ) == []
+    assert codex_notification("turn/started", {"turn": None})[0].native_turn_id == ""
+    assert (
+        codex_notification(
+            "item/completed",
+            {"item": {"type": "agent_message", "text": ""}},
+        )
+        == []
+    )
+    child = codex_notification(
+        "item/started",
+        {
+            "item": {
+                "type": "collab_agent_tool_call",
+                "receiver_thread_ids": ["thread-2"],
+            }
+        },
+    )[0]
+    assert child.metadata == {"receiver_thread_ids": ["thread-2"]}
 
 
 def test_claude_protocol_surface_normalizes() -> None:
@@ -190,30 +247,36 @@ def test_claude_protocol_surface_normalizes() -> None:
             None,
         ]
     }
-    assistant = claude_payload(
-        {"type": "assistant", "message": message}
-    )
+    assistant = claude_payload({"type": "assistant", "message": message})
     assert [event.event_type for event in assistant] == [
         "agent.message",
         "tool.started",
         "tool.completed",
     ]
+    for tool_name in ("Agent", "Task", "spawn_agent"):
+        child = claude_payload(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "child-tool",
+                            "name": tool_name,
+                            "input": {"description": "Inspect"},
+                        }
+                    ]
+                },
+            }
+        )
+        assert child[0].event_type == "agent.child.started"
     user = claude_payload({"type": "user", "message": message})
     assert user[0].event_type == "user.message"
     assert claude_payload({"type": "assistant", "message": None}) == []
-    assert (
-        claude_payload(
-            {"type": "assistant", "message": {"content": "text"}}
-        )
-        == []
-    )
+    assert claude_payload({"type": "assistant", "message": {"content": "text"}}) == []
 
     for delta, expected in (
         ({"type": "text_delta", "text": "text"}, "agent.message.delta"),
-        (
-            {"type": "thinking_delta", "thinking": "thought"},
-            "reasoning.summary.delta",
-        ),
         (
             {"type": "input_json_delta", "partial_json": "{}"},
             "agent.message.delta",
@@ -234,15 +297,29 @@ def test_claude_protocol_surface_normalizes() -> None:
         claude_payload(
             {
                 "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": "hidden",
+                    },
+                },
+            }
+        )
+        == []
+    )
+
+    assert (
+        claude_payload(
+            {
+                "type": "stream_event",
                 "event": {"type": "message_stop"},
             }
         )[0].event_type
         == "provider.event"
     )
     assert (
-        claude_payload({"type": "stream_event", "event": None})[
-            0
-        ].event_type
+        claude_payload({"type": "stream_event", "event": None})[0].event_type
         == "provider.event"
     )
     failed = claude_payload(
@@ -256,10 +333,61 @@ def test_claude_protocol_surface_normalizes() -> None:
     )
     assert failed[0].event_type == "turn.failed"
     assert failed[0].status == "failed"
-    assert (
-        claude_payload({"type": "future"})[0].event_type
-        == "provider.event"
+    assert claude_payload({"type": "future"})[0].event_type == "provider.event"
+
+
+def test_claude_task_lifecycle_normalizes_with_identity_and_usage() -> None:
+    cases = (
+        (
+            {
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-1",
+                "tool_use_id": "tool-1",
+                "session_id": "session-1",
+            },
+            "agent.child.started",
+            "running",
+        ),
+        (
+            {
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "task-1",
+                "status": "completed",
+                "usage": {"total_tokens": 10},
+            },
+            "agent.child.completed",
+            "complete",
+        ),
+        (
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "task-2",
+                "status": "failed",
+            },
+            "agent.child.failed",
+            "failed",
+        ),
+        (
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "task-3",
+                "patch": {"status": "cancelled"},
+            },
+            "agent.child.cancelled",
+            "cancelled",
+        ),
     )
+
+    for payload, event_type, status in cases:
+        event = claude_payload(payload)[0]
+        assert event.event_type == event_type
+        assert event.status == status
+        assert event.metadata["child_id"] == payload["task_id"]
+    assert cases[0][0]["session_id"] == "session-1"
 
 
 def test_payload_text_handles_every_supported_shape() -> None:

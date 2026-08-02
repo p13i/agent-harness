@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,19 +10,24 @@ import pytest
 
 from agent_harness.errors import SafetyGuardError
 from agent_harness.providers.base import ProviderEvent
-from agent_harness.safety import INTERACTIVE
-from agent_harness.safety import LIVE_SMOKE
-from agent_harness.safety import MINIMUM_STATE_FREE_BYTES
-from agent_harness.safety import SafetyConsumption
-from agent_harness.safety import UNATTENDED
-from agent_harness.safety import TurnGuard
-from agent_harness.safety import apply_extension
-from agent_harness.safety import effective_effort
-from agent_harness.safety import limits_for
-from agent_harness.safety import lower_effort
-from agent_harness.safety import normalize_usage
-from agent_harness.safety import require_state_headroom
-from agent_harness.safety import validate_profile
+from agent_harness.safety import (
+    INTERACTIVE,
+    LIVE_SMOKE,
+    MINIMUM_STATE_FREE_BYTES,
+    UNATTENDED,
+    SafetyConsumption,
+    TurnGuard,
+    apply_extension,
+    effective_effort,
+    has_exact_cost,
+    limits_for,
+    lower_effort,
+    normalize_cost,
+    normalize_usage,
+    require_state_headroom,
+    tighten_limits,
+    validate_profile,
+)
 
 
 class Clock:
@@ -48,6 +54,8 @@ def test_profiles_preserve_unattended_headroom() -> None:
     assert operations.max_seconds == 900
     assert engineering.max_seconds == 2_700
     assert smoke.max_attempts == 1
+    assert smoke.max_child_agents == 0
+    assert operations.max_child_agents == 2
     assert limits_for(UNATTENDED, "").workload == "implementation"
     extended = apply_extension(
         engineering,
@@ -57,12 +65,52 @@ def test_profiles_preserve_unattended_headroom() -> None:
         },
     )
     assert extended.max_seconds == engineering.max_seconds + 30
-    assert (
-        extended.max_total_tokens
-        == engineering.max_total_tokens + 1_000
-    )
+    assert extended.max_total_tokens == engineering.max_total_tokens + 1_000
     with pytest.raises(ValueError, match="profile"):
         validate_profile("unbounded")
+
+
+def test_per_command_limits_only_tighten_the_effective_envelope() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    tightened = tighten_limits(
+        base,
+        {
+            "max_seconds": 300,
+            "max_attempts": 2,
+            "max_child_agents": 1,
+            "max_dollars": 0,
+        },
+    )
+
+    assert tightened.max_seconds == 300
+    assert tightened.max_attempts == 2
+    assert tightened.max_child_agents == 1
+    assert tightened.max_dollars == 0
+    with pytest.raises(ValueError, match="cannot widen max_attempts"):
+        tighten_limits(base, {"max_attempts": base.max_attempts + 1})
+    with pytest.raises(ValueError, match="cannot authorize metered spend"):
+        tighten_limits(base, {"max_dollars": 1})
+    with pytest.raises(ValueError, match="unsupported field"):
+        tighten_limits(base, {"unbounded": 1})
+    with pytest.raises(ValueError, match="must be an object"):
+        tighten_limits(base, "300")
+    for value in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError, match="must be finite"):
+            tighten_limits(base, {"binding_ceiling": value})
+
+
+def test_invalid_provider_cost_is_not_exact_or_chargeable() -> None:
+    for value in (math.nan, math.inf, -math.inf, -1):
+        usage = {"total_cost_usd": value}
+        assert normalize_cost(usage) == 0
+        assert has_exact_cost(usage) is False
+    for invalid in (-1, math.nan, math.inf):
+        mixed = {
+            "total_cost_usd": invalid,
+            "nested": {"cost_usd": 0},
+        }
+        assert normalize_cost(mixed) == 0
+        assert has_exact_cost(mixed) is False
 
 
 def test_state_headroom_fails_closed_before_provider_use(
@@ -97,10 +145,7 @@ def test_xhigh_requires_an_unattended_authorization() -> None:
     assert effective_effort("", limits, xhigh_authorized=False) == "high"
     with pytest.raises(ValueError, match="authorization"):
         effective_effort("xhigh", limits, xhigh_authorized=False)
-    assert (
-        effective_effort("xhigh", limits, xhigh_authorized=True)
-        == "xhigh"
-    )
+    assert effective_effort("xhigh", limits, xhigh_authorized=True) == "xhigh"
     assert lower_effort("xhigh") == "high"
     assert lower_effort("high") == "medium"
     assert lower_effort("low") == "low"
@@ -165,6 +210,48 @@ def test_usage_normalization_accepts_both_provider_shapes() -> None:
         "total_tokens": 18_538,
         "exact": True,
     }
+    inconsistent = normalize_usage(
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 1,
+        }
+    )
+    assert inconsistent == {
+        "input_tokens": 100,
+        "cached_input_tokens": 0,
+        "output_tokens": 20,
+        "total_tokens": 120,
+        "exact": True,
+    }
+    malformed = normalize_usage(
+        {
+            "input_tokens": -1,
+            "output_tokens": 20,
+            "total_tokens": math.inf,
+        }
+    )
+    assert malformed["exact"] is False
+    assert normalize_cost(
+        {
+            "usage": [
+                {"total_cost_usd": 0.25},
+                {"nested": {"cost-usd": 0.5}},
+                {"cost_usd": True},
+            ]
+        }
+    ) == pytest.approx(0.5)
+    assert normalize_cost("unknown") == 0.0
+    assert has_exact_cost(
+        [
+            {},
+            {
+                "cost_usd": True,
+                "total_cost_usd": "unknown",
+                "nested": {"cost-usd": 0.5},
+            },
+        ]
+    )
 
 
 def test_guard_shares_context_and_usage_across_attempts() -> None:
@@ -193,6 +280,91 @@ def test_guard_shares_context_and_usage_across_attempts() -> None:
     assert consumption["output_tokens"] == 6_000
 
 
+def test_provider_usage_cannot_reduce_accounted_consumption() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_dollars=1.0))
+    guard.begin_attempt(10)
+    guard.observe(
+        ProviderEvent(
+            "usage.updated",
+            metadata={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 1,
+                "total_cost_usd": 0.75,
+            },
+        )
+    )
+    first = guard.snapshot()["consumption"]
+    assert first["input_tokens"] == 100
+    assert first["output_tokens"] == 20
+    assert first["total_tokens"] == 120
+    assert first["dollars"] == pytest.approx(0.75)
+
+    guard.observe(
+        ProviderEvent(
+            "usage.updated",
+            metadata={
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "total_tokens": 7,
+                "total_cost_usd": 0.25,
+            },
+        )
+    )
+    cumulative = guard.snapshot()["consumption"]
+    assert cumulative["input_tokens"] == 100
+    assert cumulative["output_tokens"] == 20
+    assert cumulative["total_tokens"] == 120
+    assert cumulative["dollars"] == pytest.approx(0.75)
+
+    guard.observe(
+        ProviderEvent(
+            "usage.updated",
+            metadata={
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 3,
+                        "outputTokens": 1,
+                        "totalTokens": 4,
+                    }
+                }
+            },
+        )
+    )
+    incremental = guard.snapshot()["consumption"]
+    assert incremental["input_tokens"] == 100
+    assert incremental["output_tokens"] == 20
+    assert incremental["total_tokens"] == 120
+
+
+def test_invalid_provider_usage_retains_conservative_estimates() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(500)
+    guard.observe(
+        ProviderEvent(
+            "agent.message.delta",
+            text="estimated output remains accounted",
+        )
+    )
+    estimated = guard.snapshot()["consumption"]
+    guard.observe(
+        ProviderEvent(
+            "usage.updated",
+            metadata={
+                "input_tokens": -1,
+                "output_tokens": 1,
+                "total_tokens": math.nan,
+            },
+        )
+    )
+    malformed = guard.snapshot()["consumption"]
+    assert malformed["input_tokens"] == estimated["input_tokens"]
+    assert malformed["output_tokens"] == estimated["output_tokens"]
+    assert malformed["total_tokens"] == estimated["total_tokens"]
+    assert malformed["exact_tokens"] is False
+
+
 def test_guard_trips_repeated_tool_pair() -> None:
     guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
     guard.begin_attempt(100)
@@ -210,6 +382,37 @@ def test_guard_trips_repeated_tool_pair() -> None:
         del unused
         guard.observe(started)
         guard.observe(completed)
+
+    assert guard.violation() == "repeated-tool"
+
+
+def test_guard_ignores_volatile_provider_ids_in_tool_fingerprints() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(100)
+
+    for index in range(3):
+        guard.observe(
+            ProviderEvent(
+                "tool.started",
+                text="Read",
+                metadata={
+                    "id": "request-" + str(index),
+                    "input": {
+                        "file_path": "PLAN.gpt.md",
+                        "request-id": "nested-" + str(index),
+                        "parts": ("same",),
+                        "segments": ["same"],
+                    },
+                },
+            )
+        )
+        guard.observe(
+            ProviderEvent(
+                "tool.completed",
+                text="unchanged",
+                metadata={"tool_use_id": "request-" + str(index)},
+            )
+        )
 
     assert guard.violation() == "repeated-tool"
 
@@ -266,6 +469,77 @@ def test_guard_covers_every_hard_limit_and_recovery_boundary() -> None:
     )
     assert tools.violation() == "tool-calls"
 
+    children = TurnGuard(replace(base, max_child_agents=1))
+    children.observe(ProviderEvent("agent.child.started"))
+    children.observe(ProviderEvent("agent.child.started"))
+    assert children.violation() == "child-agents"
+    admitted_children = TurnGuard(replace(base, max_child_agents=2))
+    admitted_children.note_child_admissions(1)
+    admitted_children.note_child_admissions(0)
+    assert admitted_children.consumption.child_agents == 1
+    with pytest.raises(ValueError, match="must not be negative"):
+        admitted_children.note_child_admissions(-1)
+
+    dollars = TurnGuard(replace(base, max_dollars=0.5))
+    dollars.begin_attempt(1)
+    dollars.observe(
+        ProviderEvent(
+            "usage.updated",
+            metadata={"total_cost_usd": 0.6},
+        )
+    )
+    assert dollars.violation() == "dollars"
+    assert dollars.warning_due() is True
+    assert dollars.snapshot()["consumption"]["exact_dollars"] is True
+
+    cumulative = TurnGuard(replace(base, max_dollars=1.0))
+    cumulative.begin_attempt(1)
+    for unused in range(2):
+        del unused
+        cumulative.observe(
+            ProviderEvent(
+                "usage.updated",
+                metadata={"total_cost_usd": 0.25},
+            )
+        )
+    assert cumulative.snapshot()["consumption"]["dollars"] == 0.25
+
+    multiple_children = TurnGuard(replace(base, max_child_agents=1))
+    multiple_children.observe(
+        ProviderEvent(
+            "agent.child.started",
+            metadata={"receiver_thread_ids": ["one", "two"]},
+        )
+    )
+    assert multiple_children.violation() == "child-agents"
+
+    deduplicated_child = TurnGuard(replace(base, max_child_agents=1))
+    deduplicated_child.observe(
+        ProviderEvent(
+            "agent.child.started",
+            metadata={"id": "tool-child"},
+        )
+    )
+    deduplicated_child.observe(
+        ProviderEvent(
+            "agent.child.started",
+            metadata={
+                "child_id": "task-child",
+                "tool_use_id": "tool-child",
+            },
+        )
+    )
+    assert deduplicated_child.consumption.child_agents == 1
+
+    zero_clock = Clock()
+    zero = TurnGuard(
+        replace(base, max_seconds=0),
+        monotonic=zero_clock,
+    )
+    zero_clock.advance(1)
+    assert zero.violation() == "seconds"
+    assert zero.warning_due() is True
+
     with pytest.raises(ValueError, match="hard safety"):
         tools.recover()
 
@@ -284,12 +558,26 @@ def test_guard_covers_every_hard_limit_and_recovery_boundary() -> None:
             metadata={"usage": {"total_tokens": 4}},
         )
     )
-    progress.observe(
-        ProviderEvent("usage.updated", metadata={"usage": {}})
-    )
-    progress.note_material_progress()
+    progress.observe(ProviderEvent("usage.updated", metadata={"usage": {}}))
+    progress.establish_material_state("state-a")
+    with pytest.raises(ValueError, match="digest"):
+        progress.establish_material_state("")
+    with pytest.raises(ValueError, match="digest"):
+        progress.note_material_progress("")
+    assert progress.note_material_progress("state-a") is False
+    assert progress.note_material_progress("state-b") is True
     assert progress.violation() == ""
     assert progress.warning_due() is False
+
+    camel_children = TurnGuard(replace(base, max_child_agents=1))
+    camel_children.observe(
+        ProviderEvent(
+            "agent.child.started",
+            metadata={"receiverThreadIds": []},
+        )
+    )
+    camel_children.observe(ProviderEvent("agent.child.started", metadata={}))
+    assert camel_children.violation() == "child-agents"
 
 
 def test_guard_warning_recovery_and_nonrepeating_cycles() -> None:
@@ -314,5 +602,68 @@ def test_guard_warning_recovery_and_nonrepeating_cycles() -> None:
         repeating.observe(started)
         repeating.observe(completed)
     assert repeating.violation() == "repeated-tool"
-    repeating.recover()
-    assert repeating.violation() == ""
+    with pytest.raises(ValueError, match="hard safety"):
+        repeating.recover()
+
+    interleaved = TurnGuard(base)
+    interleaved.observe(
+        ProviderEvent(
+            "tool.started",
+            text="first input",
+            metadata={"id": "tool-a"},
+        )
+    )
+    interleaved.observe(
+        ProviderEvent(
+            "tool.started",
+            text="second input",
+            metadata={"id": "tool-b"},
+        )
+    )
+    interleaved.observe(
+        ProviderEvent(
+            "tool.completed",
+            text="first output",
+            metadata={"tool_use_id": "tool-a"},
+        )
+    )
+    first_pair = interleaved.take_completed_tool_pair()
+    interleaved.observe(
+        ProviderEvent(
+            "tool.completed",
+            text="second output",
+            metadata={"tool_use_id": "tool-b"},
+        )
+    )
+    second_pair = interleaved.take_completed_tool_pair()
+    assert first_pair
+    assert second_pair
+    assert first_pair != second_pair
+    assert interleaved.violation() == ""
+
+    stagnating_clock = Clock()
+    stagnating = TurnGuard(
+        replace(base, stagnation_seconds=1),
+        monotonic=stagnating_clock,
+    )
+    stagnating_clock.advance(1)
+    assert stagnating.violation() == "stagnation"
+    stagnating.recover()
+    assert stagnating.violation() == ""
+
+
+def test_noop_file_change_cannot_clear_repetition_history() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.establish_material_state("workspace-a")
+    started = ProviderEvent("tool.started", text="same")
+    completed = ProviderEvent("tool.completed", text="same")
+
+    for unused in range(2):
+        del unused
+        guard.observe(started)
+        guard.observe(completed)
+        assert guard.note_material_progress("workspace-a") is False
+    guard.observe(started)
+    guard.observe(completed)
+
+    assert guard.violation() == "repeated-tool"

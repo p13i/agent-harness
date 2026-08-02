@@ -1,73 +1,75 @@
 import asyncio
+import subprocess
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-import subprocess
 
 import pytest
 from textual import events
-from textual.app import App
-from textual.app import ComposeResult
+from textual.app import App, ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Input
-from textual.widgets import ListView
-from textual.widgets import Static
-from textual.widgets import Tabs
+from textual.widgets import Input, ListView, Static, Tabs
 
 from agent_harness.errors import HarnessError
-from agent_harness.tui import ApprovalScreen
-from agent_harness.tui import CommandPaletteScreen
-from agent_harness.tui import HarnessApp
-from agent_harness.tui import TranscriptBlockView
-from agent_harness.tui import TranscriptView
-from agent_harness.tui import _connection_label
-from agent_harness.tui import _compact_connection_label
-from agent_harness.tui import _cursor_part
-from agent_harness.tui import _display_lifecycle
-from agent_harness.tui import _expanded_blocks
-from agent_harness.tui import _format_number
-from agent_harness.tui import _native_command
-from agent_harness.tui import _object_tuple
-from agent_harness.tui import _positive_integer
-from agent_harness.tui import _providers_refreshing
-from agent_harness.tui import _render_event
-from agent_harness.tui import _render_transcript_block
-from agent_harness.tui import _render_transcript_events
-from agent_harness.tui import _session_list_label
-from agent_harness.tui import _session_status
-from agent_harness.tui import _status_glyph
-from agent_harness.tui import _system_dark_mode
-from agent_harness.tui import _transcript_block_classes
-from agent_harness.tui import _turn_detail
-from agent_harness.tui import _turn_list_label
-from agent_harness.tui import _visible_sessions
-from agent_harness.tui_presenter import ColorScheme
-from agent_harness.tui_presenter import ComposerState
-from agent_harness.tui_presenter import InteractionState
-from agent_harness.tui_presenter import LayoutMode
-from agent_harness.tui_presenter import ThemePreference
-from agent_harness.tui_presenter import TranscriptBlock
-from agent_harness.tui_presenter import TranscriptBlockKind
-from agent_harness.tui_presenter import TranscriptBlockStatus
-from agent_harness.tui_presenter import TranscriptMutationKind
-from agent_harness.tui_presenter import TranscriptState
-from agent_harness.tui_presenter import TuiViewState
-from agent_harness.tui_presenter import contrast_ratio
-from agent_harness.tui_presenter import decide_layout
-from agent_harness.tui_presenter import project_event
-from agent_harness.tui_presenter import project_events
-from agent_harness.tui_presenter import resolve_theme
-from agent_harness.tui_presenter import safe_metadata
-from agent_harness.tui_widgets import ComposerAction
-from agent_harness.tui_widgets import ComposerDraft
-from agent_harness.tui_widgets import DEFAULT_SLASH_COMMANDS
-from agent_harness.tui_widgets import MultilineComposer
-from agent_harness.tui_widgets import SlashCommand
-from agent_harness.tui_widgets import SlashValidationState
-from agent_harness.tui_widgets import apply_completion
-from agent_harness.tui_widgets import complete_slash
-from agent_harness.tui_widgets import composer_action_for_key
-from agent_harness.tui_widgets import composer_height
-from agent_harness.tui_widgets import validate_slash
+from agent_harness.tui import (
+    ApprovalScreen,
+    CommandPaletteScreen,
+    HarnessApp,
+    TranscriptBlockView,
+    TranscriptView,
+    _compact_connection_label,
+    _connection_label,
+    _cursor_part,
+    _display_lifecycle,
+    _expanded_blocks,
+    _format_number,
+    _native_command,
+    _object_tuple,
+    _positive_integer,
+    _providers_refreshing,
+    _render_event,
+    _render_transcript_block,
+    _render_transcript_events,
+    _session_list_label,
+    _session_status,
+    _status_glyph,
+    _system_dark_mode,
+    _transcript_block_classes,
+    _turn_detail,
+    _turn_list_label,
+    _visible_sessions,
+)
+from agent_harness.tui_presenter import (
+    ColorScheme,
+    ComposerState,
+    InteractionState,
+    LayoutMode,
+    ThemePreference,
+    TranscriptBlock,
+    TranscriptBlockKind,
+    TranscriptBlockStatus,
+    TranscriptMutationKind,
+    TranscriptState,
+    TuiViewState,
+    contrast_ratio,
+    decide_layout,
+    project_event,
+    project_events,
+    resolve_theme,
+    safe_metadata,
+)
+from agent_harness.tui_widgets import (
+    DEFAULT_SLASH_COMMANDS,
+    ComposerAction,
+    ComposerDraft,
+    MultilineComposer,
+    SlashCommand,
+    SlashValidationState,
+    apply_completion,
+    complete_slash,
+    composer_action_for_key,
+    composer_height,
+    validate_slash,
+)
 
 
 def test_idle_session_lifecycle_is_presented_as_ready() -> None:
@@ -97,11 +99,7 @@ class Client:
     ):
         del idempotency_key
         self.requests.append((path, payload))
-        if (
-            method == "PUT"
-            and payload is not None
-            and path.endswith("/ui-state")
-        ):
+        if method == "PUT" and payload is not None and path.endswith("/ui-state"):
             self.ui_updates.append(payload)
             self.ui_state = dict(payload)
         if path in {"/v1/sessions", "/v1/sessions?archived=1"}:
@@ -432,17 +430,15 @@ def test_textual_workspace_restores_draft_and_inspector(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
+        client = Client()
         app = HarnessApp(
-            Client(),
+            client,
             tmp_path,
             session_id="session-1",
         )
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
-            assert (
-                app.query_one("#composer", MultilineComposer).text
-                == "unfinished"
-            )
+            assert app.query_one("#composer", MultilineComposer).text == "unfinished"
             inspector = app.query_one("#inspector-content", Static)
             assert "Finish the implementation." in str(inspector.render())
             assert "codex" in str(inspector.render())
@@ -454,6 +450,10 @@ def test_textual_workspace_restores_draft_and_inspector(
             assert "estimated" in str(inspector.render())
             assert "CHAT STORAGE" in str(inspector.render())
             assert "/Users/test/my/chats" in str(inspector.render())
+            assert not any(
+                path == "/v1/sessions/session-1" and payload is not None
+                for path, payload in client.requests
+            )
             session_list = app.query_one("#session-list", ListView)
             assert session_list.children[0].has_class("active-session")
 
@@ -485,9 +485,7 @@ def test_textual_session_switch_is_atomic_and_rejects_stale_loads(
             )
 
             client.delayed = {"session-a", "session-b"}
-            switch_to_b = asyncio.create_task(
-                app._open_session("session-b")
-            )
+            switch_to_b = asyncio.create_task(app._open_session("session-b"))
             await client.started["session-b"].wait()
             await pilot.pause()
             assert app.session_id == "session-a"
@@ -501,9 +499,7 @@ def test_textual_session_switch_is_atomic_and_rejects_stale_loads(
                 composer.region,
             ) == initial_geometry
 
-            switch_to_a = asyncio.create_task(
-                app._open_session("session-a")
-            )
+            switch_to_a = asyncio.create_task(app._open_session("session-a"))
             await client.started["session-a"].wait()
             await pilot.pause()
             assert app.session_id == "session-a"
@@ -558,12 +554,9 @@ def test_textual_notifications_are_unified_and_action_first(
 
             app._dismiss_notification("approval:approval-1")
             app._write_notice(
-                "[yellow]Waiting for the original send "
-                "acknowledgement.[/yellow]"
+                "[yellow]Waiting for the original send acknowledgement.[/yellow]"
             )
-            assert "Waiting for the original send" in str(
-                notification.render()
-            )
+            assert "Waiting for the original send" in str(notification.render())
             assert "use /" not in str(notification.render()).casefold()
 
             fired: list[bool] = []
@@ -674,10 +667,7 @@ def test_textual_search_archive_and_recovery_inspector(
             assert "one changed file" in str(inspector.render())
 
             await app._slash("/archive")
-            assert any(
-                path.endswith("/archive")
-                for path, unused in client.requests
-            )
+            assert any(path.endswith("/archive") for path, unused in client.requests)
 
     asyncio.run(scenario())
 
@@ -719,9 +709,7 @@ def test_transcript_reconciles_streaming_and_hides_protocol_noise() -> None:
 
 
 def test_legacy_event_renderer_covers_visible_event_contract() -> None:
-    assert "YOU" in _render_event(
-        {"event_type": "user.steer", "text": "change course"}
-    )
+    assert "YOU" in _render_event({"event_type": "user.steer", "text": "change course"})
     assert "AGENT" in _render_event(
         {"event_type": "agent.message.delta", "text": "working"}
     )
@@ -734,10 +722,7 @@ def test_legacy_event_renderer_covers_visible_event_contract() -> None:
         )
         == ""
     )
-    assert (
-        _render_event({"event_type": "tool.shell.started"})
-        == ""
-    )
+    assert _render_event({"event_type": "tool.shell.started"}) == ""
     assert "TOOL · shell completed" in _render_event(
         {
             "event_type": "tool.shell.completed",
@@ -756,9 +741,7 @@ def test_legacy_event_renderer_covers_visible_event_contract() -> None:
             "metadata": {"approval_id": "approval-1"},
         }
     )
-    assert "above 80%" in _render_event(
-        {"event_type": "guard.warning"}
-    )
+    assert "above 80%" in _render_event({"event_type": "guard.warning"})
     assert "stagnation" in _render_event(
         {
             "event_type": "guard.tripped",
@@ -878,9 +861,7 @@ def test_tui_projection_helpers_cover_invalid_and_attention_states() -> None:
     assert "action needed" in _connection_label("needs-input")
     assert "needs attention" in _connection_label("failed")
     assert "connected" in _connection_label("idle")
-    assert _providers_refreshing(
-        {"codex": {"usage_refreshing": True}}
-    )
+    assert _providers_refreshing({"codex": {"usage_refreshing": True}})
     assert not _providers_refreshing({"codex": "unknown"})
 
     label = _session_list_label(
@@ -1011,9 +992,7 @@ def test_textual_workspace_theme_and_responsive_visual_contract(
             await pilot.pause()
             dark_svg = app.export_screenshot()
             assert dark_svg.startswith("<svg")
-            assert "P13I AGENT HARNESS" in str(
-                app.query_one("#brand", Static).render()
-            )
+            assert "P13I AGENT HARNESS" in str(app.query_one("#brand", Static).render())
             assert "SESSION CONTROL" in str(
                 app.query_one("#inspector-heading", Static).render()
             )
@@ -1084,17 +1063,23 @@ def test_sidebar_resize_is_keyboard_pointer_and_resume_persistent(
         )
         async with restored.run_test(size=(140, 42)) as pilot:
             await pilot.pause()
-            assert restored.query_one(
-                "#sidebar",
-                Vertical,
-            ).outer_size.width == 48
+            assert (
+                restored.query_one(
+                    "#sidebar",
+                    Vertical,
+                ).outer_size.width
+                == 48
+            )
 
             await restored._slash("/sidebar reset")
             await pilot.pause()
-            assert restored.query_one(
-                "#sidebar",
-                Vertical,
-            ).outer_size.width == 31
+            assert (
+                restored.query_one(
+                    "#sidebar",
+                    Vertical,
+                ).outer_size.width
+                == 31
+            )
 
     asyncio.run(scenario())
 
@@ -1112,9 +1097,7 @@ def test_transcript_uses_stable_incremental_blocks(
             await pilot.pause()
             transcript = app.query_one("#transcript", TranscriptView)
             assert len(transcript.children) == 1
-            assert "Durable session ready" in str(
-                transcript.children[0].render()
-            )
+            assert "Durable session ready" in str(transcript.children[0].render())
             await app._apply_transcript_events(
                 [
                     {
@@ -1197,14 +1180,16 @@ def test_poll_after_textual_teardown_is_noop(
 
 
 def test_native_attachment_uses_pinned_provider_packages() -> None:
-    assert _native_command("codex", "full") == [
-        "npx",
+    codex_command = _native_command("codex", "full")
+    assert Path(codex_command[0]).name == "npx"
+    assert codex_command[1:] == [
         "-y",
         "@openai/codex@0.146.0",
         "--yolo",
     ]
-    assert _native_command("claude", "full") == [
-        "npx",
+    claude_command = _native_command("claude", "full")
+    assert Path(claude_command[0]).name == "npx"
+    assert claude_command[1:] == [
         "@anthropic-ai/claude-code@2.1.220",
         "--dangerously-skip-permissions",
     ]
@@ -1224,9 +1209,7 @@ def test_control_turn_detail_tabs_are_bounded_and_distinct() -> None:
             }
         ],
         "result": {"status": "complete"},
-        "safety": {
-            "consumption": {"total_tokens": 42, "tool_calls": 2}
-        },
+        "safety": {"consumption": {"total_tokens": 42, "tool_calls": 2}},
         "activity": [
             {
                 "event_type": "tool.result",
@@ -1295,10 +1278,8 @@ def test_budget_commands_require_explicit_operator_actions(
         )
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
-            await app._slash(
-                "/budget extend 60 1000 finish bounded validation"
-            )
-            await app._slash("/budget xhigh inspect one hard failure")
+            await app._slash("/budget extend 60 1000 finish bounded validation")
+            await app._slash("/budget xhigh command-1 codex inspect one hard failure")
 
         extensions = [
             payload
@@ -1314,6 +1295,8 @@ def test_budget_commands_require_explicit_operator_actions(
             {
                 "reason": "inspect one hard failure",
                 "allow_xhigh_once": True,
+                "command_id": "command-1",
+                "provider": "codex",
             },
         ]
 
@@ -1485,9 +1468,7 @@ def test_presenter_types_tools_without_provider_arguments() -> None:
             },
         },
     )
-    canonical_block = canonical_started.state.block(
-        "tool:canonical-call"
-    )
+    canonical_block = canonical_started.state.block("tool:canonical-call")
     assert canonical_block is not None
     assert canonical_block.title == "Tool · Shell"
     assert "private provider arguments" not in repr(canonical_block)
@@ -1504,9 +1485,7 @@ def test_presenter_types_tools_without_provider_arguments() -> None:
             },
         },
     )
-    canonical_block = canonical_completed.state.block(
-        "tool:canonical-call"
-    )
+    canonical_block = canonical_completed.state.block("tool:canonical-call")
     assert canonical_block is not None
     assert canonical_block.status == TranscriptBlockStatus.FAILED
     assert canonical_block.detail == "2 tests passed"
@@ -1519,9 +1498,7 @@ def test_presenter_types_tools_without_provider_arguments() -> None:
             "event_type": "tool.unknown.started",
         },
     )
-    assert anonymous.state.blocks[-1].block_id == (
-        "sequence:6:tool.unknown.started"
-    )
+    assert anonymous.state.blocks[-1].block_id == ("sequence:6:tool.unknown.started")
 
 
 def test_presenter_types_attention_recovery_and_lifecycle_events() -> None:
@@ -1590,9 +1567,7 @@ def test_presenter_types_attention_recovery_and_lifecycle_events() -> None:
         TranscriptBlockStatus.GUARDED,
         TranscriptBlockStatus.FAILED,
     ]
-    assert update.state.blocks[-1].content == (
-        "Storage synchronization conflict"
-    )
+    assert update.state.blocks[-1].content == ("Storage synchronization conflict")
 
 
 def test_presenter_unknown_events_are_explicit_only_when_requested() -> None:
@@ -1838,15 +1813,9 @@ def test_slash_validation_keeps_invalid_commands_editable() -> None:
     assert unknown.state == SlashValidationState.INVALID
     assert unknown.command is None
     assert unknown.message == "Unknown harness command"
-    assert validate_slash('/fork "unfinished').state == (
-        SlashValidationState.INVALID
-    )
-    assert validate_slash("/theme ultraviolet").state == (
-        SlashValidationState.INVALID
-    )
-    assert validate_slash("/theme dark extra").state == (
-        SlashValidationState.INVALID
-    )
+    assert validate_slash('/fork "unfinished').state == (SlashValidationState.INVALID)
+    assert validate_slash("/theme ultraviolet").state == (SlashValidationState.INVALID)
+    assert validate_slash("/theme dark extra").state == (SlashValidationState.INVALID)
 
     custom = SlashCommand(
         "/custom",
@@ -2123,9 +2092,7 @@ def test_textual_inspector_tabs_and_helper_boundaries(
             assert "Run?" in "\n".join(app._approval_lines())
 
             app._reconciliations = ()
-            assert "No reconciliation" in "\n".join(
-                app._recovery_lines()
-            )
+            assert "No reconciliation" in "\n".join(app._recovery_lines())
             app._reconciliations = (
                 {
                     "command_id": "command-1",
@@ -2140,9 +2107,7 @@ def test_textual_inspector_tabs_and_helper_boundaries(
                 "orchestrator": "autoplan",
                 "job_id": "job-1",
             }
-            assert "autoplan / job-1" in "\n".join(
-                app._storage_lines()
-            )
+            assert "autoplan / job-1" in "\n".join(app._storage_lines())
             for tab in (
                 "goal",
                 "usage",
@@ -2159,9 +2124,7 @@ def test_textual_inspector_tabs_and_helper_boundaries(
             app._write_notice("[yellow]warning[/yellow]")
             app._write_notice("information")
             app._render_activity_marker()
-            app._transcript_state = (
-                app._transcript_state.with_reader_at_bottom(False)
-            )
+            app._transcript_state = app._transcript_state.with_reader_at_bottom(False)
             app._render_activity_marker()
 
     asyncio.run(scenario())
@@ -2183,9 +2146,7 @@ def test_textual_inspector_tabs_and_helper_boundaries(
             {
                 "status": status,
                 "turn_ref": {"agent_role": "builder"},
-                "attempts": [
-                    {"provider": "codex", "effort": "high"}
-                ],
+                "attempts": [{"provider": "codex", "effort": "high"}],
             }
         )
         assert "builder" in label

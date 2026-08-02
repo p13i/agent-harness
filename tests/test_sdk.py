@@ -5,11 +5,13 @@ import pytest
 
 from agent_harness import sdk as sdk_module
 from agent_harness.config import paths
-from agent_harness.sdk import AgentHarnessClient
-from agent_harness.sdk import _command_view
-from agent_harness.sdk import _event_data
-from agent_harness.sdk import _object
-from agent_harness.sdk import _object_tuple
+from agent_harness.sdk import (
+    AgentHarnessClient,
+    _command_view,
+    _event_data,
+    _object,
+    _object_tuple,
+)
 
 
 def test_typed_sdk_projection_helpers() -> None:
@@ -67,6 +69,8 @@ def test_typed_sdk_builds_message_contract(
             "continue",
             provider="codex",
             effort="xhigh",
+            permission_mode="read-only",
+            safety_limits={"max_attempts": 2, "max_seconds": 300},
             idempotency_key="request-1",
         )
     )
@@ -80,6 +84,8 @@ def test_typed_sdk_builds_message_contract(
         "model": "",
         "effort": "xhigh",
         "workload": "implementation",
+        "permission_mode": "read-only",
+        "safety_limits": {"max_attempts": 2, "max_seconds": 300},
     }
     assert captured["idempotency_key"] == "request-1"
 
@@ -164,7 +170,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
     ):
         requests.append((method, path, payload, idempotency_key))
         if path == "/v1/capabilities":
-            return {"api_version": "1.4.0"}
+            return {"api_version": "1.10.0"}
         if path == "/v1/sessions" and method == "GET":
             return {"sessions": [{"session_id": "session-1"}]}
         if path == "/v1/sessions?archived=1":
@@ -181,6 +187,8 @@ def test_typed_sdk_covers_the_complete_control_plane(
             return {"ui_state": {"composer": "draft"}}
         if "/events?" in path:
             return {"events": [{"sequence": 1}]}
+        if "/proof?" in path:
+            return {"proof": {"schema": "p13i/agent-harness/proof-snapshot/v1"}}
         if "/checkpoints/" in path and "/diff?" in path:
             return {
                 "diff": {
@@ -198,6 +206,19 @@ def test_typed_sdk_covers_the_complete_control_plane(
             return {"resolved": True}
         if path.endswith("/goal"):
             return {"goal": {"status": "active"}}
+        if path.endswith("/goal/promotions"):
+            return {"promotion": {"promotion_id": "promotion-1"}}
+        if path.endswith("/contract-adoptions"):
+            return {"adoption": {"adoption_id": "adoption-1"}}
+        if path.endswith("/dispatch-invalidations"):
+            return {"invalidation": {"invalidation_id": "invalidation-1"}}
+        if path.endswith("/dispatch-transition-anchor"):
+            return {
+                "transition_anchor": {
+                    "eligible": True,
+                    "prior_anchor_kind": "resolved-reconciliation",
+                }
+            }
         if path.endswith("/evidence"):
             return {"evidence": {"evidence_id": "evidence-1"}}
         if path.endswith("/checkpoints"):
@@ -220,11 +241,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
         if path.endswith("/budget-extensions"):
             return {"safety": {"xhigh_authorizations": 1}}
         if path.endswith("/reconciliations"):
-            return {
-                "reconciliations": [
-                    {"reconciliation_id": "reconciliation-1"}
-                ]
-            }
+            return {"reconciliations": [{"reconciliation_id": "reconciliation-1"}]}
         if path.startswith("/v1/reconciliations/"):
             return {
                 "reconciliation": {
@@ -268,11 +285,9 @@ def test_typed_sdk_covers_the_complete_control_plane(
     monkeypatch.setattr(client.raw, "request", request)
 
     async def scenario() -> None:
-        assert (await client.capabilities())["api_version"] == "1.4.0"
+        assert (await client.capabilities())["api_version"] == "1.10.0"
         assert len(await client.list_sessions()) == 1
-        assert len(
-            await client.list_sessions(include_archived=True)
-        ) == 1
+        assert len(await client.list_sessions(include_archived=True)) == 1
         external = await client.session_by_external_ref(
             "p13i/machines",
             "job-1",
@@ -317,15 +332,22 @@ def test_typed_sdk_covers_the_complete_control_plane(
                 False,
             )
         )["archived"]
-        assert await client.ui_state("session-1") == {
+        assert await client.ui_state("session-1") == {"composer": "draft"}
+        assert await client.update_ui_state("session-1", {"composer": "draft"}) == {
             "composer": "draft"
         }
-        assert await client.update_ui_state(
-            "session-1", {"composer": "draft"}
-        ) == {"composer": "draft"}
+        assert (await client.events("session-1", after=1, limit=2)).events[0][
+            "sequence"
+        ] == 1
         assert (
-            await client.events("session-1", after=1, limit=2)
-        ).events[0]["sequence"] == 1
+            await client.proof(
+                "session-1",
+                after_sequence=2,
+                event_limit=3,
+                through_sequence=7,
+                snapshot_id="snapshot-1",
+            )
+        )["schema"] == "p13i/agent-harness/proof-snapshot/v1"
         assert (
             await client.turns(
                 "session-1",
@@ -333,9 +355,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
                 limit=3,
             )
         )["turns"][0]["turn_id"] == "turn-1"
-        assert (
-            await client.turn("session-1", "turn-1")
-        )["turn"]["turn_id"] == "turn-1"
+        assert (await client.turn("session-1", "turn-1"))["turn"]["turn_id"] == "turn-1"
         assert (
             await client.checkpoint_diff(
                 "session-1",
@@ -356,19 +376,90 @@ def test_typed_sdk_covers_the_complete_control_plane(
                 idempotency_key="turn-1",
             )
         ).command_id == "command-1"
-        assert (
-            await client.command("session-1", "pause")
-        ).command_id == "command-1"
-        assert (
-            await client.command_status("command-1")
-        ).status == "queued"
+        assert (await client.command("session-1", "pause")).command_id == "command-1"
+        assert (await client.command_status("command-1")).status == "queued"
         assert len(await client.approvals("session-1")) == 1
-        assert await client.resolve_approval(
-            "session-1", "approval-1", "approve"
+        assert await client.resolve_approval("session-1", "approval-1", "approve")
+        assert (await client.goal("session-1"))["goal"]["status"] == ("active")
+        promotion = await client.promote_goal(
+            "session-1",
+            from_goal_id="goal-1",
+            stage="tier-24h",
+            objective="Prove the 24-hour tier.",
+            constraints=["bounded"],
+            predicates=[{"type": "report", "subject": "tier-24h"}],
+            milestones=[
+                {
+                    "milestone_id": "tier-24h",
+                    "title": "Prove tier 24h",
+                    "dependencies": [],
+                    "predicates": [{"type": "report", "subject": "tier-24h"}],
+                }
+            ],
+            budgets={"seconds": 86_400},
+            authorization={
+                "schema": ("p13i/agent-harness/goal-promotion-authorization/v1"),
+                "receipt": {"scope": "test"},
+                "receipt_sha256": "a" * 64,
+                "next_goal_contract_digest": "b" * 64,
+            },
+            idempotency_key="promote-24h",
         )
-        assert (await client.goal("session-1"))["goal"]["status"] == (
-            "active"
+        assert promotion["promotion"]["promotion_id"] == "promotion-1"
+        adoption = await client.adopt_session_contract(
+            "session-1",
+            tmp_path,
+            name="Managed session",
+            goal="Keep the service healthy.",
+            goal_kind="invariant",
+            constraints=["Pause after an incident."],
+            predicates=[{"type": "probe", "outcome": "passed"}],
+            milestones=[
+                {
+                    "milestone_id": "installed",
+                    "title": "Install service",
+                    "dependencies": [],
+                    "predicates": [{"type": "probe", "outcome": "passed"}],
+                }
+            ],
+            budgets={"seconds": 86_400},
+            permitted_providers=["claude", "codex"],
+            permitted_efforts=["low", "medium"],
+            max_concurrency=1,
+            completion_policy="never",
+            incident_policy="recover-then-pause",
+            permission_mode="full",
+            direct=True,
+            execution_profile="unattended",
+            external_ref={
+                "orchestrator": "p13i/machines/cs-sre",
+                "job_id": "cs-sre",
+            },
+            authorization={"schema": "typed"},
+            idempotency_key="adopt-cs-sre",
         )
+        assert adoption["adoption"]["adoption_id"] == "adoption-1"
+        invalidation = await client.invalidate_dispatch_generation(
+            "session-1",
+            reason="Material state was independently reviewed.",
+            authorization={"schema": "typed"},
+            idempotency_key="invalidate-reviewed-state",
+            prior_command_id="command-1",
+            prior_command_type="message",
+            prior_anchor_kind="resolved-reconciliation",
+            prior_reconciliation_id="reconciliation-1",
+            prior_reconciliation_resolution="accept-current",
+            prior_checkpoint_id="checkpoint-1",
+            prior_generation_digest="a" * 64,
+            prior_material_digest="c" * 64,
+            next_turn_ref={"step_id": "verify", "agent_role": "verifier"},
+            transition_sequence=1,
+            next_command_digest="b" * 64,
+        )
+        assert invalidation["invalidation_id"] == "invalidation-1"
+        transition_anchor = await client.dispatch_transition_anchor("session-1")
+        assert transition_anchor["eligible"] is True
+        assert transition_anchor["prior_anchor_kind"] == ("resolved-reconciliation")
         evidence = await client.add_evidence(
             "session-1",
             evidence_type="command",
@@ -376,9 +467,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
             outcome="passed",
         )
         assert evidence["evidence_id"] == "evidence-1"
-        assert (
-            await client.checkpoint("session-1")
-        )["checkpoint_id"] == "checkpoint-1"
+        assert (await client.checkpoint("session-1"))["checkpoint_id"] == "checkpoint-1"
         assert (
             await client.fork(
                 "session-1",
@@ -398,16 +487,12 @@ def test_typed_sdk_covers_the_complete_control_plane(
             metered_budget=1.0,
         )
         assert route.provider == "codex"
-        assert (
-            await client.providers(tmp_path)
-        )["providers"]["codex"]["ready"]
-        assert (
-            await client.usage("session-1")
-        )["session"]["profile"] == "unattended"
+        assert (await client.providers(tmp_path))["providers"]["codex"]["ready"]
+        assert (await client.usage("session-1"))["session"]["profile"] == "unattended"
         assert len(await client.reconciliations("session-1")) == 1
-        assert (
-            await client.reconciliation("reconciliation-1")
-        )["reconciliation_id"] == "reconciliation-1"
+        assert (await client.reconciliation("reconciliation-1"))[
+            "reconciliation_id"
+        ] == "reconciliation-1"
         assert (
             await client.resolve_reconciliation(
                 "reconciliation-1",
@@ -425,13 +510,13 @@ def test_typed_sdk_covers_the_complete_control_plane(
                 additional_seconds=60,
                 additional_tokens=1_000,
                 allow_xhigh_once=True,
+                command_id="00000000-0000-4000-8000-000000000001",
+                provider="codex",
             )
         )["xhigh_authorizations"] == 1
         assert (await client.sync_status())["sync"]["state"] == "synced"
         assert (await client.sync())["sync"]["state"] == "synced"
-        assert await client.export("session-1") == (
-            tmp_path / "export.json"
-        )
+        assert await client.export("session-1") == (tmp_path / "export.json")
 
     asyncio.run(scenario())
 
@@ -447,33 +532,44 @@ def test_typed_sdk_covers_the_complete_control_plane(
         for item in requests
     )
     assert any(
-        item[1].endswith("/budget-extensions")
-        and bool(item[3])
-        for item in requests
+        item[1].endswith("/budget-extensions") and bool(item[3]) for item in requests
     )
     assert any(
-        item[1]
-        == "/v1/sessions/session-1/turns?after_sequence=2&limit=3"
+        item[1] == "/v1/sessions/session-1/turns?after_sequence=2&limit=3"
         for item in requests
     )
     assert any(
         item[1]
         == (
-            "/v1/sessions/session-1/checkpoints/checkpoint-1/"
-            "diff?start_line=4&limit=12"
+            "/v1/sessions/session-1/proof?after_sequence=2"
+            "&event_limit=3&through_sequence=7&snapshot_id=snapshot-1"
         )
         for item in requests
     )
     assert any(
-        item[1].endswith("/unarchive") and bool(item[3])
+        item[1]
+        == (
+            "/v1/sessions/session-1/checkpoints/checkpoint-1/diff?start_line=4&limit=12"
+        )
         for item in requests
     )
+    assert any(item[1].endswith("/unarchive") and bool(item[3]) for item in requests)
     assert any(
         item[1].startswith("/v1/reconciliations/")
         and isinstance(item[2], dict)
         and item[2].get("approval_id") == "approval-1"
         for item in requests
     )
+    transition_requests = [
+        item for item in requests if item[1].endswith("/dispatch-invalidations")
+    ]
+    assert len(transition_requests) == 1
+    transition_payload = transition_requests[0][2]
+    assert isinstance(transition_payload, dict)
+    assert transition_payload["prior_command_type"] == "message"
+    assert transition_payload["prior_anchor_kind"] == "resolved-reconciliation"
+    assert transition_payload["prior_reconciliation_id"] == "reconciliation-1"
+    assert transition_payload["prior_material_digest"] == "c" * 64
 
 
 def test_managed_sdk_requires_keys_and_waits_boundedly(
@@ -586,10 +682,7 @@ def test_sdk_external_lookup_handles_absence_and_conflicting_results(
     monkeypatch.setattr(client.raw, "request", request)
 
     async def scenario() -> None:
-        assert (
-            await client.session_by_external_ref("test", "missing")
-            is None
-        )
+        assert await client.session_by_external_ref("test", "missing") is None
         with pytest.raises(RuntimeError, match="not unique"):
             await client.session_by_external_ref("test", "duplicate")
 

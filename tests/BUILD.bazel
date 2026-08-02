@@ -6,6 +6,7 @@ test_suite(
         ":acceptance_test",
         ":chat_pty_test",
         ":e2e_tests",
+        ":integration_scale_tests",
         ":integration_tests",
         ":parity_test",
         ":unit_tests",
@@ -60,6 +61,7 @@ py_test(
     deps = [
         "//agent_harness",
         "@agent_harness_pip//pytest",
+        "@agent_harness_pip//pytest_asyncio",
     ],
 )
 
@@ -83,6 +85,7 @@ py_test(
     deps = [
         "//agent_harness",
         "@agent_harness_pip//pytest",
+        "@agent_harness_pip//pytest_asyncio",
     ],
 )
 
@@ -103,6 +106,23 @@ py_test(
         "test_api_integration.py",
     ],
     main = "integration_test_runner.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//aiohttp",
+        "@agent_harness_pip//pytest",
+        "@agent_harness_pip//pytest_asyncio",
+    ],
+)
+
+py_test(
+    name = "integration_scale_tests",
+    srcs = [
+        "integration_scale_test_runner.py",
+        "test_api_integration.py",
+    ],
+    main = "integration_scale_test_runner.py",
+    size = "large",
+    timeout = "long",
     deps = [
         "//agent_harness",
         "@agent_harness_pip//aiohttp",

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-import subprocess
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,34 +20,42 @@ import pytest
 import agent_harness.reconciliation as reconciliation_module
 import agent_harness.safety as safety_module
 import agent_harness.worker as worker_module
+from agent_harness import child_gate
+from agent_harness import process_control as process_control_module
 from agent_harness.blobs import BlobStore
-from agent_harness.config import paths
-from agent_harness.config import prepare_paths
-from agent_harness.errors import ProviderExhaustedError
-from agent_harness.errors import ProviderUnavailableError
-from agent_harness.errors import SafetyGuardError
-from agent_harness.errors import ConflictError
-from agent_harness.errors import HarnessError
-from agent_harness.goals import create_goal
-from agent_harness.goals import make_evidence
-from agent_harness.ids import new_uuid
-from agent_harness.ids import utc_now
-from agent_harness.models import CommandReceipt
-from agent_harness.models import ProviderAttempt
-from agent_harness.models import ReconciliationDecision
-from agent_harness.models import ReconciliationRecord
-from agent_harness.providers.base import ApprovalHandler
-from agent_harness.providers.base import EventHandler
-from agent_harness.providers.base import ProviderAdapter
-from agent_harness.providers.base import ProviderEvent
-from agent_harness.providers.base import ProviderModel
-from agent_harness.providers.base import ProviderResult
-from agent_harness.providers.base import ProviderStatus
+from agent_harness.config import paths, prepare_paths
+from agent_harness.errors import (
+    ConflictError,
+    HarnessError,
+    ProviderExhaustedError,
+    ProviderUnavailableError,
+    SafetyGuardError,
+    WorkerOwnershipLostError,
+)
+from agent_harness.goals import create_goal, make_evidence
+from agent_harness.ids import new_uuid, utc_now
+from agent_harness.models import (
+    CommandReceipt,
+    ProviderAttempt,
+    ReconciliationDecision,
+    ReconciliationRecord,
+)
+from agent_harness.orchestration import command_envelope_digest, normalized_digest
+from agent_harness.proof import proof_snapshot
+from agent_harness.providers.base import (
+    ApprovalHandler,
+    ChildLaunchGate,
+    EventHandler,
+    PrePromptGate,
+    ProviderAdapter,
+    ProviderEvent,
+    ProviderModel,
+    ProviderResult,
+    ProviderStatus,
+)
+from agent_harness.reconciliation import ReconciliationManager, inspect_workspace
+from agent_harness.safety import SafetyConsumption, TurnGuard, limits_for
 from agent_harness.scheduler import Scheduler
-from agent_harness.reconciliation import ReconciliationManager
-from agent_harness.reconciliation import inspect_workspace
-from agent_harness.safety import TurnGuard
-from agent_harness.safety import limits_for
 from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
 from agent_harness.worker import SessionWorker
@@ -71,6 +84,8 @@ class ScriptedAdapter(ProviderAdapter):
         usage_turns: int = 0,
         request_approval: bool = False,
         turn_delay: float = 0.0,
+        cost: object | None = None,
+        claims_cost_reporting: bool = False,
     ) -> None:
         self.provider_id = provider
         self.fail_turns = fail_turns
@@ -78,12 +93,19 @@ class ScriptedAdapter(ProviderAdapter):
         self.usage_turns = usage_turns
         self.request_approval = request_approval
         self.turn_delay = turn_delay
+        self.cost = cost
+        self.claims_cost_reporting = claims_cost_reporting
         self.prompts: list[str] = []
         self.native_inputs: list[str] = []
         self.efforts: list[str] = []
+        self.permission_modes: list[str] = []
+        self.child_agent_limits: list[int | None] = []
         self.approval_decisions: list[dict[str, Any]] = []
         self.steered: list[str] = []
         self.interruptions = 0
+        self.process_running = False
+        self.process_pid = 4242
+        self.process_start = "proof-process-start"
 
     async def run_turn(
         self,
@@ -96,16 +118,31 @@ class ScriptedAdapter(ProviderAdapter):
         effort: str,
         event_handler: EventHandler,
         approval_handler: ApprovalHandler,
+        child_launch_gate: ChildLaunchGate | None = None,
+        pre_prompt_gate: PrePromptGate | None = None,
     ) -> ProviderResult:
         del workspace
-        del permission_mode
         del model
+        if pre_prompt_gate is not None:
+            await pre_prompt_gate()
         self.prompts.append(prompt)
         self.native_inputs.append(native_session_id)
         self.efforts.append(effort)
+        self.permission_modes.append(permission_mode)
+        if child_launch_gate is None:
+            self.child_agent_limits.append(None)
+        else:
+            self.child_agent_limits.append(child_launch_gate.limit)
         if self.fail_turns:
             self.fail_turns -= 1
             raise ProviderExhaustedError(self.provider_id)
+        await event_handler(
+            ProviderEvent(
+                "provider.prompt.accepted",
+                status="accepted",
+                native_session_id=(self.provider_id + "-native-session"),
+            )
+        )
         if self.guard_turns:
             self.guard_turns -= 1
             for unused in range(3):
@@ -115,9 +152,7 @@ class ScriptedAdapter(ProviderAdapter):
                         "tool.started",
                         text="Read",
                         metadata={"path": "SKILL.md"},
-                        native_session_id=(
-                            self.provider_id + "-native-session"
-                        ),
+                        native_session_id=(self.provider_id + "-native-session"),
                     )
                 )
                 await event_handler(
@@ -166,12 +201,18 @@ class ScriptedAdapter(ProviderAdapter):
         resolved_session_id = native_session_id
         if not resolved_session_id:
             resolved_session_id = self.provider_id + "-native-session"
+        usage: dict[str, Any] = {"total_tokens": 42}
+        if self.cost is not None:
+            if isinstance(self.cost, dict):
+                usage.update(self.cost)
+            else:
+                usage["total_cost_usd"] = self.cost
         return ProviderResult(
             provider=self.provider_id,
             native_session_id=resolved_session_id,
             native_turn_id=self.provider_id + "-turn",
             status="complete",
-            usage={"total_tokens": 42},
+            usage=usage,
         )
 
     async def models(self, workspace: Path) -> tuple[ProviderModel, ...]:
@@ -187,25 +228,28 @@ class ScriptedAdapter(ProviderAdapter):
         )
 
     def status(self) -> ProviderStatus:
+        capabilities = {
+            "approval",
+            "checkpoint",
+            "hooks",
+            "mcp",
+            "plugins",
+            "proof-fault-barrier",
+            "proof-service-fault-barrier",
+            "resume",
+            "skills",
+            "streaming",
+            "subagents",
+            "tools",
+            "worktree",
+        }
+        if self.claims_cost_reporting:
+            capabilities.add("cost-reporting")
         return ProviderStatus(
             provider=self.provider_id,
             ready=True,
             detail="scripted journey provider",
-            capabilities=frozenset(
-                {
-                    "approval",
-                    "checkpoint",
-                    "hooks",
-                    "mcp",
-                    "plugins",
-                    "resume",
-                    "skills",
-                    "streaming",
-                    "subagents",
-                    "tools",
-                    "worktree",
-                }
-            ),
+            capabilities=frozenset(capabilities),
         )
 
     async def interrupt(self) -> None:
@@ -213,6 +257,11 @@ class ScriptedAdapter(ProviderAdapter):
 
     async def steer(self, text: str) -> None:
         self.steered.append(text)
+
+    def process_identity(self) -> tuple[int, str]:
+        if not self.process_running:
+            return (0, "")
+        return (self.process_pid, self.process_start)
 
 
 class JourneyRig:
@@ -222,6 +271,8 @@ class JourneyRig:
         *,
         claude: ScriptedAdapter | None = None,
         codex: ScriptedAdapter | None = None,
+        external_ref: dict[str, str] | None = None,
+        goal_constraints: tuple[str, ...] = (),
     ) -> None:
         workspace = root / "workspace"
         _repository(workspace)
@@ -230,7 +281,22 @@ class JourneyRig:
         self.store = StateStore(harness_paths.database)
         self.blobs = BlobStore(harness_paths.blobs)
         self.session = session(workspace)
+        if external_ref is not None:
+            self.session = replace(
+                self.session,
+                external_ref=external_ref,
+            )
         self.store.create_session(self.session)
+        if goal_constraints:
+            self.store.create_goal(
+                create_goal(
+                    self.session.session_id,
+                    "Complete the bounded proof fault stage.",
+                    constraints=goal_constraints,
+                    permitted_providers=("claude", "codex"),
+                    permitted_efforts=("low", "medium", "high"),
+                )
+            )
         self.store.set_session_safety(
             self.session.session_id,
             "interactive",
@@ -251,6 +317,11 @@ class JourneyRig:
             self.adapters,
             self.session.session_id,
         )
+        self.store.register_worker(
+            self.session.session_id,
+            123,
+            self.worker.incarnation,
+        )
 
     def prime_capacity(
         self,
@@ -269,12 +340,25 @@ class JourneyRig:
         text: str,
         **route: Any,
     ) -> CommandReceipt:
+        receipt = self.enqueue_message(text, **route)
+        await self.execute(receipt.command_id)
+        return self.store.get_command(receipt.command_id)
+
+    def enqueue_message(
+        self,
+        text: str,
+        *,
+        idempotency_key: str = "",
+        **route: Any,
+    ) -> CommandReceipt:
+        if not idempotency_key:
+            idempotency_key = new_uuid()
         payload = {"text": text, **route}
         receipt = self.store.enqueue_command(
             self.session.session_id,
             "message",
             payload,
-            new_uuid(),
+            idempotency_key,
         )
         self.store.append_event(
             self.session.session_id,
@@ -284,13 +368,52 @@ class JourneyRig:
             status="accepted",
             metadata={"command_id": receipt.command_id},
         )
+        return receipt
+
+    async def execute(self, command_id: str) -> None:
         claimed = self.store.claim_command(self.session.session_id)
         assert claimed is not None
+        assert claimed.command_id == command_id
         await self.worker._message(claimed)
-        return self.store.get_command(receipt.command_id)
+
+    def authorize_xhigh(self, command_id: str, provider: str) -> None:
+        self.store.create_xhigh_authorization(
+            self.session.session_id,
+            command_id,
+            provider,
+            authorization_request_digest="a" * 64,
+            idempotency_key=new_uuid(),
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
 
     def close(self) -> None:
         self.store.close()
+
+
+@pytest.mark.asyncio
+async def test_per_turn_permission_narrows_provider_execution_and_proof(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    try:
+        rig.prime_capacity(claude=10.0, codex=70.0)
+        receipt = await rig.message(
+            "Review without changing files.",
+            provider="claude",
+            permission_mode="read-only",
+        )
+        assert receipt.status == "complete"
+        assert claude.permission_modes == ["read-only"]
+        routing_events = [
+            event
+            for event in rig.store.events(rig.session.session_id)
+            if event.event_type == "routing.selected"
+        ]
+        assert routing_events[0].metadata["parent_permission_mode"] == ("read-only")
+        assert routing_events[0].metadata["child_permission_mode"] == ("read-only")
+    finally:
+        rig.close()
 
 
 @pytest.mark.asyncio
@@ -318,10 +441,7 @@ async def test_e2e_paused_session_resumes_and_stops(
                 break
             await asyncio.sleep(0.01)
         assert current.status == "complete"
-        assert (
-            rig.store.get_session(rig.session.session_id).lifecycle
-            == "running"
-        )
+        assert rig.store.get_session(rig.session.session_id).lifecycle == "running"
 
         stopped = rig.store.enqueue_command(
             rig.session.session_id,
@@ -332,10 +452,7 @@ async def test_e2e_paused_session_resumes_and_stops(
         await asyncio.wait_for(worker_task, timeout=2)
 
         assert rig.store.get_command(stopped.command_id).status == "complete"
-        assert (
-            rig.store.get_session(rig.session.session_id).lifecycle
-            == "stopped"
-        )
+        assert rig.store.get_session(rig.session.session_id).lifecycle == "stopped"
     finally:
         if not worker_task.done():
             worker_task.cancel()
@@ -361,32 +478,345 @@ async def test_e2e_provider_resume_and_cross_provider_continuity(
             provider="claude",
             workload="review",
         )
+        fourth = await rig.message(
+            "Apply the review findings.",
+            provider="codex",
+        )
+        fifth = await rig.message(
+            "Certify the resulting state.",
+            provider="claude",
+            workload="review",
+        )
 
         codex = rig.adapters["codex"]
         claude = rig.adapters["claude"]
         assert first.status == "complete"
         assert second.status == "complete"
         assert third.status == "complete"
-        assert codex.native_inputs == ["", "codex-native-session"]
-        assert "UNIQUE_PROVIDER_NATIVE_INSTRUCTION" not in codex.prompts[0]
+        assert fourth.status == "complete"
+        assert fifth.status == "complete"
+        assert codex.native_inputs == [
+            "",
+            "codex-native-session",
+            "codex-native-session",
+        ]
+        assert "UNIQUE_PROVIDER_NATIVE_INSTRUCTION" in codex.prompts[0]
         assert codex.prompts[1] == "Now add tests."
-        assert claude.native_inputs == [""]
+        assert claude.native_inputs == ["", "claude-native-session"]
         assert "# Harness session" in claude.prompts[0]
         assert "Implement the parser." in claude.prompts[0]
         assert "codex completed the turn" in claude.prompts[0]
         assert "# Next instruction" in claude.prompts[0]
-        assert "UNIQUE_PROVIDER_NATIVE_INSTRUCTION" not in claude.prompts[0]
-        assert len(rig.store.checkpoints(rig.session.session_id)) == 6
+        assert "UNIQUE_PROVIDER_NATIVE_INSTRUCTION" in claude.prompts[0]
+        assert len(rig.store.checkpoints(rig.session.session_id)) == 10
         dispatches = rig.store._connection.execute(
             """
             SELECT crossed_boundary, state, checkpoint_id
             FROM command_dispatches ORDER BY created_at
             """
         ).fetchall()
-        assert len(dispatches) == 3
+        assert len(dispatches) == 5
         assert all(row["crossed_boundary"] == 1 for row in dispatches)
         assert all(row["state"] == "complete" for row in dispatches)
+        deliveries = rig.store._connection.execute(
+            """
+            SELECT provider, checkpoint_id, context_digest, state,
+                payload_digest, accepted_at
+            FROM context_deliveries ORDER BY delivered_at
+            """
+        ).fetchall()
+        assert [row["provider"] for row in deliveries] == [
+            "codex",
+            "claude",
+            "codex",
+            "claude",
+        ]
+        assert len({row["context_digest"] for row in deliveries}) == 4
+        assert all(row["state"] == "delivered" for row in deliveries)
+        assert all(row["payload_digest"] for row in deliveries)
+        assert all(row["accepted_at"] for row in deliveries)
+        assert deliveries[0]["checkpoint_id"] == dispatches[0]["checkpoint_id"]
+        assert deliveries[1]["checkpoint_id"] == dispatches[2]["checkpoint_id"]
+        assert deliveries[2]["checkpoint_id"] == dispatches[3]["checkpoint_id"]
+        assert deliveries[3]["checkpoint_id"] == dispatches[4]["checkpoint_id"]
     finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_native_resume_does_not_accept_context_delivery(
+    tmp_path: Path,
+) -> None:
+    class MissingNativeAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            self.prompts.append(str(values["prompt"]))
+            self.native_inputs.append(str(values["native_session_id"]))
+            event_handler = values["event_handler"]
+            await event_handler(
+                ProviderEvent(
+                    "recovery.native_resume_missing",
+                    status="failed",
+                    metadata={
+                        "provider": "claude",
+                        "native_session_id": "missing-native",
+                    },
+                )
+            )
+            raise ProviderUnavailableError("claude resume")
+
+    claude = MissingNativeAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    now = utc_now()
+    rig.store.create_attempt(
+        ProviderAttempt(
+            attempt_id=new_uuid(),
+            session_id=rig.session.session_id,
+            provider="claude",
+            native_session_id="missing-native",
+            model="claude-default",
+            effort="medium",
+            auth_mode="subscription",
+            status="complete",
+            started_at=now,
+            ended_at=now,
+        )
+    )
+    rig.store.update_session(
+        rig.session.session_id,
+        active_provider="codex",
+    )
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Resume Claude with transferred context.",
+            provider="claude",
+        )
+
+        assert receipt.status == "failed"
+        deliveries = rig.store.portable_session(rig.session.session_id)["tables"][
+            "context_deliveries"
+        ]
+        assert len(deliveries) == 1
+        assert deliveries[0]["state"] == "prepared"
+        assert deliveries[0]["accepted_at"] == ""
+        assert any(
+            event.event_type == "recovery.native_resume_missing"
+            for event in rig.store.all_events(rig.session.session_id)
+        )
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_native_state_falls_back_to_canonical_context(
+    tmp_path: Path,
+) -> None:
+    class RecoveringAdapter(ScriptedAdapter):
+        def __init__(self) -> None:
+            super().__init__("claude")
+            self.native_available = True
+            self.generation = 0
+
+        def native_session_available(
+            self,
+            workspace: Path,
+            native_session_id: str,
+        ) -> bool:
+            del workspace
+            del native_session_id
+            return self.native_available
+
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            result = await super().run_turn(**values)
+            if not str(values["native_session_id"]):
+                self.generation += 1
+                self.native_available = True
+                return replace(
+                    result,
+                    native_session_id="claude-native-" + str(self.generation),
+                )
+            return result
+
+    claude = RecoveringAdapter()
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.prime_capacity()
+    try:
+        first = await rig.message(
+            "Create the first bounded artifact.",
+            provider="claude",
+        )
+        claude.native_available = False
+        second = await rig.message(
+            "Continue without replaying the first mutation.",
+            provider="claude",
+        )
+
+        assert first.status == "complete"
+        assert second.status == "complete"
+        assert claude.native_inputs == ["", ""]
+        assert "Create the first bounded artifact." in claude.prompts[1]
+        assert claude.prompts[1].count("# Next instruction") == 1
+        assert claude.prompts[1].endswith(
+            "Continue without replaying the first mutation."
+        )
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert attempts[0].native_session_id == "claude-native-1"
+        assert attempts[1].native_session_id == "claude-native-2"
+        fallback = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "provider.native_resume.fallback"
+        ]
+        assert len(fallback) == 1
+        assert fallback[0].metadata["unavailable_native_session_id"] == (
+            "claude-native-1"
+        )
+        assert fallback[0].metadata["context_payload_digest"]
+    finally:
+        rig.close()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("attempt", "checkpoint", "context-delivery"),
+)
+@pytest.mark.asyncio
+async def test_pre_admission_setup_failure_leaves_no_capacity_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    receipt = rig.store.enqueue_command(
+        rig.session.session_id,
+        "message",
+        {"text": "Exercise setup failure."},
+        new_uuid(),
+    )
+    rig.store.append_event(
+        rig.session.session_id,
+        "user.message",
+        role="user",
+        text="Exercise setup failure.",
+        status="accepted",
+        metadata={"command_id": receipt.command_id},
+    )
+    claimed = rig.store.claim_command(rig.session.session_id)
+    assert claimed is not None
+
+    def fail(*unused: object, **unused_values: object) -> None:
+        del unused
+        del unused_values
+        raise RuntimeError("injected " + failure_stage + " failure")
+
+    if failure_stage == "attempt":
+        monkeypatch.setattr(rig.store, "create_attempt", fail)
+    if failure_stage == "checkpoint":
+        monkeypatch.setattr(worker_module, "checkpoint_workspace", fail)
+    if failure_stage == "context-delivery":
+        monkeypatch.setattr(rig.store, "prepare_context_delivery", fail)
+    try:
+        with pytest.raises(RuntimeError, match="injected"):
+            await rig.worker._execute_message(claimed)
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["provider"] == ""
+        assert envelope["state"] == "reserved"
+        assert rig.store.active_process_leases() == []
+        assert rig.store.active_unattended_provider_count("claude") == 0
+        assert rig.store.active_unattended_provider_count("codex") == 0
+        rig.store.recover_interrupted_commands(
+            rig.session.session_id,
+            "recovered-digest",
+            "recovered summary",
+        )
+        assert rig.store.get_command(receipt.command_id).status == "queued"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_cancellation_stops_provider_before_lease_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HangingAdapter(ScriptedAdapter):
+        def __init__(self) -> None:
+            super().__init__("claude")
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.provider_stopped = False
+
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            event_handler = values["event_handler"]
+            await event_handler(
+                ProviderEvent(
+                    "provider.prompt.accepted",
+                    status="accepted",
+                    native_session_id="claude-hanging-native",
+                )
+            )
+            self.started.set()
+            try:
+                await self.release.wait()
+            finally:
+                self.provider_stopped = True
+            return ProviderResult(
+                provider="claude",
+                native_session_id="claude-hanging-native",
+                native_turn_id="turn",
+                status="complete",
+                usage={"total_tokens": 1},
+            )
+
+        async def interrupt(self) -> None:
+            self.release.set()
+
+        def process_identity(self) -> tuple[int, str]:
+            return (123, "process-start")
+
+    claude = HangingAdapter()
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    released_after_stop: list[bool] = []
+    original_update = rig.store.update_process_lease
+
+    def update_lease(lease_id: str, **values: Any) -> dict[str, Any]:
+        if values.get("state") == "released":
+            released_after_stop.append(claude.provider_stopped)
+        return original_update(lease_id, **values)
+
+    monkeypatch.setattr(rig.store, "update_process_lease", update_lease)
+    receipt = rig.store.enqueue_command(
+        rig.session.session_id,
+        "message",
+        {"text": "Wait until cancelled.", "provider": "claude"},
+        new_uuid(),
+    )
+    rig.store.append_event(
+        rig.session.session_id,
+        "user.message",
+        role="user",
+        text="Wait until cancelled.",
+        status="accepted",
+        metadata={"command_id": receipt.command_id},
+    )
+    claimed = rig.store.claim_command(rig.session.session_id)
+    assert claimed is not None
+    task = asyncio.create_task(rig.worker._execute_message(claimed))
+    try:
+        await asyncio.wait_for(claude.started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert claude.provider_stopped
+        assert released_after_stop == [True]
+        assert rig.store.active_process_leases() == []
+    finally:
+        if not task.done():
+            task.cancel()
         rig.close()
 
 
@@ -491,27 +921,40 @@ async def test_worker_controls_interrupt_steer_pause_resume_and_stop(
         assert (await control("interrupt")).status == "complete"
         assert adapter.interruptions == 1
 
+        inactive = rig.store.enqueue_command(
+            rig.session.session_id,
+            "message",
+            {"text": "not active"},
+            "inactive-interrupt-target",
+        )
+        invalid_interrupt = await control(
+            "interrupt",
+            {"target_command_id": inactive.command_id},
+        )
+        assert invalid_interrupt.status == "failed"
+        assert invalid_interrupt.result["code"] == "E_CONTROL_TARGET"
+        rig.store.resolve_command(inactive.command_id, "cancelled", {})
+
+        missing_interrupt = await control(
+            "interrupt",
+            {"target_command_id": new_uuid()},
+        )
+        assert missing_interrupt.status == "failed"
+        assert missing_interrupt.result["code"] == "E_CONTROL_TARGET"
+
         rig.worker._active_adapter = None
         steer = await control("steer", {"text": "change direction"})
         assert steer.status == "failed"
         assert steer.result["code"] == "E_NO_ACTIVE_TURN"
 
         rig.worker._active_adapter = adapter
-        assert (await control("steer", {"text": "new plan"})).status == (
-            "complete"
-        )
+        assert (await control("steer", {"text": "new plan"})).status == ("complete")
         assert adapter.steered == ["new plan"]
 
         assert (await control("pause")).status == "complete"
-        assert (
-            rig.store.get_session(rig.session.session_id).lifecycle
-            == "paused"
-        )
+        assert rig.store.get_session(rig.session.session_id).lifecycle == "paused"
         assert (await control("resume")).status == "complete"
-        assert (
-            rig.store.get_session(rig.session.session_id).lifecycle
-            == "running"
-        )
+        assert rig.store.get_session(rig.session.session_id).lifecycle == "running"
 
         rig.worker._active_adapter = adapter
         assert (await control("stop")).status == "complete"
@@ -572,6 +1015,162 @@ async def test_worker_run_surfaces_restart_recovery_states(
             assert rig.store.worker_registrations() == []
         finally:
             rig.close()
+
+
+@pytest.mark.parametrize(
+    ("termination", "error_type"),
+    (
+        ("identity-invalid", ""),
+        ("termination-error", "RuntimeError"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_worker_restart_retains_unresolved_process_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    termination: str,
+    error_type: str,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    lease = rig.store.create_process_lease(
+        rig.session.session_id,
+        "codex",
+        "unattended",
+        "2099-01-01T00:00:00+00:00",
+    )
+    rig.store.update_process_lease(
+        str(lease["lease_id"]),
+        pid=123,
+        pid_start="recorded-start",
+        state="active",
+    )
+
+    async def unresolved_termination(
+        unused_pid: int,
+        unused_pid_start: str,
+    ) -> str:
+        del unused_pid
+        del unused_pid_start
+        if error_type:
+            raise RuntimeError("process identity could not be established")
+        return termination
+
+    monkeypatch.setattr(
+        worker_module,
+        "terminate_recorded_process_group",
+        unresolved_termination,
+    )
+    try:
+        await rig.worker.run()
+        session = rig.store.get_session(rig.session.session_id)
+        assert session.lifecycle == "paused"
+        assert session.attention == "needs-reconciliation"
+        active = rig.store.active_process_leases()
+        assert len(active) == 1
+        assert active[0]["lease_id"] == lease["lease_id"]
+        assert active[0]["state"] == "recovery-blocked"
+        events = rig.store.all_events(rig.session.session_id)
+        blocked = [
+            event for event in events if event.event_type == "lease.recovery.blocked"
+        ]
+        assert len(blocked) == 1
+        assert blocked[0].metadata["termination"] == termination
+        assert blocked[0].metadata["error_type"] == error_type
+        assert rig.store.worker_registrations() == []
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_recorded_dead_leader_with_live_group_blocks_recovery() -> None:
+    leader = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        (
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(60)']); "
+            "sys.stdin.buffer.read(1); "
+            "sys.exit(0)"
+        ),
+        stdin=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    leader_pid = leader.pid
+    identity = process_control_module.process_group_identity(leader_pid)
+    assert leader.stdin is not None
+    leader.stdin.write(b"x")
+    await leader.stdin.drain()
+    leader.stdin.close()
+    await leader.wait()
+    try:
+        termination = await process_control_module.terminate_recorded_process_group(
+            leader_pid,
+            identity.pid_start,
+            terminate_timeout=0.1,
+            kill_timeout=0.1,
+        )
+        assert termination == "identity-invalid"
+        assert process_control_module._group_exists(leader_pid) is True
+    finally:
+        os.killpg(leader_pid, signal.SIGKILL)
+        for unused in range(100):
+            if not process_control_module._group_exists(leader_pid):
+                break
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_worker_restart_releases_pid_reuse_without_signaling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    lease = rig.store.create_process_lease(
+        rig.session.session_id,
+        "claude",
+        "unattended",
+        "2099-01-01T00:00:00+00:00",
+    )
+    rig.store.update_process_lease(
+        str(lease["lease_id"]),
+        pid=456,
+        pid_start="prior-process-start",
+        state="active",
+    )
+    loop_ran = False
+
+    async def reused_pid(
+        unused_pid: int,
+        unused_pid_start: str,
+    ) -> str:
+        del unused_pid
+        del unused_pid_start
+        return "identity-changed"
+
+    async def no_loop() -> None:
+        nonlocal loop_ran
+        loop_ran = True
+
+    monkeypatch.setattr(
+        worker_module,
+        "terminate_recorded_process_group",
+        reused_pid,
+    )
+    monkeypatch.setattr(rig.worker, "_loop", no_loop)
+    try:
+        await rig.worker.run()
+        assert loop_ran is True
+        assert rig.store.active_process_leases() == []
+        released = rig.store.process_lease(str(lease["lease_id"]))
+        assert released["state"] == "released"
+        events = rig.store.all_events(rig.session.session_id)
+        recovered = [event for event in events if event.event_type == "lease.recovered"]
+        assert len(recovered) == 1
+        assert recovered[0].metadata["termination"] == "identity-changed"
+        assert rig.store.worker_registrations() == []
+    finally:
+        rig.close()
 
 
 @pytest.mark.asyncio
@@ -737,10 +1336,7 @@ async def test_worker_approval_defaults_and_user_event_projection(
             },
         )
         assert decision == {"decision": "accept"}
-        assert (
-            rig.store.get_session(rig.session.session_id).attention
-            == "working"
-        )
+        assert rig.store.get_session(rig.session.session_id).attention == "working"
         monkeypatch.setattr(
             rig.store,
             "turn_ref",
@@ -756,7 +1352,7 @@ async def test_worker_approval_defaults_and_user_event_projection(
         )
         projected = rig.store.all_events(rig.session.session_id)[-1]
         assert projected.role == "user"
-        assert projected.blob_digest
+        assert projected.blob_digest == ""
     finally:
         rig.close()
 
@@ -873,13 +1469,18 @@ async def test_worker_message_publish_and_failover_boundaries(
         monkeypatch.setattr(
             worker_module,
             "publish_session",
-            lambda unused_paths, unused_store, session_id: published.append(
-                session_id
-            ),
+            lambda unused_paths, unused_store, session_id: published.append(session_id),
         )
         rig.worker.paths = paths(tmp_path / "publish-state")
         await SessionWorker._message(rig.worker, claimed)
         assert published == [rig.session.session_id]
+        failover_command_id = claimed.command_id
+        rig.store.create_command_envelope(
+            failover_command_id,
+            rig.session.session_id,
+            "interactive",
+            limits_for("interactive", "implementation").as_dict(),
+        )
 
         guard = TurnGuard(limits_for("interactive", "implementation"))
 
@@ -894,7 +1495,7 @@ async def test_worker_message_publish_and_failover_boundaries(
         monkeypatch.setattr(rig.worker, "_execute_attempt", safety_failure)
         with pytest.raises(SafetyGuardError):
             await rig.worker._execute_with_failover(
-                "command",
+                failover_command_id,
                 {"provider": "codex", "effort": "low"},
                 "message",
                 guard,
@@ -907,11 +1508,41 @@ async def test_worker_message_publish_and_failover_boundaries(
         monkeypatch.setattr(rig.worker, "_execute_attempt", unavailable)
         with pytest.raises(ProviderUnavailableError):
             await rig.worker._execute_with_failover(
-                "command",
+                failover_command_id,
                 {"provider": "codex"},
                 "message",
                 TurnGuard(limits_for("interactive", "implementation")),
             )
+
+        attempted_exclusions: list[frozenset[str]] = []
+
+        async def closed_codex_transport(
+            *unused: object,
+            **values: object,
+        ) -> dict[str, str]:
+            del values
+            excluded = unused[3]
+            attempted_exclusions.append(excluded)
+            if not excluded:
+                raise ProviderUnavailableError(
+                    "codex",
+                    detail="Codex app-server connection closed",
+                )
+            return {"provider": "claude"}
+
+        monkeypatch.setattr(
+            rig.worker,
+            "_execute_attempt",
+            closed_codex_transport,
+        )
+        failover_result = await rig.worker._execute_with_failover(
+            failover_command_id,
+            {},
+            "message",
+            TurnGuard(limits_for("interactive", "implementation")),
+        )
+        assert failover_result == {"provider": "claude"}
+        assert attempted_exclusions == [frozenset(), frozenset({"codex"})]
 
         empty_guard = TurnGuard(
             replace(
@@ -921,7 +1552,7 @@ async def test_worker_message_publish_and_failover_boundaries(
         )
         with pytest.raises(ProviderUnavailableError, match="all providers"):
             await rig.worker._execute_with_failover(
-                "command",
+                failover_command_id,
                 {},
                 "message",
                 empty_guard,
@@ -996,9 +1627,7 @@ async def test_worker_attempt_guard_event_lease_and_failure_boundaries(
         assert result.status == "complete"
         event_types = {
             event.event_type
-            for event in lease_rig.store.all_events(
-                lease_rig.session.session_id
-            )
+            for event in lease_rig.store.all_events(lease_rig.session.session_id)
         }
         assert "lease.attached" in event_types
         assert "lease.released" in event_types
@@ -1049,6 +1678,177 @@ async def test_worker_attempt_guard_event_lease_and_failure_boundaries(
 
 
 @pytest.mark.asyncio
+async def test_stagnation_downgrades_then_fails_over(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StagnationGuard:
+        def __init__(self, limits: object) -> None:
+            self.limits = limits
+            self.consumption = SafetyConsumption()
+
+        def begin_attempt(self, context_tokens: int) -> str:
+            self.consumption.attempts += 1
+            self.consumption.context_tokens += context_tokens
+            return ""
+
+        def establish_material_state(self, digest: str) -> None:
+            assert digest
+
+        def note_child_admissions(self, consumed: int) -> None:
+            self.consumption.child_agents = consumed
+
+        def observe(self, event: ProviderEvent) -> str:
+            del event
+            return ""
+
+        def violation(self) -> str:
+            return "stagnation"
+
+        def warning_due(self) -> bool:
+            return False
+
+        def snapshot(self) -> dict[str, object]:
+            return {"consumption": self.consumption.as_dict()}
+
+        def recover(self) -> None:
+            return
+
+    monkeypatch.setattr(
+        worker_module,
+        "TurnGuard",
+        StagnationGuard,
+    )
+    rig = JourneyRig(
+        tmp_path,
+        codex=ScriptedAdapter("codex"),
+    )
+    rig.prime_capacity(claude=80, codex=10)
+    try:
+        receipt = await rig.message("Recover a stagnant provider turn.")
+        assert receipt.status == "failed"
+        incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert [item["action"] for item in incidents] == [
+            "downgrade",
+            "failover",
+            "pause",
+        ]
+        recoveries = [
+            item
+            for item in rig.store.all_events(rig.session.session_id)
+            if item.event_type == "recovery.started"
+        ]
+        assert [item.metadata["stage"] for item in recoveries] == [1, 2]
+    finally:
+        rig.close()
+
+
+def test_goal_limit_and_workspace_digest_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    goal = create_goal(
+        rig.session.session_id,
+        "Exercise invalid durable budget values.",
+    )
+    invalid_goal = replace(
+        goal,
+        budgets={
+            "tool_calls": True,
+            "attempts": True,
+            "child_agents": True,
+        },
+    )
+    monkeypatch.setattr(
+        rig.store,
+        "goal_for_session",
+        lambda unused_session: invalid_goal,
+    )
+    limits = limits_for("interactive", "implementation")
+    assert (
+        rig.worker._goal_limited_limits(
+            limits,
+            metered_budget=None,
+        )
+        == limits
+    )
+    rig.close()
+
+    workspace = tmp_path / "digest"
+    workspace.mkdir()
+    (workspace / "directory").mkdir()
+    (workspace / "link").symlink_to("directory", target_is_directory=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    assert (
+        worker_module._workspace_artifact_digest(
+            workspace,
+            ("directory", "link", "../outside.txt"),
+        )
+        == ""
+    )
+    (workspace / "a-large.txt").write_bytes(b"a" * 200_000)
+    (workspace / "z-after.txt").write_text("after", encoding="utf-8")
+    assert worker_module._workspace_artifact_digest(
+        workspace,
+        ("*",),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_status", "terminal_status"),
+    [
+        ("failed", "failed"),
+        ("cancelled", "cancelled"),
+        ("unknown", "failed"),
+    ],
+)
+async def test_noncomplete_provider_result_fails_closed(
+    tmp_path: Path,
+    provider_status: str,
+    terminal_status: str,
+) -> None:
+    class NoncompleteAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            del values
+            return ProviderResult(
+                provider="codex",
+                native_session_id="native-noncomplete",
+                native_turn_id="turn-noncomplete",
+                status=provider_status,
+                usage={"total_tokens": 1},
+            )
+
+    root = tmp_path / provider_status
+    root.mkdir()
+    rig = JourneyRig(root, codex=NoncompleteAdapter("codex"))
+    rig.prime_capacity(claude=95, codex=10)
+    try:
+        receipt = await rig.message("Reject a non-complete result.")
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_PROVIDER_RESULT"
+        tables = rig.store.portable_session(rig.session.session_id)["tables"]
+        assert tables["provider_attempts"][-1]["status"] == terminal_status
+        assert tables["turns"][-1]["status"] == terminal_status
+        assert tables["command_dispatches"][-1]["state"] == "failed"
+        assert len(tables["checkpoints"]) == 1
+        assert (
+            tables["command_dispatches"][-1]["checkpoint_id"]
+            == (tables["checkpoints"][0]["checkpoint_id"])
+        )
+        assert not [
+            event
+            for event in tables["events"]
+            if event["event_type"] == "checkpoint.created"
+            and event["status"] == "complete"
+        ]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_worker_approval_timeout_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1056,9 +1856,7 @@ async def test_worker_approval_timeout_boundary(
     rig = JourneyRig(tmp_path)
     try:
         monkeypatch.setattr(worker_module, "APPROVAL_POLL_LIMIT", 0)
-        assert await rig.worker._approval("", "tool", {}) == {
-            "decision": "decline"
-        }
+        assert await rig.worker._approval("", "tool", {}) == {"decision": "decline"}
     finally:
         rig.close()
 
@@ -1072,13 +1870,9 @@ async def test_idle_worker_does_not_reorder_session_history(
     worker_task = asyncio.create_task(rig.worker.run())
     try:
         await asyncio.sleep(0.35)
-        first_idle = rig.store.get_session(
-            rig.session.session_id
-        ).updated_at
+        first_idle = rig.store.get_session(rig.session.session_id).updated_at
         await asyncio.sleep(0.35)
-        second_idle = rig.store.get_session(
-            rig.session.session_id
-        ).updated_at
+        second_idle = rig.store.get_session(rig.session.session_id).updated_at
 
         assert first_idle == before
         assert second_idle == first_idle
@@ -1117,11 +1911,209 @@ async def test_e2e_capacity_exhaustion_fails_over_once(
             "exhausted",
             "complete",
         ]
-        assert any(
-            item.event_type == "routing.failover" for item in events
-        )
+        assert any(item.event_type == "routing.failover" for item in events)
         current = rig.store.get_session(rig.session.session_id)
         assert current.active_provider == "codex"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_command_limit_tightening_is_immutable_and_prompt_free(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    requested = {"max_attempts": 2, "max_seconds": 300}
+    try:
+        receipt = await rig.message(
+            "Run one bounded managed stage.",
+            safety_limits=requested,
+        )
+
+        assert receipt.status == "complete", receipt.result
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["requested_limits"] == requested
+        assert envelope["requested_limits_digest"] == normalized_digest(requested)
+        assert envelope["limits"]["max_attempts"] == 2
+        assert envelope["limits"]["max_seconds"] == 300
+        proof = proof_snapshot(rig.store, rig.session.session_id)
+        proof_envelope = next(
+            item
+            for item in proof["safety"]["envelopes"]
+            if item["command_id"] == receipt.command_id
+        )
+        assert proof_envelope["requested_limits_digest"] == normalized_digest(requested)
+        assert proof_envelope["limits"]["max_attempts"] == 2
+        assert proof_envelope["limits"]["max_seconds"] == 300
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_command_limit_widening_fails_before_provider_admission(
+    tmp_path: Path,
+) -> None:
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, codex=codex)
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity(claude=80, codex=1)
+    try:
+        receipt = await rig.message(
+            "Reject a widened managed stage.",
+            provider="codex",
+            safety_limits={"max_attempts": 4},
+        )
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_SAFETY_BUDGET"
+        assert not codex.prompts
+        assert not rig.store.attempts(rig.session.session_id)
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_transport_loss_after_dispatch_requires_reconciliation(
+    tmp_path: Path,
+) -> None:
+    class ClosedCodexAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            workspace = values["workspace"]
+            event_handler = values["event_handler"]
+            await event_handler(ProviderEvent("provider.prompt.accepted"))
+            (workspace / "ambiguous-change.txt").write_text(
+                "provider may have changed the workspace\n",
+                encoding="utf-8",
+            )
+            raise ProviderUnavailableError(
+                "codex",
+                detail="Codex app-server connection closed",
+            )
+
+    rig = JourneyRig(
+        tmp_path,
+        codex=ClosedCodexAdapter("codex"),
+    )
+    rig.prime_capacity(claude=80, codex=10)
+    try:
+        receipt = await rig.message("Recover from a closed Codex transport.")
+
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert receipt.status == "failed", receipt.result
+        assert receipt.result["code"] == "E_NEEDS_RECONCILIATION"
+        assert [item.provider for item in attempts] == ["codex"]
+        assert [item.status for item in attempts] == ["ambiguous"]
+        assert not rig.adapters["claude"].prompts
+        reconciliations = rig.store.pending_reconciliations(rig.session.session_id)
+        assert len(reconciliations) == 1
+        assert reconciliations[0].command_id == receipt.command_id
+        assert reconciliations[0].audit["discovery_checkpoint_id"]
+        assert rig.store.get_session(rig.session.session_id).attention == (
+            "needs-reconciliation"
+        )
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_child_budget_is_shared_across_provider_failover(
+    tmp_path: Path,
+) -> None:
+    class ChildThenFailAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            event_handler = values["event_handler"]
+            gate = values["child_launch_gate"]
+            assert child_gate.admit(
+                gate.database,
+                gate.command_id,
+                gate.limit,
+                "claude:Agent:visible-child",
+            )
+            del event_handler
+            return await super().run_turn(**values)
+
+    claude = ChildThenFailAdapter("claude", fail_turns=1)
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message("Use one child, then fail over.")
+
+        assert receipt.status == "complete", receipt.result
+        assert claude.child_agent_limits == [16]
+        assert codex.child_agent_limits == [16]
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["consumption"]["child_agents"] == 1
+        assert rig.store.child_launch_gate(receipt.command_id)["consumed"] == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_child_gate_survives_transport_loss_before_event(
+    tmp_path: Path,
+) -> None:
+    class LaunchThenLoseTransport(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            gate = values["child_launch_gate"]
+            assert child_gate.admit(
+                gate.database,
+                gate.command_id,
+                gate.limit,
+                "claude:Agent:lost-transport",
+            )
+            raise ProviderExhaustedError(self.provider_id)
+
+    class RetryAdapter(ScriptedAdapter):
+        def __init__(self) -> None:
+            super().__init__("codex")
+            self.second_launch_admitted = True
+
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            gate = values["child_launch_gate"]
+            self.second_launch_admitted = child_gate.admit(
+                gate.database,
+                gate.command_id,
+                gate.limit,
+                "codex:Agent:retry-child",
+            )
+            return await super().run_turn(**values)
+
+    claude = LaunchThenLoseTransport("claude")
+    codex = RetryAdapter()
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig.prime_capacity()
+    try:
+        goal = create_goal(
+            rig.session.session_id,
+            "Complete with one child launch across provider retries.",
+            budgets={"attempts": 2, "child_agents": 1},
+        )
+        rig.store.create_goal(goal)
+
+        receipt = await rig.message("Launch one child and fail over.")
+
+        assert receipt.status == "complete", receipt.result
+        assert not codex.second_launch_admitted
+        gate = rig.store.child_launch_gate(receipt.command_id)
+        assert gate["permit_limit"] == 1
+        assert gate["consumed"] == 1
+        assert (
+            rig.store.command_envelope(receipt.command_id)["consumption"][
+                "child_agents"
+            ]
+            == 1
+        )
+        proof = proof_snapshot(rig.store, rig.session.session_id)
+        proof_command = proof["commands"][0]
+        assert proof_command["session_id"] == rig.session.session_id
+        assert len(proof_command["command_envelope_digest"]) == 64
+        admissions = proof["safety"]["child_launch_admissions"]
+        assert len(admissions) == 2
+        assert [item["admitted"] for item in admissions].count(True) == 1
+        assert all(len(item["admission_key_digest"]) == 64 for item in admissions)
     finally:
         rig.close()
 
@@ -1136,9 +2128,7 @@ async def test_e2e_approval_blocks_and_resumes_the_turn(
     )
     rig.prime_capacity()
     try:
-        turn = asyncio.create_task(
-            rig.message("Run the validation.", provider="codex")
-        )
+        turn = asyncio.create_task(rig.message("Run the validation.", provider="codex"))
         approval = await _wait_for_approval(
             lambda: rig.store.pending_approvals(rig.session.session_id)
         )
@@ -1263,6 +2253,237 @@ async def test_e2e_exhausted_goal_budget_pauses_before_provider_work(
 
 
 @pytest.mark.asyncio
+async def test_e2e_goal_remainder_constrains_current_envelope(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    try:
+        goal = create_goal(
+            rig.session.session_id,
+            "Keep the current turn within the remaining goal budget.",
+            budgets={
+                "tokens": 10,
+                "context_tokens": 8,
+                "output_tokens": 7,
+                "tool_calls": 4,
+                "attempts": 1,
+                "child_agents": 1,
+                "seconds": 10_000,
+                "dollars": 2,
+            },
+        )
+        rig.store.create_goal(goal)
+
+        receipt = await rig.message(
+            "This context cannot fit.",
+            metered_budget=1,
+        )
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_SAFETY_GUARD"
+        assert not rig.adapters["claude"].prompts
+        assert not rig.adapters["codex"].prompts
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["limits"]["max_context_tokens"] == 8
+        assert envelope["limits"]["max_output_tokens"] == 7
+        assert envelope["limits"]["max_total_tokens"] == 10
+        assert envelope["limits"]["max_tool_calls"] == 4
+        assert envelope["limits"]["max_attempts"] == 1
+        assert envelope["limits"]["max_child_agents"] == 1
+        assert envelope["limits"]["max_dollars"] == 1.0
+        assert 0 < envelope["limits"]["max_seconds"] <= 10_000
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_rejects_nonpositive_metered_budget_before_provider(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    try:
+        for budget in (0, -1):
+            receipt = await rig.message(
+                "Do not spend metered credits.",
+                metered_budget=budget,
+            )
+            assert receipt.status == "failed"
+            assert receipt.result["code"] == "E_SAFETY_BUDGET"
+        assert not rig.adapters["claude"].prompts
+        assert not rig.adapters["codex"].prompts
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_name", ["tool_calls", "child_agents", "dollars"])
+async def test_e2e_zero_discretionary_goal_budget_allows_parent_turn(
+    tmp_path: Path,
+    budget_name: str,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    try:
+        goal = create_goal(
+            rig.session.session_id,
+            "Do not cross an exhausted discretionary budget.",
+            budgets={budget_name: 0},
+        )
+        rig.store.create_goal(goal)
+
+        receipt = await rig.message("Complete without discretionary resource use.")
+
+        assert receipt.status == "complete", receipt.result
+        envelope = rig.store.command_envelope(receipt.command_id)
+        if budget_name == "tool_calls":
+            assert envelope["limits"]["max_tool_calls"] == 0
+        if budget_name == "child_agents":
+            assert envelope["limits"]["max_child_agents"] == 0
+            assert rig.store.child_launch_gate(receipt.command_id)["permit_limit"] == 0
+        if budget_name == "dollars":
+            assert envelope["limits"]["max_dollars"] == 0
+            assert envelope["consumption"]["dollars"] == 0
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_limit_tightening_cannot_grant_spend_under_zero_dollar_goal(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    rig.store.create_goal(
+        create_goal(
+            rig.session.session_id,
+            "Never authorize metered credits.",
+            budgets={"dollars": 0},
+        )
+    )
+    try:
+        receipt = await rig.message(
+            "Reject an attempted spend grant.",
+            safety_limits={"max_dollars": 100},
+        )
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_SAFETY_BUDGET"
+        assert not rig.adapters["claude"].prompts
+        assert not rig.adapters["codex"].prompts
+        assert not rig.store.attempts(rig.session.session_id)
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_nonfinite_limits_and_metered_budget_never_reach_provider(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    try:
+        requests = [
+            {"safety_limits": {"binding_ceiling": math.nan}},
+            {"safety_limits": {"max_dollars": math.inf}},
+            {"metered_budget": math.nan},
+        ]
+        for index, request in enumerate(requests):
+            receipt = await rig.message(
+                "Reject non-finite request " + str(index) + ".",
+                **request,
+            )
+            assert receipt.status == "failed"
+            assert receipt.result["code"] == "E_SAFETY_BUDGET"
+        assert not rig.adapters["claude"].prompts
+        assert not rig.adapters["codex"].prompts
+        assert not rig.store.attempts(rig.session.session_id)
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_zero_dollar_goal_rejects_metered_route_before_provider(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter(
+        "claude",
+        cost=0.1,
+        claims_cost_reporting=True,
+    )
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.scheduler._usage_cache = {
+        "claude": _usage("claude", 20.0, credits=True),
+        "codex": _usage("codex", 20.0),
+    }
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    try:
+        goal = create_goal(
+            rig.session.session_id,
+            "Use subscription capacity only.",
+            budgets={"dollars": 0},
+        )
+        rig.store.create_goal(goal)
+
+        receipt = await rig.message(
+            "Do not enter the metered route.",
+            provider="claude",
+            metered_budget=1,
+        )
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_PROVIDER_UNAVAILABLE"
+        assert not claude.prompts
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reported_cost", "expected_cost"),
+    [
+        (None, None),
+        ({"total_cost_usd": -1, "cost_usd": 0}, None),
+        (0.5, 0.5),
+    ],
+)
+async def test_e2e_metered_work_requires_exact_bounded_cost(
+    tmp_path: Path,
+    reported_cost: object | None,
+    expected_cost: float | None,
+) -> None:
+    claude = ScriptedAdapter(
+        "claude",
+        cost=reported_cost,
+        claims_cost_reporting=True,
+    )
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.scheduler._usage_cache = {
+        "claude": _usage("claude", 20.0, credits=True),
+        "codex": _usage("codex", 20.0),
+    }
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    try:
+        receipt = await rig.message(
+            "Use the explicit metered envelope.",
+            provider="claude",
+            metered_budget=1,
+        )
+
+        envelope = rig.store.command_envelope(receipt.command_id)
+        if expected_cost is None:
+            assert receipt.status == "failed"
+            assert envelope["guard_reason"] == "dollar-accounting"
+        else:
+            assert receipt.status == "complete"
+            assert envelope["consumption"]["dollars"] == expected_cost
+            assert envelope["consumption"]["exact_dollars"] is True
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_unattended_admission_requires_fresh_headroom(
     tmp_path: Path,
 ) -> None:
@@ -1319,12 +2540,11 @@ async def test_e2e_hard_usage_limit_interrupts_without_recovery(
 
 
 @pytest.mark.asyncio
-async def test_e2e_repetition_downgrades_then_fails_over_in_one_envelope(
+async def test_e2e_repetition_pauses_without_another_provider_attempt(
     tmp_path: Path,
 ) -> None:
     claude = ScriptedAdapter("claude", guard_turns=2)
-    codex = ScriptedAdapter("codex")
-    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig = JourneyRig(tmp_path, claude=claude)
     rig.store.set_session_safety(
         rig.session.session_id,
         "unattended",
@@ -1333,19 +2553,998 @@ async def test_e2e_repetition_downgrades_then_fails_over_in_one_envelope(
     try:
         receipt = await rig.message("Implement without rereading context.")
 
+        assert receipt.status == "failed", receipt.result
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [item.provider for item in attempts] == ["claude"]
+        assert claude.efforts == ["high"]
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["recovery_stage"] == 0
+        assert envelope["consumption"]["attempts"] == 1
+        assert len(rig.store.guard_incidents(rig.session.session_id)) == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_explicit_effort_pin_is_preserved_during_failover(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude", fail_turns=1)
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Preserve the exact effort pin.",
+            effort="high",
+        )
+
         assert receipt.status == "complete", receipt.result
         attempts = rig.store.attempts(rig.session.session_id)
-        assert [item.provider for item in attempts] == [
-            "claude",
-            "claude",
-            "codex",
+        assert [item.provider for item in attempts] == ["claude", "codex"]
+        assert claude.efforts == ["high"]
+        assert codex.efforts == ["high"]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_repeated_failed_dispatch_pauses_before_provider(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude", fail_turns=1)
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.prime_capacity()
+    try:
+        first = await rig.message(
+            "Repeat-safe instruction.",
+            provider="claude",
+        )
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="running",
+            attention="idle",
+        )
+        second = await rig.message(
+            "Repeat-safe instruction.",
+            provider="claude",
+        )
+
+        assert first.status == "failed"
+        assert second.status == "failed"
+        assert second.result["code"] == "E_SAFETY_GUARD"
+        assert len(claude.prompts) == 1
+        envelope = rig.store.command_envelope(second.command_id)
+        assert envelope["guard_reason"] == "repeated-instruction"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_repeated_completed_dispatch_pauses_before_provider(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.prime_capacity()
+    try:
+        first = await rig.message(
+            "Repeat-safe completed instruction.",
+            provider="claude",
+        )
+        second = await rig.message(
+            "Repeat-safe completed instruction.",
+            provider="claude",
+        )
+        (Path(rig.session.worktree) / "material.txt").write_text(
+            "new material state\n",
+            encoding="utf-8",
+        )
+        material_checkpoint = checkpoint_workspace(
+            rig.store.get_session(rig.session.session_id),
+            rig.blobs,
+            sequence=rig.store.last_sequence(rig.session.session_id),
+            provider="claude",
+            native_session_id="claude-native-session",
+            context_text="material generation changed",
+        )
+        rig.store.add_checkpoint(material_checkpoint)
+        third = await rig.message(
+            "Repeat-safe completed instruction.",
+            provider="claude",
+        )
+        fourth = await rig.message(
+            "Repeat-safe completed instruction.",
+            provider="claude",
+        )
+        reason = "Operator confirmed a new bounded dispatch generation."
+        retained_receipt = {"actor": "test-operator", "scope": "retry"}
+        authorization = {
+            "schema": ("p13i/agent-harness/dispatch-invalidation-authorization/v1"),
+            "session_id": rig.session.session_id,
+            "reason": reason,
+            "receipt": retained_receipt,
+            "receipt_sha256": normalized_digest(retained_receipt),
+        }
+        rig.store.create_dispatch_invalidation(
+            rig.session.session_id,
+            reason=reason,
+            authorization=authorization,
+            request_digest=normalized_digest(
+                {"reason": reason, "authorization": authorization}
+            ),
+            idempotency_key="new-dispatch-generation",
+        )
+        fifth = await rig.message(
+            "Repeat-safe completed instruction.",
+            provider="claude",
+        )
+
+        assert first.status == "complete"
+        assert second.status == "failed"
+        assert second.result["code"] == "E_SAFETY_GUARD"
+        assert third.status == "complete"
+        assert fourth.status == "failed"
+        assert fourth.result["code"] == "E_SAFETY_GUARD"
+        assert fifth.status == "complete"
+        assert len(claude.prompts) == 3
+        envelope = rig.store.command_envelope(second.command_id)
+        assert envelope["guard_reason"] == "repeated-instruction"
+        proof_events = rig.store.all_events(rig.session.session_id)
+        assert any(
+            event.event_type == "dispatch.invalidation" for event in proof_events
+        )
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_distinct_managed_steps_pause_on_repeated_governing_artifacts(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    workspace = Path(rig.session.worktree)
+    (workspace / "AGENTS.md").write_text("stable guidance\n", encoding="utf-8")
+    (workspace / "plans").mkdir()
+    (workspace / "plans" / "stable.gpt.md").write_text(
+        "stable plan\n",
+        encoding="utf-8",
+    )
+    skill = workspace / ".agents" / "skills" / "stable"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("stable skill\n", encoding="utf-8")
+    rig.prime_capacity()
+    try:
+        first = await rig.message(
+            "Complete managed stage one.",
+            provider="claude",
+            turn_ref={"step_id": "stage-1", "agent_role": "builder"},
+        )
+        second = await rig.message(
+            "Complete managed stage two.",
+            provider="claude",
+            turn_ref={"step_id": "stage-2", "agent_role": "builder"},
+        )
+
+        assert first.status == "complete", first.result
+        assert second.status == "failed", second.result
+        assert second.result["code"] == "E_SAFETY_GUARD"
+        envelope = rig.store.command_envelope(second.command_id)
+        assert envelope["guard_reason"] in {
+            "repeated-context",
+            "repeated-workspace_instruction",
+            "repeated-plan",
+            "repeated-skill",
+        }
+    finally:
+        rig.close()
+
+
+def _advance_orchestration_generation(
+    rig: JourneyRig,
+    prior_command_id: str,
+    next_turn_ref: dict[str, str],
+    idempotency_key: str,
+    policy: dict[str, Any],
+    transition_sequence: int,
+    next_command_payload: dict[str, Any],
+) -> dict[str, Any]:
+    reason = "Advance one completed orchestration stage."
+    anchor = rig.store.dispatch_transition_anchor(rig.session.session_id)
+    assert anchor["eligible"] is True
+    assert anchor["prior_command_id"] == prior_command_id
+    prior_checkpoint_id = str(anchor["prior_checkpoint_id"])
+    prior_material_digest = str(anchor["prior_material_digest"])
+    prior_generation_digest = str(anchor["prior_generation_digest"])
+    policy_sha256 = normalized_digest(policy)
+    execution_profile = str(rig.store.session_safety(rig.session.session_id)["profile"])
+    next_command_digest = command_envelope_digest(
+        "message",
+        next_command_payload,
+        execution_profile,
+    )
+    retained_receipt = {
+        "session_id": rig.session.session_id,
+        "external_ref": rig.session.external_ref,
+        "goal_id": str(rig.store.goal_for_session(rig.session.session_id).goal_id),
+        "prior_command_id": prior_command_id,
+        "prior_command_type": anchor["prior_command_type"],
+        "prior_anchor_kind": anchor["prior_anchor_kind"],
+        "prior_reconciliation_id": anchor["prior_reconciliation_id"],
+        "prior_reconciliation_resolution": anchor["prior_reconciliation_resolution"],
+        "prior_checkpoint_id": prior_checkpoint_id,
+        "prior_generation_digest": prior_generation_digest,
+        "prior_material_digest": prior_material_digest,
+        "next_turn_ref": next_turn_ref,
+        "transition_sequence": transition_sequence,
+        "epoch_id": str(policy["epoch_id"]),
+        "policy_sha256": policy_sha256,
+        "next_command_digest": next_command_digest,
+    }
+    authorization = {
+        "schema": (
+            "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+        ),
+        "session_id": rig.session.session_id,
+        "goal_id": str(rig.store.goal_for_session(rig.session.session_id).goal_id),
+        "reason": reason,
+        "prior_command_id": prior_command_id,
+        "prior_command_type": anchor["prior_command_type"],
+        "prior_anchor_kind": anchor["prior_anchor_kind"],
+        "prior_reconciliation_id": anchor["prior_reconciliation_id"],
+        "prior_reconciliation_resolution": anchor["prior_reconciliation_resolution"],
+        "prior_checkpoint_id": prior_checkpoint_id,
+        "prior_generation_digest": prior_generation_digest,
+        "prior_material_digest": prior_material_digest,
+        "next_turn_ref": next_turn_ref,
+        "transition_sequence": transition_sequence,
+        "epoch_id": str(policy["epoch_id"]),
+        "external_orchestrator": rig.session.external_ref["orchestrator"],
+        "external_job_id": rig.session.external_ref["job_id"],
+        "policy_sha256": policy_sha256,
+        "next_command_digest": next_command_digest,
+        "receipt": retained_receipt,
+        "receipt_sha256": normalized_digest(retained_receipt),
+    }
+    wire_authorization = authorization
+    if transition_sequence == 1:
+        wire_authorization["policy"] = policy
+    else:
+        wire_authorization["policy_ref"] = {
+            "policy_sha256": policy_sha256,
+            "session_id": rig.session.session_id,
+            "goal_id": str(rig.store.goal_for_session(rig.session.session_id).goal_id),
+            "epoch_id": str(policy["epoch_id"]),
+        }
+    stored_authorization = wire_authorization
+    if transition_sequence > 1:
+        stored_authorization = dict(wire_authorization)
+        stored_authorization["policy"] = policy
+    payload = {
+        "reason": reason,
+        "prior_command_id": prior_command_id,
+        "prior_command_type": anchor["prior_command_type"],
+        "prior_anchor_kind": anchor["prior_anchor_kind"],
+        "prior_reconciliation_id": anchor["prior_reconciliation_id"],
+        "prior_reconciliation_resolution": anchor["prior_reconciliation_resolution"],
+        "prior_checkpoint_id": prior_checkpoint_id,
+        "prior_generation_digest": prior_generation_digest,
+        "prior_material_digest": prior_material_digest,
+        "next_turn_ref": next_turn_ref,
+        "transition_sequence": transition_sequence,
+        "next_command_digest": next_command_digest,
+        "authorization": wire_authorization,
+    }
+    return rig.store.create_dispatch_invalidation(
+        rig.session.session_id,
+        reason=reason,
+        authorization=stored_authorization,
+        request_digest=normalized_digest(payload),
+        idempotency_key=idempotency_key,
+        prior_command_id=prior_command_id,
+        next_turn_ref=next_turn_ref,
+        authorization_digest=normalized_digest(wire_authorization),
+    )
+
+
+def _install_transition_policy(
+    rig: JourneyRig,
+    *,
+    allowed_agent_roles: list[str],
+    allowed_step_prefixes: list[str],
+    transitions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    policy = {
+        "schema": ("p13i/agent-harness/dispatch-generation-transition-policy/v1"),
+        "session_id": rig.session.session_id,
+        "external_ref": rig.session.external_ref,
+        "epoch_id": "journey-epoch-1",
+        "allowed_agent_roles": allowed_agent_roles,
+        "allowed_step_prefixes": allowed_step_prefixes,
+        "max_transitions": len(transitions),
+        "transitions": transitions,
+    }
+    rig.store.create_goal(
+        create_goal(
+            rig.session.session_id,
+            "Complete only declared orchestration stages.",
+            constraints=(
+                "dispatch-generation-transition-policy-sha256:"
+                + normalized_digest(policy),
+                "dispatch-generation-transition-epoch:" + str(policy["epoch_id"]),
+            ),
+            permitted_providers=("claude", "codex"),
+            permitted_efforts=("low", "medium", "high"),
+        )
+    )
+    return policy
+
+
+@pytest.mark.asyncio
+async def test_e2e_control_anchor_consumes_exact_next_message(
+    tmp_path: Path,
+) -> None:
+    class InterruptibleAdapter(ScriptedAdapter):
+        def __init__(self) -> None:
+            super().__init__("codex")
+            self.started = asyncio.Event()
+            self.interrupted = asyncio.Event()
+
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            if self.interrupted.is_set():
+                return await super().run_turn(**values)
+            pre_prompt_gate = values["pre_prompt_gate"]
+            if pre_prompt_gate is not None:
+                await pre_prompt_gate()
+            event_handler = values["event_handler"]
+            await event_handler(
+                ProviderEvent(
+                    "provider.prompt.accepted",
+                    status="accepted",
+                    native_session_id="codex-interrupted",
+                )
+            )
+            self.started.set()
+            await self.interrupted.wait()
+            return ProviderResult(
+                provider="codex",
+                native_session_id="codex-interrupted",
+                native_turn_id="codex-interrupted-turn",
+                status="cancelled",
+                usage={"total_tokens": 1},
+            )
+
+        async def interrupt(self) -> None:
+            self.interruptions += 1
+            self.interrupted.set()
+
+    external_ref = {
+        "orchestrator": "p13i/machines/cs-builder",
+        "job_id": "control-anchor-consumption",
+    }
+    codex = InterruptibleAdapter()
+    rig = JourneyRig(
+        tmp_path,
+        codex=codex,
+        external_ref=external_ref,
+    )
+    next_turn_ref = {
+        "step_id": "resume-after-interrupt",
+        "agent_role": "builder",
+    }
+    next_command_payload = {
+        "text": "Resume the exact stage after interruption.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    first_turn_ref = {
+        "step_id": "post-provider-transition",
+        "agent_role": "builder",
+    }
+    first_command_payload = {
+        "text": "Consume the first exact transition.",
+        "provider": "codex",
+        "turn_ref": first_turn_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["builder"],
+        allowed_step_prefixes=[
+            "post-provider-transition",
+            "resume-after-interrupt",
+        ],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": first_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    first_command_payload,
+                    "unattended",
+                ),
+            },
+            {
+                "sequence": 2,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            },
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        prior = await rig.message(
+            "Complete the provider stage before interruption.",
+            provider="claude",
+            turn_ref={"step_id": "implement", "agent_role": "builder"},
+        )
+        assert prior.status == "complete"
+        _advance_orchestration_generation(
+            rig,
+            prior.command_id,
+            first_turn_ref,
+            "provider-to-first-control-lineage-message",
+            policy,
+            1,
+            first_command_payload,
+        )
+        first = rig.enqueue_message(**first_command_payload)
+        claimed_first = rig.store.claim_command(rig.session.session_id)
+        assert claimed_first is not None
+        assert claimed_first.command_id == first.command_id
+        message_task = asyncio.create_task(rig.worker._message(claimed_first))
+        await asyncio.wait_for(codex.started.wait(), timeout=2)
+        assert rig.store.get_command(first.command_id).status == "dispatching"
+        interrupt = rig.store.enqueue_command(
+            rig.session.session_id,
+            "interrupt",
+            {"target_command_id": first.command_id},
+            "bounded-control-interrupt",
+        )
+        await asyncio.wait_for(message_task, timeout=2)
+        assert rig.store.get_command(interrupt.command_id).status == "complete"
+        assert codex.interruptions == 1
+        assert rig.store.get_command(first.command_id).status == "failed"
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert attempts[-1].status == "cancelled"
+        assert attempts[-1].ended_at
+        interrupted_events = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "turn.interrupted"
         ]
-        assert claude.efforts == ["high", "medium"]
-        assert codex.efforts == ["low"]
-        envelope = rig.store.command_envelope(receipt.command_id)
-        assert envelope["recovery_stage"] == 2
-        assert envelope["consumption"]["attempts"] == 3
-        assert len(rig.store.guard_incidents(rig.session.session_id)) == 2
+        assert len(interrupted_events) == 1
+        assert interrupted_events[0].metadata["control_command_id"] == (
+            interrupt.command_id
+        )
+        assert interrupted_events[0].metadata["target_command_id"] == (first.command_id)
+        control_proof = proof_snapshot(rig.store, rig.session.session_id)
+        proof_control = next(
+            command
+            for command in control_proof["commands"]
+            if command["command_id"] == interrupt.command_id
+        )
+        assert proof_control["result"]["target_command_id"] == first.command_id
+        assert (
+            proof_control["result"]["checkpoint_id"]
+            == (interrupted_events[0].metadata["checkpoint_id"])
+        )
+        assert (
+            proof_control["result"]["workspace_material_digest"]
+            == (interrupted_events[0].metadata["workspace_material_digest"])
+        )
+        proof_interrupt = next(
+            event
+            for event in control_proof["events"]
+            if event["event_type"] == "turn.interrupted"
+        )
+        assert proof_interrupt["metadata"] == interrupted_events[0].metadata
+        anchor = rig.store.dispatch_transition_anchor(rig.session.session_id)
+        assert anchor["prior_command_id"] == interrupt.command_id
+        assert anchor["prior_anchor_kind"] == "control-command"
+
+        transition = _advance_orchestration_generation(
+            rig,
+            interrupt.command_id,
+            next_turn_ref,
+            "control-anchor-next-message",
+            policy,
+            2,
+            next_command_payload,
+        )
+        resumed = await rig.message(**next_command_payload)
+
+        assert resumed.status == "complete"
+        consumed = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "dispatch.generation.transition.consumed"
+        ]
+        assert len(consumed) == 2
+        assert (
+            consumed[1].metadata["invalidation_id"] == (transition["invalidation_id"])
+        )
+        assert consumed[1].metadata["command_id"] == resumed.command_id
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_noop_review_transition_allows_one_verifier_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/agent-harness-proof-builder",
+        "job_id": "builder-proof-noop-review",
+    }
+    rig = JourneyRig(tmp_path, external_ref=external_ref)
+    next_turn_ref = {"step_id": "verify", "agent_role": "verifier"}
+    next_command_payload = {
+        "text": "Verify the reviewed implementation.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["verifier"],
+        allowed_step_prefixes=["verify"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    workspace = Path(rig.session.worktree)
+    (workspace / "AGENTS.md").write_text("stable guidance\n", encoding="utf-8")
+    (workspace / "plans").mkdir()
+    (workspace / "plans" / "proof.gpt.md").write_text(
+        "stable plan\n",
+        encoding="utf-8",
+    )
+    rig.prime_capacity()
+    try:
+        reviewed = await rig.message(
+            "Review the completed implementation without editing it.",
+            provider="claude",
+            turn_ref={"step_id": "review", "agent_role": "reviewer"},
+        )
+        transition = _advance_orchestration_generation(
+            rig,
+            reviewed.command_id,
+            next_turn_ref,
+            "review-to-verify",
+            policy,
+            1,
+            next_command_payload,
+        )
+        forged_payloads = [
+            {
+                **next_command_payload,
+                "text": "Run a different instruction under the verifier stage.",
+            },
+            {**next_command_payload, "effort": "medium"},
+            {
+                **next_command_payload,
+                "proof_fault_probe": {
+                    "provider": "codex",
+                    "stage": "before-prompt",
+                },
+            },
+        ]
+        for forged_payload in forged_payloads:
+            forged = await rig.message(**forged_payload)
+            assert forged.status == "failed"
+            assert forged.result["code"] == "E_SAFETY_GUARD"
+            assert (
+                rig.store.command_envelope(forged.command_id)["guard_reason"]
+                == "dispatch-transition-command-mismatch"
+            )
+            rig.store.update_session(
+                rig.session.session_id,
+                lifecycle="running",
+                attention="idle",
+            )
+        out_of_band = workspace / "out-of-band.txt"
+        out_of_band.write_text("changed after authorization\n", encoding="utf-8")
+        changed = await rig.message(**next_command_payload)
+        assert changed.status == "failed"
+        assert (
+            rig.store.command_envelope(changed.command_id)["guard_reason"]
+            == "dispatch-transition-material-mismatch"
+        )
+        out_of_band.unlink()
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="running",
+            attention="idle",
+        )
+        prompts_before_race = sum(
+            len(adapter.prompts) for adapter in rig.adapters.values()
+        )
+        original_admission = rig.store.reserve_route_admission
+
+        def mutate_before_admission(*args: Any, **kwargs: Any):
+            out_of_band.write_text(
+                "changed after transition reservation\n",
+                encoding="utf-8",
+            )
+            return original_admission(*args, **kwargs)
+
+        monkeypatch.setattr(
+            rig.store,
+            "reserve_route_admission",
+            mutate_before_admission,
+        )
+        raced = await rig.message(**next_command_payload)
+        assert raced.status == "failed"
+        assert raced.result["code"] == "E_CONFLICT"
+        assert (
+            sum(len(adapter.prompts) for adapter in rig.adapters.values())
+            == prompts_before_race
+        )
+        monkeypatch.setattr(
+            rig.store,
+            "reserve_route_admission",
+            original_admission,
+        )
+        out_of_band.unlink()
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="running",
+            attention="idle",
+        )
+        verified = await rig.message(**next_command_payload)
+        replay = await rig.message(
+            "Run another verification without a new boundary.",
+            provider="codex",
+            turn_ref=next_turn_ref,
+        )
+
+        assert reviewed.status == "complete", reviewed.result
+        assert transition["prior_command_id"] == reviewed.command_id
+        assert verified.status == "complete", verified.result
+        assert replay.status == "failed"
+        assert replay.result["code"] == "E_SAFETY_GUARD"
+        assert (
+            rig.store.command_envelope(replay.command_id)["guard_reason"]
+            == "dispatch-transition-already-consumed"
+        )
+        consumed = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "dispatch.generation.transition.consumed"
+        ]
+        assert len(consumed) == 1
+        assert consumed[0].metadata["invalidation_id"] == transition["invalidation_id"]
+        assert consumed[0].metadata["command_id"] == verified.command_id
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_compact_followup_transition_consumes_exact_second_stage(
+    tmp_path: Path,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/cs-sre",
+        "job_id": "compact-followup",
+    }
+    rig = JourneyRig(tmp_path, external_ref=external_ref)
+    verify_ref = {"step_id": "verify", "agent_role": "sre"}
+    publish_ref = {"step_id": "publish", "agent_role": "sre"}
+    verify_payload = {
+        "text": "Verify the reviewed implementation.",
+        "provider": "codex",
+        "turn_ref": verify_ref,
+    }
+    publish_payload = {
+        "text": "Publish the verified implementation.",
+        "provider": "codex",
+        "turn_ref": publish_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["sre"],
+        allowed_step_prefixes=["verify", "publish"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": verify_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    verify_payload,
+                    "unattended",
+                ),
+            },
+            {
+                "sequence": 2,
+                "next_turn_ref": publish_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    publish_payload,
+                    "unattended",
+                ),
+            },
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        reviewed = await rig.message(
+            "Review the implementation.",
+            provider="claude",
+            turn_ref={"step_id": "review", "agent_role": "reviewer"},
+        )
+        first_transition = _advance_orchestration_generation(
+            rig,
+            reviewed.command_id,
+            verify_ref,
+            "compact-review-to-verify",
+            policy,
+            1,
+            verify_payload,
+        )
+        verified = await rig.message(**verify_payload)
+        second_transition = _advance_orchestration_generation(
+            rig,
+            verified.command_id,
+            publish_ref,
+            "compact-verify-to-publish",
+            policy,
+            2,
+            publish_payload,
+        )
+        published = await rig.message(**publish_payload)
+
+        assert reviewed.status == "complete", reviewed.result
+        assert verified.status == "complete", verified.result
+        assert published.status == "complete", published.result
+        assert first_transition["transition_sequence"] == 1
+        assert second_transition["transition_sequence"] == 2
+        proof = proof_snapshot(rig.store, rig.session.session_id)
+        ledger = proof["dispatch_transition_ledger"]
+        assert ledger["complete"] is True
+        assert ledger["policy_count"] == 1
+        assert [item["state"] for item in ledger["receipts"]] == [
+            "consumed",
+            "consumed",
+        ]
+        with rig.store._lock:
+            retained = rig.store._connection.execute(
+                """
+                SELECT payload_json FROM authorization_receipts
+                WHERE schema = ? ORDER BY created_at, operation_id
+                """,
+                ("p13i/agent-harness/dispatch-generation-transition-authorization/v1",),
+            ).fetchall()
+        retained_payloads = [json.loads(str(row["payload_json"])) for row in retained]
+        assert len(retained_payloads) == 2
+        assert all("policy" not in item for item in retained_payloads)
+        assert retained_payloads[1]["policy_ref"]["policy_sha256"] == (
+            normalized_digest(policy)
+        )
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_transition_rebinds_after_preboundary_route_failure(
+    tmp_path: Path,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/agent-harness-proof-builder",
+        "job_id": "builder-proof-route-retry",
+    }
+    rig = JourneyRig(tmp_path, external_ref=external_ref)
+    next_turn_ref = {"step_id": "verify", "agent_role": "verifier"}
+    next_command_payload = {
+        "text": "Verify the reviewed implementation.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["verifier"],
+        allowed_step_prefixes=["verify"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        reviewed = await rig.message(
+            "Review the completed implementation.",
+            provider="claude",
+            turn_ref={"step_id": "review", "agent_role": "reviewer"},
+        )
+        _advance_orchestration_generation(
+            rig,
+            reviewed.command_id,
+            next_turn_ref,
+            "review-to-verify-route-retry",
+            policy,
+            1,
+            next_command_payload,
+        )
+        rig.prime_capacity(claude=95.0, codex=95.0)
+        unavailable = await rig.message(**next_command_payload)
+        assert unavailable.status == "failed"
+        assert unavailable.result["code"] == "E_PROVIDER_UNAVAILABLE"
+
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="running",
+            attention="idle",
+        )
+        rig.prime_capacity()
+        retried = await rig.message(**next_command_payload)
+
+        assert retried.status == "complete", retried.result
+        transition_events = [
+            event.event_type
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type.startswith("dispatch.generation.transition.")
+        ]
+        assert transition_events == [
+            "dispatch.generation.transition.reserved",
+            "dispatch.generation.transition.released",
+            "dispatch.generation.transition.reserved",
+            "dispatch.generation.transition.consumed",
+        ]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_exact_sre_tick_repeats_only_after_bound_transition(
+    tmp_path: Path,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/agent-harness-proof",
+        "job_id": "cs-sre-stable-ticks",
+    }
+    rig = JourneyRig(tmp_path, external_ref=external_ref)
+    next_turn_ref = {"step_id": "tick-2", "agent_role": "cs-sre"}
+    next_command_payload = {
+        "text": "sre()",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["cs-sre"],
+        allowed_step_prefixes=["tick-"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        first = await rig.message(
+            "sre()",
+            provider="codex",
+            turn_ref={"step_id": "tick-1", "agent_role": "cs-sre"},
+        )
+        _advance_orchestration_generation(
+            rig,
+            first.command_id,
+            next_turn_ref,
+            "sre-tick-1-to-2",
+            policy,
+            1,
+            next_command_payload,
+        )
+        second = await rig.message(**next_command_payload)
+
+        assert first.status == "complete", first.result
+        assert second.status == "complete", second.result
+        assert len(rig.adapters["codex"].prompts) == 2
+    finally:
+        rig.close()
+
+
+@pytest.mark.parametrize(
+    ("component", "expected_reason"),
+    (
+        ("instruction", "repeated-instruction"),
+        ("context", "repeated-context"),
+        ("workspace_instruction", "repeated-workspace_instruction"),
+        ("plan", "repeated-plan"),
+        ("skill", "repeated-skill"),
+    ),
+)
+def test_distinct_managed_steps_reject_each_repeated_component(
+    tmp_path: Path,
+    component: str,
+    expected_reason: str,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    workspace = Path(rig.session.worktree)
+    if component == "workspace_instruction":
+        (workspace / "AGENTS.md").write_text(
+            "stable guidance\n",
+            encoding="utf-8",
+        )
+    if component == "plan":
+        (workspace / "plans").mkdir()
+        (workspace / "plans" / "stable.gpt.md").write_text(
+            "stable plan\n",
+            encoding="utf-8",
+        )
+    if component == "skill":
+        skill = workspace / ".agents" / "skills" / "stable"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "stable skill\n",
+            encoding="utf-8",
+        )
+    first_instruction = "instruction-a"
+    second_instruction = "instruction-b"
+    first_context = "context-a"
+    second_context = "context-b"
+    if component == "instruction":
+        second_instruction = first_instruction
+    if component == "context":
+        second_context = first_context
+    first_turn_ref = {"step_id": "stage-1", "agent_role": "builder"}
+    second_turn_ref = {"step_id": "stage-2", "agent_role": "builder"}
+    try:
+        rig.worker._guard_repeated_dispatch(
+            new_uuid(),
+            first_instruction,
+            first_context,
+            workspace,
+            first_turn_ref,
+            "unattended",
+        )
+        with pytest.raises(SafetyGuardError) as raised:
+            rig.worker._guard_repeated_dispatch(
+                new_uuid(),
+                second_instruction,
+                second_context,
+                workspace,
+                second_turn_ref,
+                "unattended",
+            )
+        assert raised.value.reason == expected_reason
     finally:
         rig.close()
 
@@ -1361,26 +3560,16 @@ async def test_e2e_xhigh_requires_and_consumes_one_authorization(
     )
     rig.prime_capacity()
     try:
-        rejected = await rig.message(
+        waiting = await rig.message(
             "Use maximum effort.",
             provider="codex",
             effort="xhigh",
         )
-        assert rejected.status == "failed"
-        assert rejected.result["code"] == "E_SAFETY_EFFORT"
+        assert waiting.status == "awaiting-xhigh-authorization"
 
-        rig.store.extend_session_safety(
-            rig.session.session_id,
-            {
-                "reason": "operator approved one bounded attempt",
-                "allow_xhigh_once": True,
-            },
-        )
-        accepted = await rig.message(
-            "Use maximum effort once.",
-            provider="codex",
-            effort="xhigh",
-        )
+        rig.authorize_xhigh(waiting.command_id, "codex")
+        await rig.execute(waiting.command_id)
+        accepted = rig.store.get_command(waiting.command_id)
 
         assert accepted.status == "complete"
         codex = rig.adapters["codex"]
@@ -1392,11 +3581,440 @@ async def test_e2e_xhigh_requires_and_consumes_one_authorization(
 
 
 @pytest.mark.asyncio
+async def test_e2e_one_xhigh_authorization_never_funds_a_retry(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude", fail_turns=1)
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    rig.prime_capacity()
+    try:
+        receipt = rig.enqueue_message(
+            "Use only one xhigh attempt.",
+            effort="xhigh",
+        )
+        rig.authorize_xhigh(receipt.command_id, "claude")
+        await rig.execute(receipt.command_id)
+        receipt = rig.store.get_command(receipt.command_id)
+
+        assert receipt.status == "failed"
+        assert claude.efforts == ["xhigh"]
+        assert codex.efforts == []
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["limits"]["max_attempts"] == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_provider_fault_barrier_precedes_prompt_and_fails_over_once(
+    tmp_path: Path,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/agent-harness-proof-builder",
+        "job_id": "provider-fault-job",
+    }
+    idempotency_key = "provider-fault-message"
+    authorization = {
+        "schema": "p13i/machines/provider-fault-authorization/v1",
+        "external_ref": external_ref,
+        "idempotency_key": idempotency_key,
+        "stage": "after-lease-before-acceptance",
+        "provider": "codex",
+        "agent_role": "proof-fault-probe",
+    }
+    authorization_digest = normalized_digest(authorization)
+    codex = ScriptedAdapter("codex")
+    codex.process_running = True
+    claude = ScriptedAdapter("claude")
+    rig = JourneyRig(
+        tmp_path,
+        claude=claude,
+        codex=codex,
+        external_ref=external_ref,
+        goal_constraints=("proof-fault-authorization-sha256:" + authorization_digest,),
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity(claude=20.0, codex=40.0)
+    receipt = rig.enqueue_message(
+        "Exercise one externally injected provider fault.",
+        idempotency_key=idempotency_key,
+        required_capabilities=["proof-fault-barrier"],
+        turn_ref={
+            "step_id": "provider-fault-stage",
+            "agent_role": "proof-fault-probe",
+        },
+        proof_fault_probe={
+            "stage": "after-lease-before-acceptance",
+            "provider": "codex",
+            "authorization": authorization,
+            "authorization_digest": authorization_digest,
+        },
+    )
+    execute = asyncio.create_task(rig.execute(receipt.command_id))
+    try:
+        ready = None
+        for unused_attempt in range(1_000):
+            del unused_attempt
+            ready_events = [
+                event
+                for event in rig.store.all_events(rig.session.session_id)
+                if event.event_type == "proof.fault.ready"
+            ]
+            if ready_events:
+                ready = ready_events[0]
+                break
+            await asyncio.sleep(0.01)
+        assert ready is not None, {
+            "command": rig.store.command_envelope(receipt.command_id),
+            "events": [
+                event.event_type
+                for event in rig.store.all_events(rig.session.session_id)
+            ],
+        }
+        assert ready.status == "waiting"
+        assert ready.metadata["provider"] == "codex"
+        assert ready.metadata["pid"] == codex.process_pid
+        assert ready.metadata["pid_start"] == codex.process_start
+        assert codex.prompts == []
+        assert not any(
+            event.event_type == "provider.prompt.accepted"
+            for event in rig.store.all_events(rig.session.session_id)
+        )
+        assert rig.store.command_envelope(receipt.command_id)["state"] == (
+            "fault-ready"
+        )
+
+        codex.process_running = False
+        await asyncio.wait_for(execute, timeout=5)
+        completed = rig.store.get_command(receipt.command_id)
+        assert completed.status == "complete"
+        assert codex.prompts == []
+        assert len(claude.prompts) == 1
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [attempt.provider for attempt in attempts] == ["codex", "claude"]
+        leases = rig.store.process_leases(rig.session.session_id)
+        assert len(leases) == 2
+        assert leases[0]["state"] == "released"
+        assert leases[0]["command_id"] == receipt.command_id
+        assert leases[0]["attempt_id"] == attempts[0].attempt_id
+        observed = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "proof.fault.observed"
+        ]
+        assert len(observed) == 1
+        assert observed[0].metadata["termination"] == ("external-process-termination")
+    finally:
+        if not execute.done():
+            execute.cancel()
+            await asyncio.gather(execute, return_exceptions=True)
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_service_fault_barrier_precedes_restart_reconciliation(
+    tmp_path: Path,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/agent-harness-proof-builder",
+        "job_id": "service-fault-job",
+    }
+    idempotency_key = "service-fault-message"
+    authorization = {
+        "schema": "p13i/machines/service-fault-authorization/v1",
+        "external_ref": external_ref,
+        "idempotency_key": idempotency_key,
+        "stage": "after-acceptance-before-terminal",
+        "provider": "codex",
+        "agent_role": "proof-service-fault-probe",
+    }
+    authorization_digest = normalized_digest(authorization)
+    codex = ScriptedAdapter("codex")
+    codex.process_running = True
+    rig = JourneyRig(
+        tmp_path,
+        codex=codex,
+        external_ref=external_ref,
+    )
+    next_turn_ref = {
+        "step_id": "post-service-reconciliation",
+        "agent_role": "sre",
+    }
+    next_command_payload = {
+        "text": "Continue after the exact service-fault reconciliation.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    policy = {
+        "schema": "p13i/agent-harness/dispatch-generation-transition-policy/v1",
+        "session_id": rig.session.session_id,
+        "external_ref": external_ref,
+        "epoch_id": "service-fault-reconciliation-epoch",
+        "allowed_agent_roles": ["sre"],
+        "allowed_step_prefixes": ["post-service-reconciliation"],
+        "max_transitions": 1,
+        "transitions": [
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    }
+    rig.store.create_goal(
+        create_goal(
+            rig.session.session_id,
+            "Recover and continue one exact service-fault stage.",
+            constraints=(
+                "proof-service-fault-authorization-sha256:" + authorization_digest,
+                "dispatch-generation-transition-policy-sha256:"
+                + normalized_digest(policy),
+                "dispatch-generation-transition-epoch:"
+                "service-fault-reconciliation-epoch",
+            ),
+            permitted_providers=("claude", "codex"),
+            permitted_efforts=("low", "medium", "high"),
+        )
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity(claude=20.0, codex=40.0)
+    receipt = rig.enqueue_message(
+        "Hold after acceptance for one service restart.",
+        idempotency_key=idempotency_key,
+        required_capabilities=["proof-service-fault-barrier"],
+        turn_ref={
+            "step_id": "service-fault-stage",
+            "agent_role": "proof-service-fault-probe",
+        },
+        proof_service_fault_probe={
+            "stage": "after-acceptance-before-terminal",
+            "provider": "codex",
+            "authorization": authorization,
+            "authorization_digest": authorization_digest,
+        },
+    )
+    execute = asyncio.create_task(rig.execute(receipt.command_id))
+    try:
+        ready = None
+        for unused_attempt in range(1_000):
+            del unused_attempt
+            events = rig.store.all_events(rig.session.session_id)
+            ready_events = [
+                event
+                for event in events
+                if event.event_type == "proof.service-fault.ready"
+            ]
+            if ready_events:
+                ready = ready_events[0]
+                break
+            await asyncio.sleep(0.01)
+        assert ready is not None, {
+            "command": rig.store.command_envelope(receipt.command_id),
+            "events": [event.event_type for event in events],
+        }
+        accepted = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "provider.prompt.accepted"
+        ]
+        assert len(accepted) == 1
+        assert accepted[0].sequence < ready.sequence
+        assert ready.metadata["provider"] == "codex"
+        assert ready.metadata["context_digest"]
+
+        replacement = SessionWorker(
+            rig.store,
+            rig.blobs,
+            rig.scheduler,
+            rig.adapters,
+            rig.session.session_id,
+        )
+        rig.store.register_worker(
+            rig.session.session_id,
+            456,
+            replacement.incarnation,
+        )
+        manager = ReconciliationManager(
+            rig.store,
+            rig.blobs,
+        )
+        recovery = await manager.recover_after_restart(rig.session.session_id)
+        assert len(recovery.reconciliations) == 1
+        reconciliation = recovery.reconciliations[0]
+        assert reconciliation.command_id == receipt.command_id
+
+        with pytest.raises(WorkerOwnershipLostError):
+            await asyncio.wait_for(execute, timeout=7)
+        assert len(rig.store.attempts(rig.session.session_id)) == 1
+        original_attempt = rig.store.attempts(rig.session.session_id)[0]
+        interrupted = rig.store.get_command(receipt.command_id)
+        assert interrupted.status == "failed"
+        assert interrupted.result["code"] == "E_NEEDS_RECONCILIATION"
+        assert len(rig.store.pending_reconciliations(rig.session.session_id)) == 1
+        original_leases = rig.store.process_leases(rig.session.session_id)
+        assert len(original_leases) == 1
+        assert original_leases[0]["state"] == "active"
+        assert original_leases[0]["attempt_id"] == original_attempt.attempt_id
+        assert original_leases[0]["worker_incarnation"] == rig.worker.incarnation
+        resolved = await manager.resolve(
+            reconciliation.reconciliation_id,
+            ReconciliationDecision.ACCEPT_CURRENT,
+            reconciliation.current_workspace_digest,
+            audit={"actor": "journey"},
+        )
+        assert resolved.status == "resolved"
+        resolution_workspace_digest = inspect_workspace(Path(rig.session.worktree))[0]
+        assert resolved.audit["resolution_workspace_digest"] == (
+            resolution_workspace_digest
+        )
+        proof_reconciliation = proof_snapshot(
+            rig.store,
+            rig.session.session_id,
+        )["reconciliations"][0]
+        assert proof_reconciliation["resolution_workspace_digest"] == (
+            resolution_workspace_digest
+        )
+        original_audit = dict(resolved.audit)
+        tampered_audit = dict(original_audit)
+        tampered_audit["resolution_workspace_digest"] = "0" * 64
+        with rig.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE reconciliations SET audit_json = ?
+                WHERE reconciliation_id = ?
+                """,
+                (
+                    json.dumps(
+                        tampered_audit,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    resolved.reconciliation_id,
+                ),
+            )
+        tampered_anchor = rig.store.dispatch_transition_anchor(rig.session.session_id)
+        assert tampered_anchor["eligible"] is False
+        assert tampered_anchor["reason"] == (
+            "dispatch transition reconciliation material is not current"
+        )
+        with rig.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE reconciliations SET audit_json = ?
+                WHERE reconciliation_id = ?
+                """,
+                (
+                    json.dumps(
+                        original_audit,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    resolved.reconciliation_id,
+                ),
+            )
+        topology = resolved.audit["topology_receipt"]
+        assert topology["schema"] == (
+            "p13i/agent-harness/reconciliation-topology-receipt/v1"
+        )
+        assert topology["command_id"] == receipt.command_id
+        assert topology["attempt_id"] == original_attempt.attempt_id
+        assert topology["attempt_state"] == "ambiguous"
+        assert topology["turn_state"] == "ambiguous"
+        assert topology["dispatch_state"] == "ambiguous"
+        assert topology["envelope_state"] == "paused"
+        assert topology["guard_reason"] == "ambiguous-provider-dispatch"
+        assert len(topology["leases"]) == 1
+        assert topology["leases"][0]["prior_state"] == "active"
+        assert topology["leases"][0]["state"] == "released"
+        assert topology["leases"][0]["worker_incarnation"] == (rig.worker.incarnation)
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["state"] == "paused"
+        assert envelope["guard_reason"] == "ambiguous-provider-dispatch"
+        normalized_attempt = rig.store.attempts(rig.session.session_id)[0]
+        assert normalized_attempt.status == "ambiguous"
+        topology_rows = rig.store._connection.execute(
+            """
+            SELECT turns.status AS turn_state,
+                command_dispatches.state AS dispatch_state
+            FROM turns JOIN command_dispatches USING(turn_id)
+            WHERE command_dispatches.attempt_id = ?
+            """,
+            (original_attempt.attempt_id,),
+        ).fetchone()
+        assert topology_rows is not None
+        assert topology_rows["turn_state"] == "ambiguous"
+        assert topology_rows["dispatch_state"] == "ambiguous"
+        released = rig.store.process_leases(rig.session.session_id)
+        assert len(released) == 1
+        assert released[0]["state"] == "released"
+        assert rig.store.active_process_leases() == []
+        anchor = rig.store.dispatch_transition_anchor(rig.session.session_id)
+        assert anchor["eligible"] is True
+        assert anchor["prior_anchor_kind"] == "resolved-reconciliation"
+        transition = _advance_orchestration_generation(
+            rig,
+            receipt.command_id,
+            next_turn_ref,
+            "service-fault-reconciled-next-message",
+            policy,
+            1,
+            next_command_payload,
+        )
+        rig.worker = replacement
+        continued = await rig.message(**next_command_payload)
+        assert continued.status == "complete"
+        consumed = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "dispatch.generation.transition.consumed"
+        ]
+        assert len(consumed) == 1
+        assert (
+            consumed[0].metadata["invalidation_id"] == (transition["invalidation_id"])
+        )
+        assert consumed[0].metadata["command_id"] == continued.command_id
+    finally:
+        if not execute.done():
+            execute.cancel()
+            await asyncio.gather(execute, return_exceptions=True)
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_reconciliation_restores_pre_dispatch_checkpoint(
     tmp_path: Path,
 ) -> None:
     rig = JourneyRig(tmp_path)
-    manager, record, command = await _ambiguous_reconciliation(rig)
+    workspace = Path(rig.session.worktree)
+    (workspace / "pre-turn-target.txt").write_text(
+        "pre-turn material\n",
+        encoding="utf-8",
+    )
+    (workspace / "pre-turn-link").symlink_to("pre-turn-target.txt")
+    script = workspace / "pre-turn-script.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o644)
+    pre_turn_workspace_digest = inspect_workspace(workspace)[0]
+
+    def make_script_executable(unused_workspace: Path) -> None:
+        del unused_workspace
+        script.chmod(0o755)
+
+    manager, record, command = await _ambiguous_reconciliation(
+        rig,
+        make_script_executable,
+    )
+    assert script.stat().st_mode & 0o111
+    assert record.current_workspace_digest != pre_turn_workspace_digest
     queued = rig.store.enqueue_command(
         rig.session.session_id,
         "message",
@@ -1439,6 +4057,21 @@ async def test_e2e_reconciliation_restores_pre_dispatch_checkpoint(
         assert resolved.status == "resolved"
         assert resolved.resolution == "restore-pre-turn"
         assert "checkpoint_id" in resolved.audit
+        resolution_workspace_digest = inspect_workspace(Path(rig.session.worktree))[0]
+        assert (
+            resolved.audit["resolution_workspace_digest"] == resolution_workspace_digest
+        )
+        proof = proof_snapshot(rig.store, rig.session.session_id)
+        proof_reconciliation = proof["reconciliations"][0]
+        assert proof_reconciliation["resolution_workspace_digest"] == (
+            resolution_workspace_digest
+        )
+        assert proof_reconciliation["resolution_workspace_digest_valid"] is True
+        assert proof_reconciliation["resolution_material_certified"] is True
+        assert resolution_workspace_digest == pre_turn_workspace_digest
+        assert (workspace / "pre-turn-link").is_symlink()
+        assert os.readlink(workspace / "pre-turn-link") == ("pre-turn-target.txt")
+        assert script.stat().st_mode & 0o111 == 0
         assert (Path(rig.session.worktree) / "file.txt").read_text(
             encoding="utf-8"
         ) == "base\n"
@@ -1449,6 +4082,34 @@ async def test_e2e_reconciliation_restores_pre_dispatch_checkpoint(
         claimed = rig.store.claim_command(rig.session.session_id)
         assert claimed is not None
         assert claimed.command_id == queued.command_id
+        tampered_audit = dict(resolved.audit)
+        tampered_audit["resolution_workspace_digest"] = "tampered"
+        with rig.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE reconciliations SET audit_json = ?
+                WHERE reconciliation_id = ?
+                """,
+                (
+                    json.dumps(
+                        tampered_audit,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    resolved.reconciliation_id,
+                ),
+            )
+        with pytest.raises(ConflictError, match="certified workspace material"):
+            await manager.resolve(
+                record.reconciliation_id,
+                ReconciliationDecision.RESTORE_PRE_TURN,
+                record.current_workspace_digest,
+                approved=True,
+            )
+        tampered_proof = proof_snapshot(rig.store, rig.session.session_id)
+        tampered_reconciliation = tampered_proof["reconciliations"][0]
+        assert tampered_reconciliation["resolution_workspace_digest_valid"] is False
+        assert tampered_reconciliation["resolution_material_certified"] is False
     finally:
         rig.close()
 
@@ -1460,8 +4121,18 @@ async def test_e2e_reconciliation_accepts_current_or_stops(
     accept_root = tmp_path / "accept"
     accept_root.mkdir()
     accept_rig = JourneyRig(accept_root)
-    accept_manager, accept_record, unused_command = (
-        await _ambiguous_reconciliation(accept_rig)
+    accept_script = Path(accept_rig.session.worktree) / "accept-script.sh"
+    accept_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    accept_script.chmod(0o644)
+    accept_before_digest = inspect_workspace(Path(accept_rig.session.worktree))[0]
+
+    def accept_executable(unused_workspace: Path) -> None:
+        del unused_workspace
+        accept_script.chmod(0o755)
+
+    accept_manager, accept_record, unused_command = await _ambiguous_reconciliation(
+        accept_rig,
+        accept_executable,
     )
     del unused_command
     try:
@@ -1476,14 +4147,47 @@ async def test_e2e_reconciliation_accepts_current_or_stops(
             accept_record.current_workspace_digest,
         )
         assert accepted.resolution == "accept-current"
+        assert accepted.current_workspace_digest != accept_before_digest
+        assert accept_script.stat().st_mode & 0o111
         assert "checkpoint_id" in accepted.audit
+        assert "discovery_checkpoint_id" in accepted.audit
+        assert "resolution_checkpoint_id" in accepted.audit
+        accepted_workspace_digest = inspect_workspace(
+            Path(accept_rig.session.worktree)
+        )[0]
+        assert accepted.audit["resolution_workspace_digest"] == (
+            accepted_workspace_digest
+        )
+        proof = proof_snapshot(
+            accept_rig.store,
+            accept_rig.session.session_id,
+        )
+        reconciliation = proof["reconciliations"][0]
+        assert reconciliation["pre_dispatch_checkpoint_bound"] is True
+        assert reconciliation["discovery_checkpoint_bound"] is True
+        assert reconciliation["resolution_checkpoint_bound"] is True
+        assert reconciliation["resolution_workspace_digest"] == (
+            accepted_workspace_digest
+        )
+        assert reconciliation["resolution_workspace_digest_valid"] is True
+        assert reconciliation["resolution_material_certified"] is True
+        assert reconciliation["discovery_resolution_material_equal"] is True
+        assert reconciliation["recovery_material_certified"] is True
+        checkpoints = {item["checkpoint_id"]: item for item in proof["checkpoints"]}
+        discovery = checkpoints[reconciliation["discovery_checkpoint_id"]]
+        resolution = checkpoints[reconciliation["resolution_checkpoint_id"]]
+        for field in (
+            "base_commit",
+            "patch_digest",
+            "untracked_digest",
+            "context_digest",
+        ):
+            assert discovery[field] == resolution[field]
         assert (Path(accept_rig.session.worktree) / "file.txt").read_text(
             encoding="utf-8"
         ) == "ambiguous effect\n"
         assert (
-            accept_rig.store.get_session(
-                accept_rig.session.session_id
-            ).attention
+            accept_rig.store.get_session(accept_rig.session.session_id).attention
             == "idle"
         )
         with pytest.raises(ConflictError):
@@ -1492,14 +4196,48 @@ async def test_e2e_reconciliation_accepts_current_or_stops(
                 ReconciliationDecision.STOP,
                 accept_record.current_workspace_digest,
             )
+        tampered_audit = dict(accepted.audit)
+        tampered_audit["resolution_checkpoint_id"] = "missing-checkpoint"
+        tampered_audit["resolution_workspace_digest"] = "tampered"
+        with accept_rig.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE reconciliations SET audit_json = ?
+                WHERE reconciliation_id = ?
+                """,
+                (
+                    json.dumps(
+                        tampered_audit,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    accepted.reconciliation_id,
+                ),
+            )
+        tampered_proof = proof_snapshot(
+            accept_rig.store,
+            accept_rig.session.session_id,
+        )
+        tampered_reconciliation = tampered_proof["reconciliations"][0]
+        assert tampered_reconciliation["resolution_checkpoint_bound"] is False
+        assert tampered_reconciliation["resolution_workspace_digest_valid"] is False
+        assert tampered_reconciliation["resolution_material_certified"] is False
+        assert tampered_reconciliation["discovery_resolution_material_equal"] is False
+        assert tampered_reconciliation["recovery_material_certified"] is False
+        with pytest.raises(ConflictError, match="certified workspace material"):
+            await accept_manager.resolve(
+                accept_record.reconciliation_id,
+                ReconciliationDecision.ACCEPT_CURRENT,
+                accept_record.current_workspace_digest,
+            )
     finally:
         accept_rig.close()
 
     stop_root = tmp_path / "stop"
     stop_root.mkdir()
     stop_rig = JourneyRig(stop_root)
-    stop_manager, stop_record, unused_command = (
-        await _ambiguous_reconciliation(stop_rig)
+    stop_manager, stop_record, unused_command = await _ambiguous_reconciliation(
+        stop_rig
     )
     del unused_command
     try:
@@ -1508,6 +4246,12 @@ async def test_e2e_reconciliation_accepts_current_or_stops(
             ReconciliationDecision.STOP,
             stop_record.current_workspace_digest,
         )
+        stopped_replay = await stop_manager.resolve(
+            stop_record.reconciliation_id,
+            ReconciliationDecision.STOP,
+            stop_record.current_workspace_digest,
+        )
+        assert stopped_replay == stopped
         assert stopped.resolution == "stop"
         assert (
             stop_rig.store.get_session(stop_rig.session.session_id).lifecycle
@@ -1534,9 +4278,7 @@ async def test_e2e_reconciliation_rejects_changes_and_conflicting_intent(
     changed_root = tmp_path / "changed"
     changed_root.mkdir()
     changed_rig = JourneyRig(changed_root)
-    manager, record, unused_command = await _ambiguous_reconciliation(
-        changed_rig
-    )
+    manager, record, unused_command = await _ambiguous_reconciliation(changed_rig)
     del unused_command
     try:
         (Path(changed_rig.session.worktree) / "file.txt").write_text(
@@ -1555,9 +4297,7 @@ async def test_e2e_reconciliation_rejects_changes_and_conflicting_intent(
     race_root = tmp_path / "race"
     race_root.mkdir()
     race_rig = JourneyRig(race_root)
-    manager, record, unused_command = await _ambiguous_reconciliation(
-        race_rig
-    )
+    manager, record, unused_command = await _ambiguous_reconciliation(race_rig)
     del unused_command
     race_rig.store.begin_reconciliation_resolution(
         record.reconciliation_id,
@@ -1582,9 +4322,7 @@ async def test_e2e_reconciliation_rejects_changes_and_conflicting_intent(
     intent_root = tmp_path / "intent"
     intent_root.mkdir()
     intent_rig = JourneyRig(intent_root)
-    manager, record, unused_command = await _ambiguous_reconciliation(
-        intent_rig
-    )
+    manager, record, unused_command = await _ambiguous_reconciliation(intent_rig)
     del unused_command
     try:
         intent_rig.store.begin_reconciliation_resolution(
@@ -1626,6 +4364,41 @@ async def test_e2e_reconciliation_rejects_read_only_restore(
         rig.close()
 
 
+@pytest.mark.asyncio
+async def test_e2e_special_object_effect_requires_reconciliation(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    fifo = Path(rig.session.worktree) / "provider-effect.fifo"
+
+    def create_fifo(unused_workspace: Path) -> None:
+        del unused_workspace
+        os.mkfifo(fifo)
+
+    manager, record, command = await _ambiguous_reconciliation(
+        rig,
+        create_fifo,
+    )
+    del manager
+    try:
+        assert fifo.exists()
+        current_digest = inspect_workspace(Path(rig.session.worktree))[0]
+        assert record.current_workspace_digest == current_digest
+        failed = rig.store.get_command(command.command_id)
+        assert failed.status == "failed"
+        assert failed.result["code"] == "E_NEEDS_RECONCILIATION"
+        queued = rig.store.enqueue_command(
+            rig.session.session_id,
+            "message",
+            {"text": "must remain behind reconciliation"},
+            "special-object-blocked-command",
+        )
+        assert rig.store.claim_command(rig.session.session_id) is None
+        assert rig.store.get_command(queued.command_id).status == "queued"
+    finally:
+        rig.close()
+
+
 def test_reconciliation_workspace_inspection_defenses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1636,17 +4409,52 @@ def test_reconciliation_workspace_inspection_defenses(
         "untracked\n",
         encoding="utf-8",
     )
-    (workspace / "untracked-link").symlink_to("untracked.txt")
+    (workspace / "alternate.txt").write_text(
+        "alternate\n",
+        encoding="utf-8",
+    )
+    link = workspace / "untracked-link"
+    without_link_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    link.symlink_to("untracked.txt")
 
     digest, summary = inspect_workspace(workspace)
 
     assert len(digest) == 64
+    assert digest != without_link_digest
     assert '"commit"' in summary
+    link.unlink()
+    link.symlink_to("alternate.txt")
+    retargeted_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    assert retargeted_digest != digest
+    link.unlink()
+    removed_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    assert removed_digest == without_link_digest
+    script = workspace / "mode-effect.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o644)
+    nonexecutable_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    script.chmod(0o755)
+    executable_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    assert executable_digest != nonexecutable_digest
+    fifo = workspace / "provider-effect.fifo"
+    os.mkfifo(fifo)
+    fifo_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    assert fifo_digest != executable_digest
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_text("outside\n", encoding="utf-8")
+    (workspace / "outside-directory").symlink_to(outside)
     original_git = reconciliation_module._git
 
     def unsafe_paths(path: Path, *arguments: str) -> bytes:
         if arguments[0] == "ls-files":
-            return b"../escape\0missing\0"
+            return b"../escape\0missing\0outside-directory/file\0"
         return original_git(path, *arguments)
 
     monkeypatch.setattr(reconciliation_module, "_git", unsafe_paths)
@@ -1673,6 +4481,7 @@ def test_reconciliation_workspace_inspection_defenses(
 
 async def _ambiguous_reconciliation(
     rig: JourneyRig,
+    ambiguous_mutation: Callable[[Path], None] | None = None,
 ) -> tuple[ReconciliationManager, ReconciliationRecord, CommandReceipt]:
     command = rig.store.enqueue_command(
         rig.session.session_id,
@@ -1742,16 +4551,14 @@ async def _ambiguous_reconciliation(
         "untracked effect\n",
         encoding="utf-8",
     )
-    (workspace / "untracked-effect-link").symlink_to(
-        "untracked-effect.txt"
-    )
+    (workspace / "untracked-effect-link").symlink_to("untracked-effect.txt")
+    if ambiguous_mutation is not None:
+        ambiguous_mutation(workspace)
     after_digest, unused_summary = inspect_workspace(workspace)
     del unused_summary
     assert before_digest != after_digest
     manager = ReconciliationManager(rig.store, rig.blobs)
-    recovery = await manager.recover_after_restart(
-        rig.session.session_id
-    )
+    recovery = await manager.recover_after_restart(rig.session.session_id)
     assert len(recovery.reconciliations) == 1
     record = recovery.reconciliations[0]
     assert record.safety_consumption["total_tokens"] == 73
@@ -1773,11 +4580,13 @@ async def _wait_for_approval(
 def _usage(
     provider: str,
     binding: float | None,
+    *,
+    credits: bool = False,
 ) -> UsageSnapshot:
     return UsageSnapshot(
         provider=provider,
         binding_percent=binding,
-        credits_engaged=False,
+        credits_engaged=credits,
         payload={},
     )
 

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import runpy
+import sqlite3
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,17 +15,18 @@ from typing import Any
 import pytest
 from claude_agent_sdk import RateLimitInfo
 
-from agent_harness.errors import HarnessError
-from agent_harness.errors import ProviderExhaustedError
-from agent_harness.errors import ProviderUnavailableError
-from agent_harness.providers import claude
-from agent_harness.providers import kimi
-from agent_harness.providers import normalize
-from agent_harness.providers import codex
-from agent_harness.providers import base
-from agent_harness import terminal
-from agent_harness.providers.base import ProviderAdapter
-from agent_harness.providers.base import ProviderEvent
+from agent_harness import child_gate, terminal
+from agent_harness.errors import (
+    HarnessError,
+    ProviderExhaustedError,
+    ProviderUnavailableError,
+)
+from agent_harness.providers import base, claude, codex, kimi, normalize
+from agent_harness.providers.base import (
+    ChildLaunchGate,
+    ProviderAdapter,
+    ProviderEvent,
+)
 
 
 class Stream:
@@ -79,6 +84,48 @@ async def _ignore_notification(
 ) -> None:
     del method
     del params
+
+
+def _durable_child_gate(tmp_path: Path, limit: int) -> ChildLaunchGate:
+    database = tmp_path / "child-gate.sqlite3"
+    command_id = "00000000-0000-4000-8000-000000000001"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS child_launch_gates (
+                command_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                permit_limit INTEGER NOT NULL,
+                consumed INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS child_launch_admissions (
+                command_id TEXT NOT NULL,
+                admission_key TEXT NOT NULL,
+                admitted INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(command_id, admission_key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO child_launch_gates VALUES (
+                ?, 'session', ?, 0, 'created', 'updated'
+            )
+            """,
+            (command_id, limit),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return ChildLaunchGate(database, command_id, limit)
 
 
 async def _decline(
@@ -142,11 +189,17 @@ def test_provider_base_contract_and_environment(
             "PATH": "/bin",
             "npm_config_package": "ignored",
             "OTHER_SECRET": "ignored",
+            "CLAUDE_CODE_OAUTH_TOKEN": "claude-oauth",
             "ANTHROPIC_API_KEY": "anthropic",
             "OPENAI_API_KEY": "openai",
         },
     )
+    monkeypatch.setattr(base, "trusted_provider_path", lambda: "/bin")
     assert codex.provider_environment("codex") == {"PATH": "/bin"}
+    assert codex.provider_environment("claude") == {
+        "PATH": "/bin",
+        "CLAUDE_CODE_OAUTH_TOKEN": "claude-oauth",
+    }
     assert codex.provider_environment("codex", "api") == {
         "PATH": "/bin",
         "OPENAI_API_KEY": "openai",
@@ -155,6 +208,34 @@ def test_provider_base_contract_and_environment(
         "PATH": "/bin",
         "ANTHROPIC_API_KEY": "anthropic",
     }
+
+
+def test_trusted_provider_executable_ignores_hostile_path_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "npx"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    searches: list[str] = []
+
+    def find_executable(name: str, *, path: str) -> str:
+        assert name == "npx"
+        searches.append(path)
+        return str(executable)
+
+    monkeypatch.setattr(base.shutil, "which", find_executable)
+    monkeypatch.setenv("PATH", str(tmp_path / "hostile"))
+    assert base.trusted_executable("npx") == str(executable)
+    assert searches == [base._TRUSTED_EXECUTABLE_SEARCH]
+
+    executable.chmod(0o775)
+    with pytest.raises(RuntimeError, match="writable"):
+        base.trusted_executable("npx")
+
+    monkeypatch.setattr(base.shutil, "which", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="not found"):
+        base.trusted_executable("npx")
 
 
 def test_codex_protocol_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,9 +276,7 @@ def test_codex_protocol_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
         }
     ) == ("low", "high")
     assert codex._strings("fast") == ()
-    assert codex._strings(
-        ["fast", 1, {"id": "flex"}, {"id": 2}]
-    ) == ("fast", "flex")
+    assert codex._strings(["fast", 1, {"id": "flex"}, {"id": 2}]) == ("fast", "flex")
 
     monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "")
     assert codex._process_start(42) == "42"
@@ -241,9 +320,7 @@ def test_codex_server_send_request_and_routes(tmp_path: Path) -> None:
         assert process.stdin.writes
 
         async def reply(payload: dict[str, Any]) -> None:
-            await server._route(
-                {"id": payload["id"], "result": {"answer": 7}}
-            )
+            await server._route({"id": payload["id"], "result": {"answer": 7}})
 
         server._send = reply  # type: ignore[method-assign]
         assert await server.request("question", {}) == {"answer": 7}
@@ -258,9 +335,7 @@ def test_codex_server_send_request_and_routes(tmp_path: Path) -> None:
 
         exhausted = loop.create_future()
         server._pending[11] = exhausted
-        await server._route(
-            {"id": 11, "error": {"message": "quota reached"}}
-        )
+        await server._route({"id": 11, "error": {"message": "quota reached"}})
         assert isinstance(exhausted.exception(), ProviderExhaustedError)
 
         failed = loop.create_future()
@@ -275,9 +350,7 @@ def test_codex_server_send_request_and_routes(tmp_path: Path) -> None:
 
         await server._route({"method": "event", "params": {"x": 1}})
         assert notifications == [("event", {"x": 1})]
-        await server._route(
-            {"id": 14, "method": "approval", "params": {"x": 2}}
-        )
+        await server._route({"id": 14, "method": "approval", "params": {"x": 2}})
         assert requests == [("approval", {"x": 2})]
 
     asyncio.run(scenario())
@@ -302,8 +375,12 @@ def test_codex_server_readers_and_timeout(
         server.stderr_tail = ["last stderr"]
         pending = asyncio.get_running_loop().create_future()
         server._pending[1] = pending
-        await server._read_messages()
-        assert isinstance(pending.exception(), ProviderUnavailableError)
+        with pytest.raises(ProviderUnavailableError):
+            await server._read_messages()
+        failure = pending.exception()
+        assert isinstance(failure, ProviderUnavailableError)
+        assert failure.provider == "codex"
+        assert "Codex app-server connection closed" in failure.detail.message
         await server._read_stderr()
         assert server.stderr_tail == [
             "last stderr",
@@ -343,14 +420,36 @@ def test_codex_server_start_and_close(
 ) -> None:
     async def scenario() -> None:
         process = Process(stdout=Stream([]), stderr=Stream([]))
+        identity = SimpleNamespace(pid=42, pgid=42, pid_start="start")
 
         async def create(*args: Any, **kwargs: Any) -> Process:
-            assert args[:3] == ("npx", "-y", "@openai/codex@0.146.0")
+            assert Path(str(args[0])).name == "npx"
+            assert args[1:3] == ("-y", "@openai/codex@0.146.0")
             assert kwargs["cwd"] == tmp_path
             return process
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
-        server = _server(tmp_path)
+        monkeypatch.setattr(
+            codex,
+            "process_group_identity",
+            lambda unused: identity,
+        )
+
+        async def terminate(
+            selected_process: Process,
+            selected_identity: object,
+            **unused: object,
+        ) -> None:
+            assert selected_process is process
+            assert selected_identity is identity
+
+        monkeypatch.setattr(codex, "terminate_process_group", terminate)
+        server = codex.CodexAppServer(
+            tmp_path,
+            notification_handler=_ignore_notification,
+            request_handler=_decline,
+            child_launch_gate=_durable_child_gate(tmp_path, 2),
+        )
         calls: list[str] = []
 
         async def request(
@@ -380,6 +479,207 @@ def test_codex_server_start_and_close(
     asyncio.run(scenario())
 
 
+def test_codex_child_gate_argv_is_durable(tmp_path: Path) -> None:
+    durable_gate = _durable_child_gate(tmp_path, 2)
+    server = codex.CodexAppServer(
+        tmp_path,
+        notification_handler=_ignore_notification,
+        request_handler=_decline,
+        child_launch_gate=durable_gate,
+    )
+    arguments = server._child_gate_arguments()
+    assert arguments[0] == "--dangerously-bypass-hook-trust"
+    assert "agents.max_concurrent_threads_per_session=2" in arguments
+    hook = next(value for value in arguments if value.startswith("hooks.PreToolUse="))
+    assert "^(Agent|spawn_agent)$" in hook
+    assert "child_gate.py" in hook
+    assert str(durable_gate.database) in hook
+    assert durable_gate.command_id in hook
+    asyncio.run(server.close())
+    assert durable_gate.database.exists()
+
+    inactive = codex.CodexAppServer(
+        tmp_path,
+        notification_handler=_ignore_notification,
+        request_handler=_decline,
+        child_launch_gate=_durable_child_gate(tmp_path, 0),
+    )
+    assert "agents.enabled=false" in inactive._child_gate_arguments()
+    asyncio.run(inactive.close())
+
+
+def test_child_gate_is_atomic_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gate = _durable_child_gate(tmp_path, 2)
+    assert child_gate.admit(gate.database, gate.command_id, 2, "claude:Agent:one")
+    assert child_gate.admit(gate.database, gate.command_id, 2, "claude:Agent:one")
+    assert child_gate.admit(gate.database, gate.command_id, 2, "claude:Agent:two")
+    assert not child_gate.admit(
+        gate.database,
+        gate.command_id,
+        2,
+        "claude:Agent:three",
+    )
+    assert not child_gate.admit(
+        gate.database,
+        gate.command_id,
+        3,
+        "claude:Agent:four",
+    )
+    assert not child_gate.admit(
+        gate.database,
+        "missing",
+        2,
+        "claude:Agent:five",
+    )
+    assert not child_gate.admit(gate.database, gate.command_id, 2, "")
+
+    concurrent_gate = _durable_child_gate(tmp_path, 2)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        admitted = list(
+            pool.map(
+                lambda unused: child_gate.admit(
+                    concurrent_gate.database,
+                    concurrent_gate.command_id,
+                    concurrent_gate.limit,
+                    "codex:Agent:" + str(unused),
+                ),
+                range(20),
+            )
+        )
+    assert sum(admitted) == 2
+    child_gate._rollback(None)
+    child_gate._rollback(SimpleNamespace(in_transaction=False))  # type: ignore[arg-type]
+
+    class BrokenRollback:
+        in_transaction = True
+
+        def execute(self, statement: str) -> None:
+            del statement
+            raise sqlite3.OperationalError("rollback failed")
+
+    child_gate._rollback(BrokenRollback())  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        child_gate.sys,
+        "stdin",
+        io.StringIO('{"tool_name":"Bash"}'),
+    )
+    assert child_gate.main([str(gate.database), gate.command_id, "2", "codex"]) == 0
+    assert child_gate.main([]) == 0
+    assert '"permissionDecision":"deny"' in capsys.readouterr().out
+    monkeypatch.setattr(
+        child_gate.sys,
+        "stdin",
+        io.StringIO('{"tool_name":"Agent"}'),
+    )
+    assert child_gate.main([str(gate.database), gate.command_id, "2", "codex"]) == 0
+    assert '"permissionDecision":"deny"' in capsys.readouterr().out
+
+    for payload, limit in (("not-json", "2"), ("[]", "2"), ("{}", "invalid")):
+        monkeypatch.setattr(child_gate.sys, "stdin", io.StringIO(payload))
+        assert (
+            child_gate.main([str(gate.database), gate.command_id, limit, "codex"]) == 0
+        )
+        assert '"permissionDecision":"deny"' in capsys.readouterr().out
+    unwritable = tmp_path / "directory-state"
+    unwritable.mkdir()
+    monkeypatch.setattr(
+        child_gate.sys,
+        "stdin",
+        io.StringIO('{"tool_name":"Agent"}'),
+    )
+    assert child_gate.main([str(unwritable), gate.command_id, "2", "codex"]) == 0
+    assert '"permissionDecision":"deny"' in capsys.readouterr().out
+
+    gate = _durable_child_gate(tmp_path, 2)
+    monkeypatch.setattr(
+        child_gate.sys,
+        "argv",
+        ["child_gate.py", str(gate.database), gate.command_id, "2", "codex"],
+    )
+    monkeypatch.setattr(
+        child_gate.sys,
+        "stdin",
+        io.StringIO('{"tool_name":"spawn_agent","tool_use_id":"spawn-one"}'),
+    )
+    assert child_gate.main() == 0
+    monkeypatch.setattr(
+        child_gate.sys,
+        "stdin",
+        io.StringIO('{"tool_name":"spawn_agent","tool_use_id":"spawn-one"}'),
+    )
+    assert child_gate.main() == 0
+    assert child_gate.admit(
+        gate.database,
+        gate.command_id,
+        2,
+        "codex:spawn_agent:spawn-one",
+    )
+    assert child_gate.admit(
+        gate.database,
+        gate.command_id,
+        2,
+        "codex:spawn_agent:spawn-two",
+    )
+    assert not child_gate.admit(
+        gate.database,
+        gate.command_id,
+        2,
+        "codex:spawn_agent:spawn-three",
+    )
+
+    monkeypatch.setattr(
+        child_gate.sys,
+        "stdin",
+        io.StringIO('{"tool_name":"Bash"}'),
+    )
+    with pytest.raises(SystemExit) as exited:
+        runpy.run_path(str(Path(child_gate.__file__)), run_name="__main__")
+    assert exited.value.code == 0
+
+
+def test_claude_child_gate_denies_third_before_start(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        durable_gate = _durable_child_gate(tmp_path, 2)
+        gate = claude._child_gate(durable_gate)
+        inputs = [
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_input": {},
+                "tool_use_id": "tool-" + str(index),
+            }
+            for index in range(3)
+        ]
+        results = []
+        for value in inputs:
+            results.append(await gate(value, None, {}))
+        allowed = [value for value in results if not value.get("hookSpecificOutput")]
+        starts = [ProviderEvent("agent.child.started") for unused in allowed]
+        assert len(starts) == 2
+        assert results[2]["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert await gate(inputs[0], None, {}) == {}
+        missing_identity = dict(inputs[0])
+        missing_identity.pop("tool_use_id")
+        assert (await gate(missing_identity, None, {}))["hookSpecificOutput"][
+            "permissionDecision"
+        ] == "deny"
+        assert (
+            await gate(
+                {**inputs[0], "tool_name": "Bash"},
+                None,
+                {},
+            )
+            == {}
+        )
+
+    asyncio.run(scenario())
+
+
 def test_codex_close_escalates_and_reader_preserves_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -391,6 +691,8 @@ def test_codex_close_escalates_and_reader_preserves_failure(
         )
         server = _server(tmp_path)
         server.process = process  # type: ignore[assignment]
+        identity = SimpleNamespace(pid=42, pgid=42, pid_start="start")
+        server._process_group = identity  # type: ignore[assignment]
 
         async def broken_route(payload: dict[str, Any]) -> None:
             del payload
@@ -399,25 +701,21 @@ def test_codex_close_escalates_and_reader_preserves_failure(
         server._route = broken_route  # type: ignore[method-assign]
         pending = asyncio.get_running_loop().create_future()
         server._pending[1] = pending
-        await server._read_messages()
+        with pytest.raises(RuntimeError, match="reader failed"):
+            await server._read_messages()
         assert isinstance(pending.exception(), RuntimeError)
 
-        calls = 0
+        async def terminate(
+            selected_process: Process,
+            selected_identity: object,
+            **unused: object,
+        ) -> None:
+            assert selected_process is process
+            assert selected_identity is identity
+            process.terminated = True
+            process.killed = True
 
-        async def wait_for(
-            future: Any,
-            *,
-            timeout: float,
-        ) -> int:
-            nonlocal calls
-            del future
-            del timeout
-            calls += 1
-            if calls <= 2:
-                raise TimeoutError
-            return 0
-
-        monkeypatch.setattr(asyncio, "wait_for", wait_for)
+        monkeypatch.setattr(codex, "terminate_process_group", terminate)
         await server.close()
         assert process.terminated
         assert process.killed
@@ -438,18 +736,20 @@ def test_codex_adapter_models_and_turn(
             *,
             notification_handler: Any,
             request_handler: Any,
+            child_launch_gate: ChildLaunchGate | None = None,
         ) -> None:
             self.workspace = workspace
             self.notification_handler = notification_handler
             self.request_handler = request_handler
-            self.process = SimpleNamespace(pid=44)
+            self.child_launch_gate = child_launch_gate
+            self.process = SimpleNamespace(pid=44, returncode=None)
+            self._reader: asyncio.Task[None] | None = None
             self.closed = False
             self.instances.append(self)
 
         async def start(self) -> None:
-            if self.notification_handler.__name__ == (
-                "ignore_notification"
-            ):
+            self._reader = asyncio.create_task(asyncio.sleep(3600))
+            if self.notification_handler.__name__ == ("ignore_notification"):
                 await self.notification_handler("notice", {})
             await self.request_handler("approval", {})
 
@@ -495,6 +795,9 @@ def test_codex_adapter_models_and_turn(
 
         async def close(self) -> None:
             self.closed = True
+            if self._reader is not None:
+                self._reader.cancel()
+                await asyncio.gather(self._reader, return_exceptions=True)
 
     provider_events = iter(
         [
@@ -545,7 +848,8 @@ def test_codex_adapter_models_and_turn(
         )
         assert result.status == "complete"
         assert result.usage == {"total_tokens": 9}
-        assert len(events) == 3
+        assert len(events) == 4
+        assert events[-1].event_type == "provider.prompt.accepted"
         assert adapter.process_identity() == (0, "")
         await adapter.interrupt()
         with pytest.raises(ProviderUnavailableError):
@@ -570,12 +874,15 @@ def test_codex_adapter_status_resume_failure_and_interrupt_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(codex.shutil, "which", lambda command: None)
+    def unavailable(unused_name: str) -> str:
+        raise RuntimeError("not found")
+
+    monkeypatch.setattr(codex, "trusted_executable", unavailable)
     assert not codex.CodexAdapter().status().ready
     monkeypatch.setattr(
-        codex.shutil,
-        "which",
-        lambda command: "/usr/bin/npx",
+        codex,
+        "trusted_executable",
+        lambda name: "/usr/bin/" + name,
     )
     assert codex.CodexAdapter().status().ready
 
@@ -588,14 +895,17 @@ def test_codex_adapter_status_resume_failure_and_interrupt_guard(
             *,
             notification_handler: Any,
             request_handler: Any,
+            child_launch_gate: ChildLaunchGate | None = None,
         ) -> None:
             del workspace
             self.notification_handler = notification_handler
             self.request_handler = request_handler
+            del child_launch_gate
             self.process = None
+            self._reader: asyncio.Task[None] | None = None
 
         async def start(self) -> None:
-            return
+            self._reader = asyncio.create_task(asyncio.sleep(3600))
 
         async def request(
             self,
@@ -612,15 +922,15 @@ def test_codex_adapter_status_resume_failure_and_interrupt_guard(
             return {}
 
         async def close(self) -> None:
-            return
+            if self._reader is not None:
+                self._reader.cancel()
+                await asyncio.gather(self._reader, return_exceptions=True)
 
     monkeypatch.setattr(codex, "CodexAppServer", Server)
     monkeypatch.setattr(
         codex,
         "codex_notification",
-        lambda method, params: [
-            ProviderEvent("provider.error", status="failed")
-        ],
+        lambda method, params: [ProviderEvent("provider.error", status="failed")],
     )
 
     async def scenario() -> None:
@@ -670,14 +980,17 @@ def test_claude_helpers_and_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(claude.shutil, "which", lambda command: None)
+    def unavailable(unused_name: str) -> str:
+        raise RuntimeError("not found")
+
+    monkeypatch.setattr(claude, "trusted_executable", unavailable)
     transport = object.__new__(claude.NpxClaudeTransport)
     with pytest.raises(claude.CLINotFoundError):
         transport._find_cli()
     monkeypatch.setattr(
-        claude.shutil,
-        "which",
-        lambda command: "/usr/bin/npx",
+        claude,
+        "trusted_executable",
+        lambda name: "/usr/bin/" + name,
     )
     assert transport._find_cli() == "/usr/bin/npx"
     asyncio.run(transport._check_claude_version())
@@ -689,23 +1002,71 @@ def test_claude_helpers_and_transport(
     with pytest.raises(ValueError):
         claude._permission_mode("invalid")
 
-    assert claude._message_session_id(
-        SimpleNamespace(session_id="session")
-    ) == "session"
+    assert (
+        claude._message_session_id(SimpleNamespace(session_id="session")) == "session"
+    )
     assert claude._message_session_id(object()) == ""
     assert claude._content_payload(object()) == {"type": "unknown"}
     assert claude._message_events(object())[0].event_type == "provider.event"
+    child_ids: set[str] = set()
+    started = claude._normalized_child_event(
+        ProviderEvent(
+            "agent.child.started",
+            metadata={"id": "child-1"},
+        ),
+        child_ids,
+    )
+    assert started.event_type == "agent.child.started"
+    assert child_ids == {"child-1"}
+    unrelated = ProviderEvent(
+        "tool.completed",
+        metadata={"tool_use_id": "other"},
+    )
+    assert (
+        claude._normalized_child_event(
+            unrelated,
+            child_ids,
+        )
+        is unrelated
+    )
+    completed = claude._normalized_child_event(
+        ProviderEvent(
+            "tool.completed",
+            metadata={"tool_use_id": "child-1"},
+        ),
+        child_ids,
+    )
+    assert completed.event_type == "agent.child.completed"
+    assert not child_ids
+    child_ids.add("child-2")
+    failed = claude._normalized_child_event(
+        ProviderEvent(
+            "tool.completed",
+            metadata={"tool_use_id": "child-2", "is_error": True},
+        ),
+        child_ids,
+    )
+    assert failed.event_type == "agent.child.failed"
+    assert failed.status == "failed"
+    assert not child_ids
+    no_metadata = ProviderEvent("provider.event")
+    assert (
+        claude._normalized_child_event(
+            no_metadata,
+            child_ids,
+        )
+        is no_metadata
+    )
     assert claude._looks_exhausted("Capacity reached")
     assert not claude._looks_exhausted("healthy")
-    assert claude._looks_like_spend_limit(
-        "Monthly spend limit; use /usage-credits"
-    )
+    assert claude._looks_like_spend_limit("Monthly spend limit; use /usage-credits")
     assert not claude._looks_like_spend_limit("monthly spend limit")
     assert claude._bounded("x" * 5000) == "x" * 4096
     assert not claude._has_native_session(tmp_path, "missing")
 
     monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "")
     assert claude._process_start(7) == "7"
+
     def unavailable(*args: Any, **kwargs: Any) -> str:
         del args
         del kwargs
@@ -721,9 +1082,7 @@ def test_claude_helpers_and_transport(
     assert claude._process_start(7) == "21"
 
     async def prompt() -> None:
-        values = [
-            value async for value in claude._prompt_stream("hello", "session")
-        ]
+        values = [value async for value in claude._prompt_stream("hello", "session")]
         assert values[0]["message"]["content"][0]["text"] == "hello"
         assert [value async for value in claude._empty_stream()] == []
 
@@ -769,7 +1128,7 @@ def test_claude_message_normalization_boundaries() -> None:
             event={"type": "delta"},
         ),
         claude.RateLimitEvent(
-                rate_limit_info=RateLimitInfo(
+            rate_limit_info=RateLimitInfo(
                 status="allowed_warning",
                 utilization=0.8,
             ),
@@ -876,7 +1235,11 @@ def test_claude_run_turn_success_exhaustion_and_sdk_failure(
 
     monkeypatch.setattr(claude, "NpxClaudeTransport", Transport)
     monkeypatch.setattr(claude, "ClaudeSDKClient", Client)
-    monkeypatch.setattr(claude, "_has_native_session", lambda *args: False)
+    monkeypatch.setattr(
+        claude,
+        "_has_native_session",
+        lambda unused_workspace, session_id: session_id == "native",
+    )
     monkeypatch.setattr(claude.uuid, "uuid4", lambda: "new-session")
 
     event_map = {
@@ -1027,18 +1390,76 @@ def test_claude_run_turn_success_exhaustion_and_sdk_failure(
     asyncio.run(scenario())
 
 
+def test_claude_resume_fails_when_transcript_is_missing_or_misbound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    other_workspace = tmp_path / "other-workspace"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    monkeypatch.setattr(
+        claude.Path,
+        "home",
+        classmethod(lambda unused_class: home),
+    )
+    transcript = claude._native_session_path(workspace, "native")
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    assert claude._has_native_session(workspace, "native")
+    assert not claude._has_native_session(other_workspace, "native")
+    transcript.unlink()
+    assert not claude._has_native_session(workspace, "native")
+
+    class NeverClient:
+        def __init__(self, **unused: Any) -> None:
+            raise AssertionError("a missing resume must not start Claude")
+
+    monkeypatch.setattr(claude, "ClaudeSDKClient", NeverClient)
+    events: list[ProviderEvent] = []
+
+    async def collect(event: ProviderEvent) -> None:
+        events.append(event)
+
+    async def scenario() -> None:
+        adapter = claude.ClaudeAdapter()
+        with pytest.raises(ProviderUnavailableError):
+            await adapter.run_turn(
+                workspace=workspace,
+                prompt="resume",
+                native_session_id="native",
+                permission_mode="plan",
+                model="",
+                effort="",
+                event_handler=collect,
+                approval_handler=_decline,
+            )
+
+    asyncio.run(scenario())
+    assert [event.event_type for event in events] == ["recovery.native_resume_missing"]
+    assert events[0].status == "failed"
+    assert events[0].metadata == {
+        "provider": "claude",
+        "native_session_id": "native",
+    }
+
+
 def test_claude_adapter_status_models_and_active_control(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def unavailable(unused_name: str) -> str:
+        raise RuntimeError("not found")
+
     adapter = claude.ClaudeAdapter()
     monkeypatch.setattr(
-        claude.shutil,
-        "which",
-        lambda command: "/usr/bin/npx",
+        claude,
+        "trusted_executable",
+        lambda name: "/usr/bin/" + name,
     )
     assert adapter.status().ready
-    monkeypatch.setattr(claude.shutil, "which", lambda command: None)
+    monkeypatch.setattr(claude, "trusted_executable", unavailable)
     assert not adapter.status().ready
     assert len(asyncio.run(adapter.models(tmp_path))) == 3
     asyncio.run(adapter.interrupt())
@@ -1061,20 +1482,29 @@ def test_claude_adapter_status_models_and_active_control(
 
     adapter._transport = SimpleNamespace(_process=None)
     assert adapter.process_identity() == (0, "")
-    adapter._transport = SimpleNamespace(_process=SimpleNamespace(pid=0))
+    adapter._transport = SimpleNamespace(
+        _process=SimpleNamespace(pid=0, returncode=None)
+    )
     assert adapter.process_identity() == (0, "")
     monkeypatch.setattr(claude, "_process_start", lambda pid: "started")
-    adapter._transport = SimpleNamespace(_process=SimpleNamespace(pid=55))
+    adapter._transport = SimpleNamespace(
+        _process=SimpleNamespace(pid=55, returncode=None)
+    )
     assert adapter.process_identity() == (55, "started")
 
 
 def test_terminal_command_text_and_pty_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert terminal._command("codex", "approval", ["resume"]) == [
-        "npx",
+    codex_command = terminal._command("codex", "approval", ["resume"])
+    assert Path(codex_command[0]).name == "npx"
+    assert codex_command[1:] == [
         "-y",
         "@openai/codex@0.146.0",
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
         "resume",
     ]
     assert "--yolo" in terminal._command("codex", "full", [])
@@ -1083,10 +1513,31 @@ def test_terminal_command_text_and_pty_boundaries(
         "full",
         [],
     )
-    assert terminal._command("claude", "approval", [])[:2] == [
-        "npx",
-        "@anthropic-ai/claude-code@2.1.220",
+    claude_command = terminal._command("claude", "approval", [])
+    assert Path(claude_command[0]).name == "npx"
+    assert claude_command[1] == "@anthropic-ai/claude-code@2.1.220"
+    assert terminal._command("codex", "read-only", ["resume"])[3:] == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "on-request",
+        "resume",
     ]
+    assert terminal._command("claude", "plan", [])[-2:] == [
+        "--permission-mode",
+        "plan",
+    ]
+    for protected in (
+        "--yolo",
+        "--sandbox=danger-full-access",
+        "--ask-for-approval=never",
+        "--dangerously-skip-permissions",
+        "--permission-mode=bypassPermissions",
+        "-a",
+        "-s",
+    ):
+        with pytest.raises(ValueError, match="override"):
+            terminal._command("codex", "approval", [protected])
     with pytest.raises(ValueError):
         terminal._command("other", "approval", [])
 
@@ -1185,6 +1636,7 @@ def test_terminal_socket_lifecycle(
 
     class Child:
         returncode = None
+        pid = 42
 
         def __init__(self) -> None:
             self.signals: list[int] = []
@@ -1201,7 +1653,8 @@ def test_terminal_socket_lifecycle(
     writes: list[bytes] = []
 
     async def create(*args: Any, **kwargs: Any) -> Child:
-        assert args[:3] == ("npx", "-y", "@openai/codex@0.146.0")
+        assert Path(str(args[0])).name == "npx"
+        assert args[1:3] == ("-y", "@openai/codex@0.146.0")
         assert kwargs["cwd"] == tmp_path
         return child
 
@@ -1220,6 +1673,21 @@ def test_terminal_socket_lifecycle(
     monkeypatch.setattr(terminal, "_pty_to_socket", relay)
     monkeypatch.setattr(terminal, "_text_message", text)
     monkeypatch.setattr(terminal.os, "close", closed.append)
+    identity = SimpleNamespace(pid=42, pgid=42, pid_start="start")
+    monkeypatch.setattr(
+        terminal,
+        "process_group_identity",
+        lambda unused: identity,
+    )
+    terminated: list[tuple[object, object]] = []
+
+    async def terminate(
+        selected_process: object,
+        selected_identity: object,
+    ) -> None:
+        terminated.append((selected_process, selected_identity))
+
+    monkeypatch.setattr(terminal, "terminate_process_group", terminate)
     monkeypatch.setattr(
         terminal.os,
         "write",
@@ -1235,7 +1703,7 @@ def test_terminal_socket_lifecycle(
 
     asyncio.run(scenario())
     assert writes == [b"binary"]
-    assert child.signals == [terminal.signal.SIGTERM]
+    assert terminated == [(child, identity)]
     assert closed == [11, 10]
 
 

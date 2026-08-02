@@ -1,24 +1,31 @@
 import asyncio
+import datetime
+import math
 from pathlib import Path
 
 import pytest
+from test_support import session
 
 from agent_harness.errors import ProviderUnavailableError
 from agent_harness.models import RoutingCandidate
-from agent_harness.providers.base import ProviderAdapter
-from agent_harness.providers.base import ProviderModel
-from agent_harness.providers.base import ProviderResult
-from agent_harness.providers.base import ProviderStatus
+from agent_harness.providers.base import (
+    ProviderAdapter,
+    ProviderModel,
+    ProviderResult,
+    ProviderStatus,
+)
 from agent_harness.routing import route
-from agent_harness.scheduler import Scheduler
-from agent_harness.scheduler import _durable_usage
-from agent_harness.scheduler import _fallback_models
-from agent_harness.scheduler import _optional_number
-from agent_harness.scheduler import _select_effort
-from agent_harness.scheduler import _select_model
+from agent_harness.scheduler import (
+    Scheduler,
+    _durable_usage,
+    _fallback_models,
+    _optional_number,
+    _select_effort,
+    _select_model,
+    _usage_is_fresh,
+)
 from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
-from test_support import session
 
 
 def candidate(
@@ -26,14 +33,18 @@ def candidate(
     *,
     binding: float | None,
     credits: bool = False,
+    cost_reporting: bool = False,
     queue: int = 0,
 ) -> RoutingCandidate:
+    capabilities = {"tools", "resume"}
+    if cost_reporting:
+        capabilities.add("cost-reporting")
     return RoutingCandidate(
         provider=provider,
         model="frontier",
         effort="xhigh",
         ready=True,
-        capabilities=frozenset({"tools", "resume"}),
+        capabilities=frozenset(capabilities),
         quality=100.0,
         binding_percent=binding,
         credits_engaged=credits,
@@ -65,14 +76,52 @@ def test_routing_drops_ninety_percent_capacity() -> None:
     assert decision.rejected[0]["provider"] == "codex"
 
 
+@pytest.mark.parametrize("binding", [math.nan, math.inf, -1.0])
+def test_routing_rejects_malformed_binding_usage(binding: float) -> None:
+    with pytest.raises(ProviderUnavailableError):
+        route([candidate("codex", binding=binding)])
+
+
+@pytest.mark.parametrize("budget", [math.nan, math.inf, -math.inf])
+def test_routing_rejects_nonfinite_metered_budget(budget: float) -> None:
+    with pytest.raises(ValueError, match="must be finite"):
+        route(
+            [candidate("codex", binding=10, credits=True, cost_reporting=True)],
+            metered_budget=budget,
+        )
+
+
 def test_metered_capacity_requires_explicit_budget() -> None:
     with pytest.raises(ProviderUnavailableError):
         route([candidate("codex", binding=10, credits=True)])
+    with pytest.raises(ProviderUnavailableError):
+        route(
+            [candidate("codex", binding=10, credits=True)],
+            metered_budget=0,
+        )
+    with pytest.raises(ProviderUnavailableError):
+        route(
+            [candidate("codex", binding=10, credits=True)],
+            metered_budget=-1,
+        )
+    with pytest.raises(ProviderUnavailableError):
+        route(
+            [candidate("codex", binding=10, credits=True)],
+            metered_budget=1.0,
+        )
     decision = route(
-        [candidate("codex", binding=10, credits=True)],
+        [
+            candidate(
+                "claude",
+                binding=10,
+                credits=True,
+                cost_reporting=True,
+            )
+        ],
         metered_budget=1.0,
     )
-    assert decision.provider == "codex"
+    assert decision.provider == "claude"
+    assert decision.credits_engaged is True
 
 
 def test_explicit_model_and_effort_never_fall_back() -> None:
@@ -207,6 +256,10 @@ def test_status_returns_durable_usage_before_slow_refresh(
 
         assert elapsed < 0.1
         assert status["claude"]["usage"]["binding_percent"] == 37.0
+        assert status["claude"]["usage"]["sample_id"]
+        assert status["claude"]["usage"]["observed_at"]
+        assert status["claude"]["usage"]["fresh"] is True
+        assert status["claude"]["usage"]["admissible"] is True
         assert status["claude"]["usage_refreshing"]
         assert status["claude"]["models"][0]["id"] == "opus"
         refresh = scheduler._status_refresh
@@ -292,6 +345,31 @@ def test_scheduler_enforces_capacity_concurrency_model_and_effort(
                 payload={},
             )
         }
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                provider="codex",
+                permitted_providers=frozenset({"claude"}),
+            )
+        policy_route = await scheduler.choose(
+            current,
+            workload="implementation",
+            required_capabilities=frozenset(),
+            permitted_providers=frozenset({"codex"}),
+            permitted_efforts=frozenset({"low"}),
+        )
+        assert policy_route.provider == "codex"
+        assert policy_route.effort == "low"
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                effort="high",
+                permitted_efforts=frozenset({"low"}),
+            )
         monkeypatch.setattr(
             store,
             "active_unattended_provider_count",
@@ -307,9 +385,56 @@ def test_scheduler_enforces_capacity_concurrency_model_and_effort(
             )
         monkeypatch.setattr(
             store,
+            "command_envelope",
+            lambda command_id: {
+                "command_id": command_id,
+                "provider": "codex",
+                "state": "recovering",
+            },
+        )
+        resumed = await scheduler.choose(
+            current,
+            workload="implementation",
+            required_capabilities=frozenset(),
+            execution_profile="unattended",
+            enforce_concurrency=True,
+            command_id="command-1",
+        )
+        assert resumed.provider == "codex"
+        monkeypatch.setattr(
+            store,
+            "command_envelope",
+            lambda command_id: {
+                "command_id": command_id,
+                "provider": "codex",
+                "state": "complete",
+            },
+        )
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                execution_profile="unattended",
+                enforce_concurrency=True,
+                command_id="command-2",
+            )
+        monkeypatch.setattr(
+            store,
             "active_unattended_provider_count",
             lambda provider: 0,
         )
+        monkeypatch.setattr(store, "active_goal_command_count", lambda goal_id: 2)
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                enforce_concurrency=True,
+                goal_id="goal-1",
+                max_concurrency=2,
+            )
+        monkeypatch.setattr(store, "active_goal_command_count", lambda goal_id: 0)
         with pytest.raises(ProviderUnavailableError):
             await scheduler.choose(
                 current,
@@ -378,15 +503,61 @@ def test_scheduler_helpers_normalize_fallback_values() -> None:
     assert durable["claude"].error == "offline"
     assert _optional_number(False) is None
     assert _optional_number("unknown") is None
+    assert _optional_number(math.nan) is None
+    assert _optional_number(-1) is None
 
-    without_default = (
-        ProviderModel("first", "First", ("low",), None),
-    )
+    without_default = (ProviderModel("first", "First", ("low",), None),)
     assert _select_model(without_default, "").model_id == "first"
     assert _select_model((), "").model_id == "default"
     assert _select_effort(without_default[0], "") == "low"
+    assert (
+        _select_effort(
+            without_default[0],
+            "",
+            frozenset({"high"}),
+        )
+        is None
+    )
     medium = ProviderModel("medium", "Medium", ("medium",), None)
     assert _select_effort(medium, "") == "medium"
     no_efforts = ProviderModel("none", "None", (), None)
     assert _select_effort(no_efforts, "") == ""
     assert _fallback_models("codex")[0].model_id == "default"
+
+    stale = datetime.datetime.now(datetime.UTC)
+    stale -= datetime.timedelta(minutes=5)
+    assert _usage_is_fresh(stale.isoformat()) is False
+    assert _usage_is_fresh("not-a-timestamp") is False
+    assert _usage_is_fresh(datetime.datetime.now().isoformat()) is True
+
+
+def test_status_marks_high_binding_and_probe_errors_inadmissible(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        snapshot = UsageSnapshot(
+            provider="claude",
+            binding_percent=95.0,
+            credits_engaged=False,
+            payload={},
+            error="probe failed",
+        )
+        store.record_usage(
+            "claude",
+            95.0,
+            False,
+            {"error": "probe failed"},
+        )
+        scheduler = Scheduler(store, {"claude": SlowAdapter()})
+        scheduler._usage_cache = {"claude": snapshot}
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        status = await scheduler.status(tmp_path)
+        assert status["claude"]["usage"]["admissible"] is False
+        refresh = scheduler._status_refresh
+        assert refresh is not None
+        refresh.cancel()
+        await asyncio.gather(refresh, return_exceptions=True)
+        store.close()
+
+    asyncio.run(scenario())

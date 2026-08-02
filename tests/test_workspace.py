@@ -1,17 +1,19 @@
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
+from test_support import session
 
 from agent_harness.blobs import BlobStore
 from agent_harness.errors import HarnessError
-from agent_harness.workspace import checkpoint_workspace
-from agent_harness.workspace import create_worktree
-from agent_harness.workspace import restore_checkpoint
-from agent_harness.workspace import _git
-from agent_harness.workspace import _git_bytes
-from agent_harness.workspace import _git_input
-from test_support import session
+from agent_harness.workspace import (
+    _git,
+    _git_bytes,
+    _git_input,
+    checkpoint_workspace,
+    create_worktree,
+    restore_checkpoint,
+)
 
 
 def git(path: Path, *arguments: str) -> None:
@@ -40,6 +42,7 @@ def test_checkpoint_restores_tracked_and_untracked_files(
     current = session(source)
     (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
     (source / "new.txt").write_text("new\n", encoding="utf-8")
+    (source / "new-link").symlink_to("new.txt")
     blobs = BlobStore(tmp_path / "blobs")
     checkpoint = checkpoint_workspace(
         current,
@@ -57,6 +60,8 @@ def test_checkpoint_restores_tracked_and_untracked_files(
     restore_checkpoint(target, checkpoint, blobs)
     assert (target / "tracked.txt").read_text(encoding="utf-8") == "changed\n"
     assert (target / "new.txt").read_text(encoding="utf-8") == "new\n"
+    assert (target / "new-link").is_symlink()
+    assert (target / "new-link").readlink() == Path("new.txt")
 
 
 def test_workspace_rejects_collisions_mismatches_and_git_failures(

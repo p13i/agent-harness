@@ -2,25 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 import runpy
 import signal
 import subprocess
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agent_harness import cli
+from agent_harness import cli, runtime
 from agent_harness import client as client_module
-from agent_harness.config import CONTROL_BUILD_ID
-from agent_harness.config import CONTROL_PROTOCOL_VERSION
-from agent_harness.config import prepare_paths
+from agent_harness.config import (
+    CONTROL_BUILD_ID,
+    CONTROL_PROTOCOL_VERSION,
+    prepare_paths,
+)
 from agent_harness.config import paths as harness_paths_for
 from agent_harness.errors import HarnessError
-from agent_harness.service_manager import ServiceStatus
-from agent_harness.service_manager import DiagnosticProbe
-from agent_harness import runtime
+from agent_harness.service_manager import DiagnosticProbe, ServiceStatus
 
 
 def test_executable_launcher_delegates_to_cli(
@@ -47,9 +47,7 @@ def test_launcher_prefers_current_source_build(
     launcher.write_text("#!/bin/sh\n", encoding="utf-8")
     launcher.chmod(0o755)
     stale_runfiles = tmp_path / "stale.runfiles"
-    stale_launcher = (
-        stale_runfiles / "_main" / "cmd" / "agent-harness"
-    )
+    stale_launcher = stale_runfiles / "_main" / "cmd" / "agent-harness"
     stale_launcher.parent.mkdir(parents=True)
     stale_launcher.write_text("#!/bin/sh\n", encoding="utf-8")
     stale_launcher.chmod(0o755)
@@ -77,9 +75,7 @@ def test_launcher_discovers_runfiles_sys_path_invocation_and_fallback(
     )
 
     runfiles = tmp_path / "runfiles"
-    runfiles_launcher = (
-        runfiles / "workspace" / "cmd" / "agent-harness"
-    )
+    runfiles_launcher = runfiles / "workspace" / "cmd" / "agent-harness"
     runfiles_launcher.parent.mkdir(parents=True)
     runfiles_launcher.write_text("#!/bin/sh\n", encoding="utf-8")
     runfiles_launcher.chmod(0o755)
@@ -539,9 +535,7 @@ def test_client_discovers_only_daemon_processes(
 
     monkeypatch.setattr(client_module.subprocess, "run", fallback)
     assert client_module._managed_daemon_pids(harness_paths) == (789,)
-    assert client_module._filter_managed_daemon_pids(
-        {0, 999, 456}
-    ) == ()
+    assert client_module._filter_managed_daemon_pids({0, 999, 456}) == ()
 
 
 def test_client_stops_a_managed_daemon(
@@ -756,9 +750,7 @@ def test_cli_dispatches_every_session_control(
             payload=None,
             idempotency_key="",
         ):
-            requests.append(
-                (method, path, payload, idempotency_key)
-            )
+            requests.append((method, path, payload, idempotency_key))
             if path.endswith("/messages"):
                 return {
                     "command": {
@@ -923,14 +915,9 @@ def test_cli_dispatches_every_session_control(
     assert "/v1/sessions" in paths
     assert "/v1/sessions/session-1/messages" in paths
     assert "/v1/transfers/import" in paths
-    assert (
-        "/v1/reconciliations/reconciliation-1/resolution"
-        in paths
-    )
+    assert "/v1/reconciliations/reconciliation-1/resolution" in paths
     assert any(
-        item[1].endswith("/budget-extensions")
-        and bool(item[3])
-        for item in requests
+        item[1].endswith("/budget-extensions") and bool(item[3]) for item in requests
     )
 
 
@@ -970,9 +957,7 @@ def test_cli_rejects_invalid_event_and_evidence_values(
         with pytest.raises(ValueError):
             asyncio.run(cli._run(parsed))
 
-    assert cli._json_object('{"value":1}', "--value") == {
-        "value": 1
-    }
+    assert cli._json_object('{"value":1}', "--value") == {"value": 1}
     with pytest.raises(ValueError, match="JSON object"):
         cli._json_object("[]", "--value")
     assert cli._object({"value": 1}) == {"value": 1}
@@ -1116,6 +1101,7 @@ def test_cli_main_reports_bounded_failures(
     ]
 
     for error, status, message in failures:
+
         def fail(unused: object, selected: BaseException = error) -> int:
             del unused
             raise selected
@@ -1160,9 +1146,7 @@ def test_cli_resume_validation_and_legacy_resume_dispatch(
 
     monkeypatch.setattr(cli, "ensure_daemon", client)
     monkeypatch.setattr(cli, "run_tui", run_tui)
-    missing = cli.parser().parse_args(
-        ["--cwd", str(tmp_path), "chat", "resume"]
-    )
+    missing = cli.parser().parse_args(["--cwd", str(tmp_path), "chat", "resume"])
     with pytest.raises(ValueError, match="session UUID"):
         cli._run_tui_command(missing)
 
@@ -1171,9 +1155,7 @@ def test_cli_resume_validation_and_legacy_resume_dispatch(
     )
     assert cli._run_tui_command(chat_resume) == 0
 
-    resumed = cli.parser().parse_args(
-        ["--cwd", str(tmp_path), "resume", "session-1"]
-    )
+    resumed = cli.parser().parse_args(["--cwd", str(tmp_path), "resume", "session-1"])
     assert cli._run_tui_command(resumed) == 0
     assert observed == ["session-2", "session-1"]
 
@@ -1297,6 +1279,80 @@ def test_service_status_returns_failure_for_inactive_daemons(
     assert asyncio.run(cli._run(arguments)) == 1
 
 
+def test_quiescence_cli_uses_health_then_fails_closed_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    statuses = [
+        ServiceStatus(True, True, 1, "build-1", "active"),
+        ServiceStatus(True, True, 1, "build-1", "active"),
+        ServiceStatus(False, True, 1, "build-1", "inactive"),
+        ServiceStatus(True, True, 1, "build-1", "active"),
+        ServiceStatus(False, True, 1, "build-1", "inactive"),
+    ]
+    health_values = [
+        {
+            "runtime_build_id": "build-1",
+            "quiescence": {"restart_safe": True},
+        },
+        {
+            "runtime_build_id": "build-1",
+            "quiescence": {"restart_safe": False},
+        },
+        {},
+        {},
+        {},
+    ]
+    durable_commands = [
+        [],
+        [],
+        [
+            {
+                "command_id": "command-1",
+                "profile": "unattended",
+            }
+        ],
+    ]
+
+    class Manager:
+        def status(self) -> ServiceStatus:
+            return statuses.pop(0)
+
+    class Client:
+        def __init__(self, unused_paths: object) -> None:
+            del unused_paths
+
+        async def _health_payload(self) -> dict[str, object]:
+            return health_values.pop(0)
+
+    class Store:
+        def __init__(self, unused_database: Path) -> None:
+            del unused_database
+
+        def active_command_summaries(self) -> list[dict[str, str]]:
+            return durable_commands.pop(0)
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr(cli, "_service_manager", lambda: Manager())
+    monkeypatch.setattr(cli, "HarnessClient", Client)
+    monkeypatch.setattr(cli, "StateStore", Store)
+    arguments = cli.parser().parse_args(
+        ["--state-dir", str(tmp_path / "state"), "quiescence"]
+    )
+    assert asyncio.run(cli._run(arguments)) == 0
+    assert asyncio.run(cli._run(arguments)) == 1
+    assert asyncio.run(cli._run(arguments)) == 0
+    assert asyncio.run(cli._run(arguments)) == 1
+    assert asyncio.run(cli._run(arguments)) == 1
+    output = capsys.readouterr().out
+    assert '"runtime_build_id": "build-1"' in output
+    assert '"proof_state_known": false' in output
+    assert '"active_unattended_commands"' in output
+
+
 def test_worker_closes_storage_after_session_worker_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1356,8 +1412,8 @@ def test_doctor_reports_bundle_service_daemon_and_storage(
             return (
                 DiagnosticProbe(
                     "user-systemd",
-                    "warning",
-                    "not available in this fixture",
+                    "pass",
+                    "available in this fixture",
                 ),
             )
 
@@ -1367,6 +1423,8 @@ def test_doctor_reports_bundle_service_daemon_and_storage(
             "status": "ok",
             "control_build_id": CONTROL_BUILD_ID,
             "control_protocol_version": CONTROL_PROTOCOL_VERSION,
+            "runtime_build_id": "build-1",
+            "quiescence": {"restart_safe": True},
         }
 
     def no_installed_selection():
@@ -1385,6 +1443,12 @@ def test_doctor_reports_bundle_service_daemon_and_storage(
     )
     monkeypatch.setattr(cli.shutil, "which", lambda unused: "/bin/tool")
     monkeypatch.setattr(
+        cli,
+        "trusted_executable",
+        lambda name: "/usr/bin/" + name,
+    )
+    monkeypatch.setattr(cli, "provider_auth_ready", lambda unused: True)
+    monkeypatch.setattr(
         cli.shutil,
         "disk_usage",
         lambda unused: SimpleNamespace(free=10 * 1024**3),
@@ -1398,7 +1462,7 @@ def test_doctor_reports_bundle_service_daemon_and_storage(
         },
     )
 
-    assert asyncio.run(cli._doctor(harness_paths)) == 0
+    assert asyncio.run(cli._doctor(harness_paths)) == 1
     output = capsys.readouterr().out
     assert '"sqlite": true' in output
     assert '"status": "compatible"' in output
@@ -1420,7 +1484,29 @@ def test_doctor_reports_bundle_service_daemon_and_storage(
         lambda unused: SimpleNamespace(content_digest="digest-1"),
     )
     assert asyncio.run(cli._doctor(harness_paths)) == 0
-    assert '"content_digest": "digest-1"' in capsys.readouterr().out
+    bound_output = capsys.readouterr().out
+    assert '"content_digest": "digest-1"' in bound_output
+    assert '"runtime_build_id": "build-1"' in bound_output
+    assert '"runtime_build_matches_selection": true' in bound_output
+
+    async def stale_health(unused):
+        del unused
+        return {
+            "status": "ok",
+            "control_build_id": "old-control-source",
+            "control_protocol_version": CONTROL_PROTOCOL_VERSION,
+            "runtime_build_id": "old-build",
+            "quiescence": {"restart_safe": True},
+        }
+
+    monkeypatch.setattr(
+        cli.HarnessClient,
+        "_health_payload",
+        stale_health,
+    )
+    assert asyncio.run(cli._doctor(harness_paths)) == 1
+    stale_output = capsys.readouterr().out
+    assert '"runtime_build_matches_selection": false' in stale_output
 
     harness_paths.state_dir.chmod(0o755)
     harness_paths.socket.write_text("not a socket", encoding="utf-8")
@@ -1445,16 +1531,12 @@ def test_doctor_stale_timestamp_classification() -> None:
         maximum_age_seconds=90,
     )
     assert cli._timestamp_is_expired("2000-01-01T00:00:00+00:00")
-    assert not cli._timestamp_is_expired(
+    assert not cli._timestamp_is_expired("2099-01-01T00:00:00+00:00")
+    assert cli._timestamp_is_expired("invalid")
+    assert cli._sync_lag_seconds({"updated_at": "2099-01-01T00:00:00"}) == 0.0
+    assert cli._timestamp("2099-01-01T00:00:00") == cli._timestamp(
         "2099-01-01T00:00:00+00:00"
     )
-    assert cli._timestamp_is_expired("invalid")
-    assert cli._sync_lag_seconds(
-        {"updated_at": "2099-01-01T00:00:00"}
-    ) == 0.0
-    assert cli._timestamp(
-        "2099-01-01T00:00:00"
-    ) == cli._timestamp("2099-01-01T00:00:00+00:00")
 
 
 def test_installed_bundle_selection_is_verified(

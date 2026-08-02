@@ -1,15 +1,15 @@
 import asyncio
 import json
-from pathlib import Path
+import math
 import subprocess
-from types import SimpleNamespace
 import urllib.error
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent_harness import usage
-from agent_harness.usage import UsageSnapshot
-from agent_harness.usage import normalize_usage
+from agent_harness.usage import UsageSnapshot, normalize_usage
 
 
 def test_codex_binding_is_maximum_window() -> None:
@@ -23,6 +23,15 @@ def test_codex_binding_is_maximum_window() -> None:
         },
     )
     assert snapshot.binding_percent == 70
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -1.0])
+def test_usage_normalization_rejects_malformed_binding(value: float) -> None:
+    snapshot = normalize_usage(
+        "codex",
+        {"rate_limit": {"primary_window": {"used_percent": value}}},
+    )
+    assert snapshot.binding_percent is None
 
 
 def test_claude_extra_usage_is_metered() -> None:
@@ -52,12 +61,15 @@ def test_usage_probes_are_bounded_and_provider_complete(
     assert set(results) == {"codex", "claude"}
     monkeypatch.setattr(usage, "_timed_probe", original_timed_probe)
 
-    assert asyncio.run(
-        usage._timed_probe(
-            "codex",
-            lambda: UsageSnapshot("codex", 10, False, {}),
-        )
-    ).binding_percent == 10
+    assert (
+        asyncio.run(
+            usage._timed_probe(
+                "codex",
+                lambda: UsageSnapshot("codex", 10, False, {}),
+            )
+        ).binding_percent
+        == 10
+    )
 
     async def timeout(coroutine: object, *, timeout: float) -> object:
         del timeout
@@ -66,9 +78,7 @@ def test_usage_probes_are_bounded_and_provider_complete(
         raise TimeoutError
 
     monkeypatch.setattr(usage.asyncio, "wait_for", timeout)
-    timed_out = asyncio.run(
-        usage._timed_probe("claude", lambda: None)
-    )
+    timed_out = asyncio.run(usage._timed_probe("claude", lambda: None))
     assert timed_out.error == "probe timed out"
 
 
@@ -127,6 +137,9 @@ def test_usage_http_and_credential_parsers_are_defensive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(usage.sys, "platform", "darwin")
+
     class Response:
         def __init__(self, value: object) -> None:
             self.value = value
@@ -152,9 +165,7 @@ def test_usage_http_and_credential_parsers_are_defensive(
         "urlopen",
         lambda unused_request, timeout: Response({"value": 1}),
     )
-    assert usage._json_get("https://example.invalid", {}) == {
-        "value": 1
-    }
+    assert usage._json_get("https://example.invalid", {}) == {"value": 1}
     monkeypatch.setattr(
         usage.urllib.request,
         "urlopen",
@@ -260,6 +271,28 @@ def test_usage_http_and_credential_parsers_are_defensive(
     assert usage._safe_error(error) == "HTTP 429"
 
 
+def test_claude_linux_credentials_are_read_without_projecting_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(usage.sys, "platform", "linux")
+    monkeypatch.setattr(usage.Path, "home", lambda: tmp_path)
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.parent.mkdir()
+    credentials.write_text(
+        '{"claudeAiOauth":{"accessToken":"linux-token"}}',
+        encoding="utf-8",
+    )
+    credentials.chmod(0o600)
+    assert usage._claude_token() == "linux-token"
+    credentials.chmod(0o644)
+    assert usage._claude_token() is None
+    credentials.chmod(0o600)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "environment-token")
+    assert usage._claude_token() == "environment-token"
+
+
 def test_usage_normalization_omits_private_payloads() -> None:
     codex = normalize_usage(
         "codex",
@@ -289,6 +322,4 @@ def test_usage_normalization_omits_private_payloads() -> None:
     assert usage._number("unknown") is None
     assert usage._object("unknown") == {}
     assert usage._usage_window(None, "utilization") is None
-    assert UsageSnapshot("test", None, False, {}).as_dict()["provider"] == (
-        "test"
-    )
+    assert UsageSnapshot("test", None, False, {}).as_dict()["provider"] == ("test")

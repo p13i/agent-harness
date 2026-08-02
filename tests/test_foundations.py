@@ -3,40 +3,42 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
-
-from agent_harness.blobs import BlobStore
-from agent_harness.config import api_token
-from agent_harness.config import default_state_dir
-from agent_harness.config import paths
-from agent_harness.context import compile_context
-from agent_harness.context import estimate_tokens
-from agent_harness.context import workspace_instructions
-from agent_harness.errors import ConflictError
-from agent_harness.errors import HarnessError
-from agent_harness.errors import NeedsReconciliationError
-from agent_harness.errors import NotFoundError
-from agent_harness.errors import ProviderExhaustedError
-from agent_harness.goals import create_goal
-from agent_harness.goals import make_evidence
-from agent_harness.goals import validate_budgets
-from agent_harness.ids import new_uuid
-from agent_harness.ids import require_identifier
-from agent_harness.ids import require_uuid
-from agent_harness.models import SessionEvent
-from agent_harness.models import RestartRecovery
-from agent_harness.projections import write_session_projections
-from agent_harness.transfer import MachineKeys
-from agent_harness.transfer import load_machine_keys
-from agent_harness.transfer import open_transfer
-from agent_harness.transfer import seal_transfer
-from agent_harness.workspace import create_worktree
-from agent_harness.workspace import checkpoint_workspace
-from agent_harness.workspace import restore_checkpoint
 from test_support import session
+
+import agent_harness.proof as proof_module
+from agent_harness.blobs import BlobStore
+from agent_harness.config import api_token, default_state_dir, paths, runtime_build_id
+from agent_harness.context import (
+    compile_context,
+    estimate_tokens,
+    workspace_instructions,
+)
+from agent_harness.errors import (
+    ConflictError,
+    HarnessError,
+    NeedsReconciliationError,
+    NotFoundError,
+    ProviderExhaustedError,
+)
+from agent_harness.goals import create_goal, make_evidence, validate_budgets
+from agent_harness.ids import new_uuid, require_identifier, require_uuid
+from agent_harness.models import RestartRecovery, SessionEvent
+from agent_harness.projections import write_session_projections
+from agent_harness.transfer import (
+    MachineKeys,
+    load_machine_keys,
+    open_transfer,
+    seal_transfer,
+)
+from agent_harness.workspace import (
+    checkpoint_workspace,
+    create_worktree,
+    restore_checkpoint,
+)
 
 
 def test_blob_store_round_trip_and_validation(tmp_path: Path) -> None:
@@ -84,14 +86,50 @@ def test_configuration_generates_and_reuses_private_token(
     assert first == second
     assert len(first) > 40
     assert value.token.stat().st_mode & 0o077 == 0
-    assert value.database == (
-        tmp_path / "state" / ".runtime" / "state.sqlite3"
-    )
+    assert value.database == (tmp_path / "state" / ".runtime" / "state.sqlite3")
     assert value.sessions == tmp_path / "state" / "sessions"
-    assert value.worktrees == (
-        tmp_path / "state" / ".runtime" / "worktrees"
-    )
+    assert value.worktrees == (tmp_path / "state" / ".runtime" / "worktrees")
     assert paths().state_dir == default_state_dir().resolve()
+
+
+def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "build-1" / "bin" / "agent-harness"
+    executable.parent.mkdir(parents=True)
+    assert runtime_build_id(executable) == ""
+    manifest = executable.parent.parent / "bundle-manifest.json"
+    manifest.write_bytes(b"\xff")
+    assert runtime_build_id(executable) == ""
+    manifest.write_text("invalid", encoding="utf-8")
+    assert runtime_build_id(executable) == ""
+    manifest.write_text("[]", encoding="utf-8")
+    assert runtime_build_id(executable) == ""
+    manifest.write_text(
+        json.dumps({"schema": "unknown", "build_id": "build-1"}),
+        encoding="utf-8",
+    )
+    assert runtime_build_id(executable) == ""
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "p13i/agent-harness/install-bundle/v1",
+                "build_id": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert runtime_build_id(executable) == ""
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "p13i/agent-harness/install-bundle/v1",
+                "build_id": "commit-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert runtime_build_id(executable) == "commit-sha"
 
 
 def test_context_bounds_large_workspace_instruction(
@@ -194,6 +232,25 @@ def test_goal_budget_validation(
         validate_budgets(budget)
 
 
+def test_goal_budget_validation_accepts_turn_envelope_limits() -> None:
+    assert (
+        validate_budgets(
+            {
+                "tokens": 1,
+                "context_tokens": 2,
+                "output_tokens": 3,
+                "tool_calls": 4,
+                "attempts": 5,
+                "child_agents": 6,
+                "seconds": 7,
+                "dollars": 8,
+                "turns": 9,
+            }
+        )["child_agents"]
+        == 6
+    )
+
+
 def test_goal_and_evidence_input_validation() -> None:
     session_id = new_uuid()
     with pytest.raises(ValueError, match="empty"):
@@ -223,6 +280,152 @@ def test_projection_rejects_missing_session_identity(
         )
 
 
+def test_proof_helpers_cover_fail_closed_projection_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = make_evidence(
+        new_uuid(),
+        "test",
+        "unit",
+        "passed",
+        {"count": 1},
+    )
+    assert proof_module._child_identities({"receiverThreadIds": ["native-child"]}) == [
+        ("native-child", ["native-child"])
+    ]
+    result = proof_module._proof_result(
+        {
+            "target_command_id": "target-command",
+            "workspace_material_digest": "material-digest",
+            "usage": {"tokens": [1, True, "redacted"]},
+            "safety": {"limit": 1},
+        }
+    )
+    assert result["target_command_id"] == "target-command"
+    assert result["workspace_material_digest"] == "material-digest"
+    assert result["usage"] == {"tokens": [1, True, None]}
+    assert result["safety_digest"]
+    assert proof_module._proof_approval({})["decision_digest"] == ""
+
+    captured_at = "2026-07-31T12:00:00+00:00"
+    assert not proof_module._usage_is_fresh("invalid", captured_at)
+    assert proof_module._usage_is_fresh(
+        "2026-07-31T12:00:00",
+        "2026-07-31T12:01:00",
+    )
+    usage_rows = [
+        {
+            "sample_id": "sample-" + str(index),
+            "provider": "provider-" + str(index),
+            "observed_at": captured_at,
+            "binding_percent": binding,
+            "credits_engaged": credits,
+            "payload_json": "{}",
+        }
+        for index, (binding, credits) in enumerate(
+            ((None, False), (90.0, False), (10.0, True))
+        )
+    ]
+    usage_rows.append(
+        {
+            **usage_rows[0],
+            "sample_id": "sample-latest",
+            "observed_at": "2026-07-31T12:00:01+00:00",
+        }
+    )
+    projected = proof_module._usage_proof(
+        {"tables": {"usage_samples": usage_rows}},
+        set(),
+        [],
+        captured_at,
+    )
+    assert all(not item["admissible_at_90_percent"] for item in projected)
+
+    truncated: list[str] = []
+    monkeypatch.setattr(proof_module, "MAX_PROOF_RECORDS", 1)
+    assert (
+        len(
+            proof_module._usage_proof(
+                {"tables": {"usage_samples": usage_rows}},
+                set(),
+                truncated,
+                captured_at,
+            )
+        )
+        == 1
+    )
+    assert "usage" in truncated
+    truncated.clear()
+    assert proof_module._bounded_rows(
+        {"commands": [{}, {}]},
+        "commands",
+        truncated,
+    ) == [{}]
+    assert truncated == ["commands"]
+    with pytest.raises(ValueError, match="after_sequence exceeds"):
+        proof_module._proof_page(
+            {"payload": {"events": []}, "through_sequence": 0},
+            after_sequence=1,
+            event_limit=1,
+        )
+    with pytest.raises(ValueError, match="not contiguous"):
+        proof_module._proof_page(
+            {"payload": {"events": []}, "through_sequence": 1},
+            after_sequence=0,
+            event_limit=1,
+        )
+    with pytest.raises(ValueError, match="not contiguous"):
+        proof_module._proof_page(
+            {
+                "payload": {"events": [{"sequence": 2}]},
+                "through_sequence": 1,
+            },
+            after_sequence=0,
+            event_limit=1,
+        )
+
+    assert proof_module._turn_commands(
+        [{"command_id": "command", "result_json": '{"turn_id":"turn"}'}],
+        [],
+    ) == {"turn": "command"}
+    assert proof_module._rows({"rows": "invalid"}, "rows") == []
+    assert proof_module._object([]) == {}
+    assert proof_module._json_object("[]") == {}
+    assert proof_module._json_list("{}") == []
+    assert proof_module._json_value(7) == 7
+    assert proof_module._json_value("invalid") is None
+    assert proof_module._predicate_fields(({"type": "test"},)) == {}
+
+    assert not proof_module._evidence_matches({"type": "other"}, evidence)
+    assert not proof_module._evidence_matches(
+        {"type": "test", "subject": "other"}, evidence
+    )
+    assert not proof_module._evidence_matches(
+        {"type": "test", "outcome": "failed"}, evidence
+    )
+    assert proof_module._evidence_matches({"type": "test"}, evidence)
+    assert proof_module._evidence_matches(
+        {"type": "test", "field": "count", "equals": 1},
+        evidence,
+    )
+    assert proof_module._formal_value(None)["type"] == "null"
+    assert proof_module._formal_value(True)["type"] == "boolean"
+    assert proof_module._formal_value(1)["type"] == "integer"
+    assert proof_module._formal_value(1.5)["type"] == "number"
+    assert proof_module._formal_value("secret")["digest"]
+    assert proof_module._formal_value({"value": 1})["type"] == "json"
+    assert proof_module._strings("invalid") == []
+    assert proof_module._numeric_tree(False) is False
+    assert proof_module._numeric_tree([1, "secret"]) == [1, None]
+    assert proof_module._numeric_tree("secret") is None
+    assert proof_module._integer(True) == 0
+    assert proof_module._integer(3) == 3
+    assert proof_module._integer("3") == 0
+    assert proof_module._optional_boolean(False) is False
+    assert proof_module._optional_boolean(1) is True
+    assert proof_module._optional_boolean("true") is None
+
+
 def test_workspace_rejects_invalid_roots_and_checkpoint_bases(
     tmp_path: Path,
 ) -> None:
@@ -236,12 +439,15 @@ def test_workspace_rejects_invalid_roots_and_checkpoint_bases(
     source = tmp_path / "source"
     _repository(source)
     current = session(source)
-    assert create_worktree(
-        source,
-        tmp_path / "unused",
-        current.session_id,
-        direct=True,
-    ) == source.resolve()
+    assert (
+        create_worktree(
+            source,
+            tmp_path / "unused",
+            current.session_id,
+            direct=True,
+        )
+        == source.resolve()
+    )
 
     blobs = BlobStore(tmp_path / "blobs")
     checkpoint = checkpoint_workspace(
@@ -302,9 +508,7 @@ def test_transfer_rejects_wrong_destination_key() -> None:
     wrong = MachineKeys.generate()
     envelope = seal_transfer(
         {"session_id": "session"},
-        destination_encryption_public=(
-            intended.public_bundle()["encryption"]
-        ),
+        destination_encryption_public=(intended.public_bundle()["encryption"]),
         source_signing_private=source.signing_private,
     )
     with pytest.raises(HarnessError, match="decrypt"):
