@@ -1292,19 +1292,50 @@ class StateStore:
         session_id: str,
         *,
         limit: int = 5000,
+        before_sequence: int | None = None,
     ) -> list[SessionEvent]:
         bounded = max(1, min(limit, 5000))
+        with self._lock:
+            if before_sequence is None:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM events
+                    WHERE session_id = ?
+                    ORDER BY sequence DESC LIMIT ?
+                    """,
+                    (session_id, bounded),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM events
+                    WHERE session_id = ? AND sequence < ?
+                    ORDER BY sequence DESC LIMIT ?
+                    """,
+                    (session_id, before_sequence, bounded),
+                ).fetchall()
+        rows.reverse()
+        return [_event(row) for row in rows]
+
+    def command_instruction_sequence(
+        self,
+        session_id: str,
+        command_id: str,
+    ) -> int:
         with self._lock:
             rows = self._connection.execute(
                 """
                 SELECT * FROM events
-                WHERE session_id = ?
-                ORDER BY sequence DESC LIMIT ?
+                WHERE session_id = ? AND event_type = 'user.message'
+                ORDER BY sequence
                 """,
-                (session_id, bounded),
+                (session_id,),
             ).fetchall()
-        rows.reverse()
-        return [_event(row) for row in rows]
+        for row in rows:
+            event = _event(row)
+            if str(event.metadata.get("command_id", "")) == command_id:
+                return event.sequence
+        raise NotFoundError("command instruction event")
 
     def event_count(self, session_id: str) -> int:
         with self._lock:
@@ -4212,18 +4243,26 @@ class StateStore:
                 ),
             )
 
+    def _mark_provider_boundary(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        now: str,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            UPDATE command_dispatches SET crossed_boundary = 1,
+                state = 'dispatched', updated_at = ?
+            WHERE attempt_id = ? AND crossed_boundary = 0
+            """,
+            (now, attempt_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("provider dispatch boundary is stale")
+
     def mark_provider_boundary(self, attempt_id: str) -> None:
         with self.transaction() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE command_dispatches SET crossed_boundary = 1,
-                    state = 'dispatched', updated_at = ?
-                WHERE attempt_id = ? AND crossed_boundary = 0
-                """,
-                (utc_now(), attempt_id),
-            )
-            if cursor.rowcount != 1:
-                raise ConflictError("provider dispatch boundary is stale")
+            self._mark_provider_boundary(connection, attempt_id, utc_now())
 
     def complete_dispatch(self, attempt_id: str, state: str) -> None:
         if state not in {
@@ -4356,6 +4395,14 @@ class StateStore:
                     )
                     requeued.append(str(command["command_id"]))
                     continue
+                if self._dispatch_known_undelivered(connection, dispatch):
+                    self._requeue_pre_boundary(
+                        connection,
+                        str(command["command_id"]),
+                        now,
+                    )
+                    requeued.append(str(command["command_id"]))
+                    continue
                 record = self._create_reconciliation(
                     connection,
                     command,
@@ -4369,6 +4416,26 @@ class StateStore:
             requeued_command_ids=tuple(requeued),
             reconciliations=tuple(reconciliations),
         )
+
+    def _dispatch_known_undelivered(
+        self,
+        connection: sqlite3.Connection,
+        dispatch: sqlite3.Row,
+    ) -> bool:
+        if str(dispatch["state"]) not in {"failed", "exhausted"}:
+            return False
+        delivery = connection.execute(
+            """
+            SELECT state, accepted_at FROM context_deliveries
+            WHERE attempt_id = ?
+            """,
+            (str(dispatch["attempt_id"]),),
+        ).fetchone()
+        if delivery is None:
+            return True
+        if str(delivery["state"]) == "delivered":
+            return False
+        return not str(delivery["accepted_at"])
 
     def _requeue_pre_boundary(
         self,
@@ -5400,7 +5467,9 @@ class StateStore:
             }:
                 raise ConflictError("xhigh authorization command is not active")
             command_payload = _load_object(str(command["payload_json"]))
-            requested_effort = str(command_payload.get("effort", ""))
+            requested_effort = (
+                str(command_payload.get("effort", "")).strip().casefold()
+            )
             if not effort_requires_xhigh_authorization(requested_effort):
                 raise ConflictError("xhigh authorization command effort changed")
             requested_provider = str(command_payload.get("provider", ""))
@@ -5769,7 +5838,8 @@ class StateStore:
                     """
                     SELECT authorization_id
                     FROM xhigh_authorization_receipts
-                    WHERE command_id = ? AND provider = ? AND effort = ?
+                    WHERE command_id = ? AND provider = ?
+                    AND lower(trim(effort)) = ?
                     AND command_request_digest = ? AND consumed_at = ''
                     AND expires_at > ?
                     """,
@@ -5806,16 +5876,7 @@ class StateStore:
                 Path(str(session["worktree"])),
             )
             if attempt_id:
-                boundary = connection.execute(
-                    """
-                    UPDATE command_dispatches SET crossed_boundary = 1,
-                        state = 'dispatched', updated_at = ?
-                    WHERE attempt_id = ? AND crossed_boundary = 0
-                    """,
-                    (now, attempt_id),
-                )
-                if boundary.rowcount != 1:
-                    raise ConflictError("provider dispatch boundary is stale")
+                self._mark_provider_boundary(connection, attempt_id, now)
             connection.execute(
                 """
                 UPDATE command_envelopes SET provider = ?, state = 'running',
@@ -5990,15 +6051,23 @@ class StateStore:
             for prior in prior_command_rows:
                 dispatch = connection.execute(
                     """
-                    SELECT crossed_boundary FROM command_dispatches
+                    SELECT crossed_boundary, state FROM command_dispatches
                     WHERE attempt_id = ?
                     """,
                     (str(prior["attempt_id"]),),
                 ).fetchone()
                 crossed_boundary = False
+                known_undelivered = False
                 if dispatch is not None:
                     crossed_boundary = int(dispatch["crossed_boundary"]) > 0
-                if str(prior["state"]) == "delivered" or crossed_boundary:
+                    known_undelivered = (
+                        str(dispatch["state"]) in {"failed", "exhausted"}
+                        and str(prior["state"]) != "delivered"
+                        and not str(prior["accepted_at"])
+                    )
+                if str(prior["state"]) == "delivered" or (
+                    crossed_boundary and not known_undelivered
+                ):
                     raise ConflictError(
                         "prior context delivery for this command is ambiguous"
                     )
@@ -6029,12 +6098,20 @@ class StateStore:
                     )
                 dispatch = connection.execute(
                     """
-                    SELECT crossed_boundary FROM command_dispatches
+                    SELECT crossed_boundary, state FROM command_dispatches
                     WHERE attempt_id = ?
                     """,
                     (str(existing["attempt_id"]),),
                 ).fetchone()
-                if dispatch is not None and int(dispatch["crossed_boundary"]) > 0:
+                crossed_boundary = False
+                known_undelivered = False
+                if dispatch is not None:
+                    crossed_boundary = int(dispatch["crossed_boundary"]) > 0
+                    known_undelivered = (
+                        str(dispatch["state"]) in {"failed", "exhausted"}
+                        and not str(existing["accepted_at"])
+                    )
+                if crossed_boundary and not known_undelivered:
                     raise ConflictError(
                         "context package delivery is ambiguous; reconcile first"
                     )

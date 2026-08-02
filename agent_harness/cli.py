@@ -29,7 +29,6 @@ from agent_harness.migration import migrate_state
 from agent_harness.providers.base import trusted_executable
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
-from agent_harness.providers.kimi import KimiAdapter
 from agent_harness.scheduler import Scheduler
 from agent_harness.service_manager import SystemdUserService, UnitConfiguration
 from agent_harness.storage import StateStore
@@ -684,7 +683,6 @@ async def _worker(harness_paths: Any, session_id: str) -> None:
     adapters = {
         "claude": ClaudeAdapter(),
         "codex": CodexAdapter(),
-        "kimi": KimiAdapter(),
     }
     scheduler = Scheduler(store, adapters)
     worker = SessionWorker(

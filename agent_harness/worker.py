@@ -1682,15 +1682,15 @@ class SessionWorker:
         if lineage:
             inherited_context_digest = str(lineage["source_context_digest"])
             inherited_context = self.blobs.get_text(inherited_context_digest)
-        context_events = self.store.context_events(self.session_id, limit=5000)
-        context_events = [
-            event
-            for event in context_events
-            if not (
-                event.event_type == "user.message"
-                and str(event.metadata.get("command_id", "")) == command_id
-            )
-        ]
+        instruction_sequence = self.store.command_instruction_sequence(
+            self.session_id,
+            command_id,
+        )
+        context_events = self.store.context_events(
+            self.session_id,
+            limit=5000,
+            before_sequence=instruction_sequence,
+        )
         before_sequence = 0
         if context_events:
             before_sequence = context_events[0].sequence - 1

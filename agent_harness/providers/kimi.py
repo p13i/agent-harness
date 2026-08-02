@@ -6,12 +6,15 @@ and a local REST server (``kimi web``), but both are heavier surfaces
 than this harness needs, and the subprocess path shares one wire format
 with ``tools/ingest_agent.gpt.py`` in the consuming repo.
 
-Two consequences of that choice, both deliberate:
+Three consequences of that choice, all deliberate:
 
 - ``steer`` stays the base class's no-op. The active one-shot process can
   still be interrupted and is contained in an isolated process group.
-- ``--yolo`` is NOT passed. Kimi rejects it together with ``--prompt``,
-  so tool permissions come from ``~/.kimi-code/config.toml`` instead.
+- ``--yolo`` is NOT passed. Kimi rejects it together with ``--prompt``.
+- The adapter reports itself unavailable to the scheduler because the
+  one-shot CLI cannot map harness permission modes or emit bounded tool
+  and child-agent accounting. It remains packaged for protocol work and
+  provider-boundary tests, but is not in the default provider registry.
 """
 
 from __future__ import annotations
@@ -79,10 +82,14 @@ class KimiAdapter(ProviderAdapter):
         child_launch_gate: ChildLaunchGate | None = None,
         pre_prompt_gate: PrePromptGate | None = None,
     ) -> ProviderResult:
-        # Kimi Code exposes no reasoning-effort control and approves
-        # tools from its own config, so both arguments are accepted for
-        # the contract and unused.
-        del effort, permission_mode, approval_handler, child_launch_gate
+        # Kimi Code exposes no reasoning-effort control. Its one-shot
+        # prompt surface also cannot map restrictive harness permission
+        # modes or enforce child-agent admission.
+        del effort, approval_handler
+        if permission_mode != "full":
+            raise RuntimeError("Kimi cannot map the requested permission mode")
+        if child_launch_gate is not None:
+            raise RuntimeError("Kimi cannot enforce the child-agent limit")
 
         if pre_prompt_gate is not None:
             await pre_prompt_gate()
@@ -197,25 +204,21 @@ class KimiAdapter(ProviderAdapter):
         )
 
     def status(self) -> ProviderStatus:
-        ready = shutil.which("npx") is not None
-        detail = "npx is available"
-        if not ready:
-            detail = "npx was not found"
+        npx_available = shutil.which("npx") is not None
+        ready = False
+        detail = "npx was not found"
+        if npx_available:
+            detail = "one-shot Kimi lacks permission and tool accounting"
         return ProviderStatus(
             provider=self.provider_id,
             ready=ready,
             detail=detail,
-            # No approval: --yolo cannot accompany --prompt, so tool
-            # permissions are config-driven rather than interactive. No
-            # steering: a one-shot run has no live protocol turn.
+            # The unavailable adapter advertises only behavior its
+            # stream can observe. No steering exists on a one-shot run.
             capabilities=frozenset(
                 {
-                    "mcp",
                     "resume",
-                    "skills",
                     "streaming",
-                    "subagents",
-                    "tools",
                     "worktree",
                 }
             ),

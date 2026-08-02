@@ -22,6 +22,7 @@ from agent_harness.config import HarnessPaths, host_id
 from agent_harness.context import compile_context, workspace_instructions
 from agent_harness.errors import ConflictError, HarnessError, SafetyGuardError
 from agent_harness.goals import (
+    SUPPORTED_EFFORTS,
     create_goal,
     evaluate_goal,
     evaluate_milestones,
@@ -52,7 +53,6 @@ from agent_harness.projections import write_session_projections
 from agent_harness.proof import proof_snapshot
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
-from agent_harness.providers.kimi import KimiAdapter
 from agent_harness.reconciliation import (
     ReconciliationManager,
     validate_reconciliation_audit,
@@ -440,7 +440,6 @@ class HarnessService:
         self.adapters = {
             "claude": ClaudeAdapter(),
             "codex": CodexAdapter(),
-            "kimi": KimiAdapter(),
         }
         self.scheduler = Scheduler(self.store, self.adapters)
         self.reconciliations = ReconciliationManager(
@@ -786,6 +785,12 @@ class HarnessService:
         idempotency_key: str,
     ) -> dict[str, Any]:
         require_uuid(session_id, "session_id")
+        requested_effort = str(payload.get("effort", "")).strip().casefold()
+        if requested_effort and requested_effort not in SUPPORTED_EFFORTS:
+            raise ValueError("unsupported message effort")
+        if "effort" in payload:
+            payload = dict(payload)
+            payload["effort"] = requested_effort
         session = self.store.get_session(session_id)
         _validate_proof_fault_probe(
             session,
