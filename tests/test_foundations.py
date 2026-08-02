@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from test_support import session
 
+from agent_harness import config as config_module
 import agent_harness.proof as proof_module
 from agent_harness.blobs import BlobStore
 from agent_harness.config import api_token, default_state_dir, paths, runtime_build_id
@@ -99,11 +100,25 @@ def test_configuration_generates_and_reuses_private_token(
 
 def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executable = tmp_path / "build-1" / "bin" / "agent-harness"
+    executable = tmp_path / "commit-sha" / "bin" / "agent-harness"
     executable.parent.mkdir(parents=True)
+    outer_manifest = tmp_path / "bundle-manifest.json"
+    outer_manifest.write_text(
+        json.dumps(
+            {
+                "schema": "p13i/agent-harness/install-bundle/v1",
+                "build_id": tmp_path.name,
+            }
+        ),
+        encoding="utf-8",
+    )
     assert runtime_build_id(executable) == ""
     manifest = executable.parent.parent / "bundle-manifest.json"
+    manifest.symlink_to(outer_manifest)
+    assert runtime_build_id(executable) == ""
+    manifest.unlink()
     manifest.write_bytes(b"\xff")
     assert runtime_build_id(executable) == ""
     manifest.write_text("invalid", encoding="utf-8")
@@ -112,6 +127,16 @@ def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
     assert runtime_build_id(executable) == ""
     manifest.write_text(
         json.dumps({"schema": "unknown", "build_id": "build-1"}),
+        encoding="utf-8",
+    )
+    assert runtime_build_id(executable) == ""
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "p13i/agent-harness/install-bundle/v1",
+                "build_id": "different-build",
+            }
+        ),
         encoding="utf-8",
     )
     assert runtime_build_id(executable) == ""
@@ -135,6 +160,29 @@ def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
         encoding="utf-8",
     )
     assert runtime_build_id(executable) == "commit-sha"
+
+    stage_two = (
+        executable.parent
+        / "agent-harness.runfiles"
+        / "_main"
+        / "cmd"
+        / "_agent-harness_stage2_bootstrap.py"
+    )
+    stage_two.parent.mkdir(parents=True)
+    stage_two.write_text("", encoding="utf-8")
+    assert runtime_build_id(stage_two) == "commit-sha"
+
+    runfiles_config = (
+        executable.parent
+        / "agent-harness.runfiles"
+        / "_main"
+        / "agent_harness"
+        / "config.py"
+    )
+    runfiles_config.parent.mkdir(parents=True)
+    runfiles_config.write_text("", encoding="utf-8")
+    monkeypatch.setattr(config_module, "__file__", str(runfiles_config))
+    assert runtime_build_id() == "commit-sha"
 
 
 def test_context_bounds_large_workspace_instruction(

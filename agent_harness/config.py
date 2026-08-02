@@ -7,7 +7,6 @@ import json
 import os
 import secrets
 import socket
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,11 +32,23 @@ def runtime_build_id(executable: Path | None = None) -> str:
     """Return the selected verified-bundle identifier, if installed."""
     selected = executable
     if selected is None:
-        selected = Path(sys.argv[0])
+        selected = Path(__file__)
+    resolved = selected.expanduser().resolve()
+    for parent in resolved.parents:
+        if parent.name != "bin":
+            continue
+        return _manifest_build_id(
+            parent.parent / "bundle-manifest.json"
+        )
+    return ""
+
+
+def _manifest_build_id(manifest: Path) -> str:
+    if manifest.is_symlink():
+        return ""
     try:
-        root = selected.expanduser().resolve().parent.parent
         payload = json.loads(
-            (root / "bundle-manifest.json").read_text(encoding="utf-8")
+            manifest.read_text(encoding="utf-8")
         )
     except (OSError, UnicodeError, json.JSONDecodeError):
         return ""
@@ -47,6 +58,8 @@ def runtime_build_id(executable: Path | None = None) -> str:
         return ""
     build_id = payload.get("build_id")
     if not isinstance(build_id, str):
+        return ""
+    if manifest.parent.name != build_id:
         return ""
     return build_id
 
