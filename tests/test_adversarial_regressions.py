@@ -16,7 +16,12 @@ import agent_harness.proof as proof_module
 import agent_harness.worker as worker_module
 from agent_harness.blobs import BlobStore
 from agent_harness.config import paths
-from agent_harness.errors import ConflictError, HarnessError, SafetyGuardError
+from agent_harness.errors import (
+    ConflictError,
+    HarnessError,
+    NotFoundError,
+    SafetyGuardError,
+)
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import Checkpoint, CommandStatus, ProviderAttempt
 from agent_harness.process_control import ProcessGroupIdentity
@@ -670,6 +675,9 @@ def test_cross_provider_context_excludes_the_current_instruction(
         status="accepted",
         metadata={"command_id": "future"},
     )
+    assert len(store.context_events(created.session_id)) == 3
+    with pytest.raises(NotFoundError, match="instruction event"):
+        store.command_instruction_sequence(created.session_id, "missing")
     worker = SessionWorker(
         store,
         BlobStore(tmp_path / "blobs"),
@@ -760,6 +768,89 @@ def test_known_undelivered_terminal_dispatch_requeues_after_restart(
     )
     assert prepared["attempt_id"] == next_attempt.attempt_id
     store.close()
+
+
+def test_delivery_evidence_distinguishes_retry_from_reconciliation(
+    tmp_path: Path,
+) -> None:
+    limits = limits_for("unattended", "implementation")
+    no_delivery, no_delivery_session = _store(tmp_path / "no-delivery")
+    command = no_delivery.enqueue_command(
+        no_delivery_session.session_id,
+        "message",
+        {"text": "fail before delivery"},
+        new_uuid(),
+    )
+    assert no_delivery.claim_command(no_delivery_session.session_id) is not None
+    no_delivery.create_command_envelope(
+        command.command_id,
+        no_delivery_session.session_id,
+        "unattended",
+        limits.as_dict(),
+    )
+    attempt, unused_turn_id, unused_checkpoint = _dispatch(
+        no_delivery,
+        no_delivery_session,
+        command.command_id,
+    )
+    del unused_turn_id, unused_checkpoint
+    no_delivery.mark_provider_boundary(attempt.attempt_id)
+    no_delivery.update_attempt(attempt.attempt_id, status="failed")
+    no_delivery.complete_dispatch(attempt.attempt_id, "failed")
+    retry = no_delivery.recover_interrupted_commands(
+        no_delivery_session.session_id,
+        "material",
+        "summary",
+    )
+    assert retry.requeued_command_ids == (command.command_id,)
+    no_delivery.close()
+
+    delivered, delivered_session = _store(tmp_path / "delivered")
+    delivered_command = delivered.enqueue_command(
+        delivered_session.session_id,
+        "message",
+        {"text": "fail after delivery"},
+        new_uuid(),
+    )
+    assert delivered.claim_command(delivered_session.session_id) is not None
+    delivered.create_command_envelope(
+        delivered_command.command_id,
+        delivered_session.session_id,
+        "unattended",
+        limits.as_dict(),
+    )
+    delivered_attempt, unused_turn_id, checkpoint = _dispatch(
+        delivered,
+        delivered_session,
+        delivered_command.command_id,
+    )
+    del unused_turn_id
+    delivered.prepare_context_delivery(
+        delivered_session.session_id,
+        "codex",
+        "accepted-context",
+        checkpoint.checkpoint_id,
+        delivered_command.command_id,
+        delivered_attempt.attempt_id,
+        "accepted-payload",
+    )
+    delivered.accept_context_delivery(
+        delivered_session.session_id,
+        "codex",
+        "accepted-context",
+        delivered_attempt.attempt_id,
+    )
+    delivered.mark_provider_boundary(delivered_attempt.attempt_id)
+    delivered.update_attempt(delivered_attempt.attempt_id, status="failed")
+    delivered.complete_dispatch(delivered_attempt.attempt_id, "failed")
+    reconciliation = delivered.recover_interrupted_commands(
+        delivered_session.session_id,
+        "material",
+        "summary",
+    )
+    assert reconciliation.requeued_command_ids == ()
+    assert len(reconciliation.reconciliations) == 1
+    delivered.close()
 
 
 def test_persisted_proof_payload_must_match_its_retained_digest(

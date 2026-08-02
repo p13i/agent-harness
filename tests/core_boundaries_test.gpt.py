@@ -1733,6 +1733,13 @@ def test_service_turn_and_budget_extension_boundaries(tmp_path: Path) -> None:
                 {"text": "Run one turn.", "effort": "unsupported"},
                 idempotency_key="unsupported-effort",
             )
+        normalized = service.submit_message(
+            session.session_id,
+            {"text": "Run one normalized turn.", "effort": " HIGH "},
+            idempotency_key="normalized-effort",
+        )
+        normalized_payload = service.store.command_payload(normalized["command_id"])
+        assert normalized_payload["effort"] == "high"
         with pytest.raises(ValueError, match="only one proof fault probe"):
             service.submit_message(
                 session.session_id,
