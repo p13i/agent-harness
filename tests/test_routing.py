@@ -35,6 +35,7 @@ def candidate(
     credits: bool = False,
     cost_reporting: bool = False,
     queue: int = 0,
+    affinity: bool = False,
 ) -> RoutingCandidate:
     capabilities = {"tools", "resume"}
     if cost_reporting:
@@ -49,7 +50,7 @@ def candidate(
         binding_percent=binding,
         credits_engaged=credits,
         queue_count=queue,
-        affinity=False,
+        affinity=affinity,
         context_transfer_tokens=0,
     )
 
@@ -82,15 +83,53 @@ def test_routing_rejects_malformed_binding_usage(binding: float) -> None:
         route([candidate("codex", binding=binding)])
 
 
-def test_routing_prefers_an_independent_reviewer() -> None:
-    decision = route(
+def test_review_routing_uses_provider_neutral_ordering() -> None:
+    first = route(
         [
-            candidate("claude", binding=50),
+            candidate("codex", binding=50),
             candidate("kimi", binding=50),
         ],
         workload="code review",
     )
-    assert decision.provider == "kimi"
+    second = route(
+        [
+            candidate("kimi", binding=50),
+            candidate("codex", binding=50),
+        ],
+        workload="code review",
+    )
+
+    assert first.provider == "codex"
+    assert second.provider == "codex"
+    assert (
+        "deterministic quality, then provider/model tie-breaking"
+        in first.reason
+    )
+
+
+def test_routing_normalizes_workload_whitespace() -> None:
+    decision = route(
+        [
+            candidate("codex", binding=50),
+            candidate("claude", binding=50),
+        ],
+        workload="  implementation  ",
+    )
+
+    assert decision.provider == "claude"
+
+
+def test_review_routing_prefers_an_independent_provider() -> None:
+    for workload in ("code review", "code-review", "code_review", "review"):
+        decision = route(
+            [
+                candidate("codex", binding=50, affinity=True),
+                candidate("claude", binding=50),
+            ],
+            workload=workload,
+        )
+
+        assert decision.provider == "claude"
 
 
 @pytest.mark.parametrize("budget", [math.nan, math.inf, -math.inf])

@@ -96,6 +96,7 @@ def route(
         + selected.model
         + " passed capability and budget gates, stayed within the quality "
         + "window, and had the best headroom-adjusted fair-share score"
+        + " with deterministic quality, then provider/model tie-breaking"
     )
     if selected.affinity:
         reason += " with provider-session affinity"
@@ -151,22 +152,24 @@ def _fairness_score(candidate: RoutingCandidate, workload: str) -> float:
         if math.isfinite(candidate.binding_percent):
             headroom = max(1.0, 100.0 - candidate.binding_percent)
     role_weight = 1.0
-    normalized = workload.casefold()
+    normalized = workload.strip().casefold()
     if normalized in {"planning", "architecture"}:
         if candidate.provider == "codex":
             role_weight = 1.25
     if normalized in {"implementation", "debugging"}:
         if candidate.provider == "claude":
             role_weight = 1.25
-    # Review leans Kimi: with two providers "an independent
-    # perspective" collapsed to "whichever one did not implement it",
-    # which a third provider is what actually fixes.
-    if normalized in {"review", "code_review", "code review"}:
-        if candidate.provider == "kimi":
-            role_weight = 1.25
+    independent_review = normalized in {
+        "code review",
+        "code-review",
+        "code_review",
+        "review",
+    }
+    if independent_review and not candidate.affinity:
+        role_weight = 1.25
     weight = headroom * role_weight
     fairness = (candidate.queue_count + 1.0) / weight
-    if candidate.affinity:
+    if candidate.affinity and not independent_review:
         fairness -= 0.05
     fairness += candidate.context_transfer_tokens / 10_000_000.0
     return fairness

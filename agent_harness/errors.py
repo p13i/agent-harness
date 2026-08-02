@@ -80,8 +80,14 @@ class ProviderExhaustedError(HarnessError):
 
 
 class ReconciliationRequiredError(HarnessError):
-    def __init__(self, reconciliation_id: str) -> None:
+    def __init__(
+        self,
+        reconciliation_id: str,
+        *,
+        reason: str = "ambiguous-provider-dispatch",
+    ) -> None:
         self.reconciliation_id = reconciliation_id
+        self.reason = reason
         super().__init__(
             "E_NEEDS_RECONCILIATION",
             "provider dispatch effect is ambiguous; reconciliation is required",
@@ -95,7 +101,7 @@ class SafetyGuardError(HarnessError):
         reason: str,
         provider: str,
         *,
-        recoverable: bool,
+        recoverable: bool = False,
     ) -> None:
         super().__init__(
             "E_SAFETY_GUARD",

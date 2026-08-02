@@ -1071,7 +1071,7 @@ def test_xhigh_authorization_parks_and_requeues_one_exact_command(
     store.close()
 
 
-def test_schema_v4_migrates_external_and_turn_columns(
+def test_schema_v5_migrates_external_and_turn_columns(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "state.sqlite3"
@@ -1128,7 +1128,7 @@ def test_schema_v4_migrates_external_and_turn_columns(
         store._connection.execute("SELECT version FROM schema_meta").fetchone()[
             "version"
         ]
-        == 4
+        == 5
     )
     session_columns = {
         row["name"] for row in store._connection.execute("PRAGMA table_info(sessions)")
@@ -1145,19 +1145,32 @@ def test_schema_v4_migrates_external_and_turn_columns(
     store.close()
 
 
-def test_schema_v4_migrates_v3_and_forces_rollback_rejection(
+def test_schema_v5_migrates_v3_and_forces_rollback_rejection(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "state.sqlite3"
     store = StateStore(database)
     store._connection.execute("UPDATE schema_meta SET version = 3")
     store.close()
 
+    migrations: list[int] = []
+    original_migration = StateStore._migrate_to_v4
+
+    def track_migration(
+        current: StateStore,
+        connection: sqlite3.Connection,
+    ) -> None:
+        migrations.append(4)
+        original_migration(current, connection)
+
+    monkeypatch.setattr(StateStore, "_migrate_to_v4", track_migration)
     upgraded = StateStore(database)
     version = upgraded._connection.execute(
         "SELECT version FROM schema_meta"
     ).fetchone()["version"]
-    assert version == 4
+    assert version == 5
+    assert migrations == [4]
     durable_tables = {
         str(row["name"])
         for row in upgraded._connection.execute(
@@ -1180,6 +1193,181 @@ def test_schema_v4_migrates_v3_and_forces_rollback_rejection(
                 raise RuntimeError("unsupported database schema version")
     finally:
         legacy.close()
+
+
+def test_schema_v5_rebuilds_v4_context_delivery_identity(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = StateStore(database)
+    created = session(tmp_path)
+    store.create_session(created)
+    store.close()
+
+    legacy = sqlite3.connect(database)
+    legacy.executescript(
+        """
+        DROP INDEX context_deliveries_context;
+        ALTER TABLE context_deliveries RENAME TO context_deliveries_v5;
+        CREATE TABLE context_deliveries (
+            session_id TEXT NOT NULL REFERENCES sessions(session_id),
+            provider TEXT NOT NULL,
+            context_digest TEXT NOT NULL,
+            checkpoint_id TEXT NOT NULL,
+            delivered_at TEXT NOT NULL,
+            command_id TEXT NOT NULL DEFAULT '',
+            attempt_id TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'delivered',
+            payload_digest TEXT NOT NULL DEFAULT '',
+            accepted_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(session_id, provider, context_digest)
+        );
+        DROP TABLE context_deliveries_v5;
+        UPDATE schema_meta SET version = 4;
+        """
+    )
+    legacy.execute(
+        """
+        INSERT INTO context_deliveries VALUES (
+            ?, 'codex', 'legacy-context', 'legacy-checkpoint',
+            '2026-08-02T00:00:00+00:00', '', 'duplicate-attempt', 'delivered',
+            'legacy-payload', '2026-08-02T00:00:00+00:00'
+        )
+        """,
+        (created.session_id,),
+    )
+    legacy.execute(
+        """
+        INSERT INTO context_deliveries VALUES (
+            ?, 'claude', 'legacy-context-two', 'legacy-checkpoint',
+            '2026-08-02T00:00:01+00:00', '', 'duplicate-attempt', 'delivered',
+            'legacy-payload-two', '2026-08-02T00:00:01+00:00'
+        )
+        """,
+        (created.session_id,),
+    )
+    legacy.execute(
+        """
+        INSERT INTO context_deliveries VALUES (
+            ?, 'codex', 'legacy-context-three', 'legacy-checkpoint',
+            '2026-08-02T00:00:02+00:00', '', '', 'delivered',
+            'legacy-payload-three', '2026-08-02T00:00:02+00:00'
+        )
+        """,
+        (created.session_id,),
+    )
+    duplicate_rowid = legacy.execute(
+        """
+        SELECT rowid FROM context_deliveries
+        WHERE provider = 'codex' AND context_digest = 'legacy-context'
+        """
+    ).fetchone()[0]
+    colliding_attempt_id = "legacy-duplicate-" + normalized_digest(
+        {
+            "attempt_id": "duplicate-attempt",
+            "rowid": duplicate_rowid,
+            "session_id": created.session_id,
+            "provider": "codex",
+            "context_digest": "legacy-context",
+        }
+    )
+    legacy.execute(
+        """
+        INSERT INTO context_deliveries VALUES (
+            ?, 'other', 'legacy-context-four', 'legacy-checkpoint',
+            '2026-08-02T00:00:03+00:00', '', ?, 'delivered',
+            'legacy-payload-four', '2026-08-02T00:00:03+00:00'
+        )
+        """,
+        (created.session_id, colliding_attempt_id),
+    )
+    legacy.commit()
+    legacy.close()
+
+    upgraded = StateStore(database)
+    rows = upgraded._connection.execute(
+        "SELECT * FROM context_deliveries ORDER BY attempt_id"
+    ).fetchall()
+    assert len(rows) == 4
+    by_context = {str(row["context_digest"]): row for row in rows}
+    first_duplicate = str(by_context["legacy-context"]["attempt_id"])
+    second_duplicate = str(by_context["legacy-context-two"]["attempt_id"])
+    assert first_duplicate.startswith("legacy-duplicate-")
+    assert first_duplicate != colliding_attempt_id
+    assert second_duplicate.startswith("legacy-duplicate-")
+    assert second_duplicate != first_duplicate
+    assert str(by_context["legacy-context-three"]["attempt_id"]).startswith(
+        "legacy-"
+    )
+    assert by_context["legacy-context-four"]["attempt_id"] == colliding_attempt_id
+    primary_key = [
+        item["name"]
+        for item in upgraded._connection.execute(
+            "PRAGMA table_info(context_deliveries)"
+        ).fetchall()
+        if item["pk"]
+    ]
+    assert primary_key == ["attempt_id"]
+    foreign_keys = upgraded._connection.execute(
+        "PRAGMA foreign_key_list(context_deliveries)"
+    ).fetchall()
+    assert any(str(item["table"]) == "sessions" for item in foreign_keys)
+    upgraded.close()
+
+
+def test_current_schema_does_not_rerun_prior_migrations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    StateStore(database).close()
+
+    def fail_migration(*unused: object) -> None:
+        raise AssertionError("current schema reran a prior migration")
+
+    monkeypatch.setattr(StateStore, "_migrate_to_v4", fail_migration)
+    monkeypatch.setattr(StateStore, "_migrate_to_v5", fail_migration)
+    StateStore(database).close()
+
+
+def test_v5_instruction_index_tolerates_malformed_legacy_metadata(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = StateStore(database)
+    created = session(tmp_path)
+    store.create_session(created)
+    store.close()
+
+    legacy = sqlite3.connect(database)
+    legacy.executescript(
+        """
+        DROP INDEX events_command_instruction_v2;
+        UPDATE schema_meta SET version = 4;
+        """
+    )
+    legacy.execute(
+        """
+        INSERT INTO events VALUES (
+            ?, 1, 'malformed-event', 'user.message', 'user',
+            'legacy text', 'accepted', '', '', '',
+            '2026-08-02T00:00:00+00:00'
+        )
+        """,
+        (created.session_id,),
+    )
+    legacy.commit()
+    legacy.close()
+
+    upgraded = StateStore(database)
+    retained = upgraded._connection.execute(
+        "SELECT event_id FROM events WHERE session_id = ?",
+        (created.session_id,),
+    ).fetchone()
+    assert retained["event_id"] == "malformed-event"
+    with pytest.raises(NotFoundError, match="instruction event"):
+        upgraded.command_instruction_sequence(created.session_id, "missing")
+    upgraded.close()
 
 
 def test_external_reference_creation_lookup_fork_and_conflicts(
@@ -2365,12 +2553,6 @@ def test_portable_records_reject_missing_blobs_and_bad_documents(
     clean = StateStore(clean_paths.database)
     clean_session = session(tmp_path)
     clean.create_session(clean_session)
-    clean.record_context_delivery(
-        clean_session.session_id,
-        "codex",
-        "1" * 64,
-        "",
-    )
     published = publish_session(
         clean_paths,
         clean,
@@ -2423,25 +2605,24 @@ def test_context_delivery_survives_restart_and_blocks_ambiguous_resend(
     )
     assert prepared["state"] == "prepared"
     assert prepared["accepted_at"] == ""
-    retried = store.prepare_context_delivery(
-        created.session_id,
-        "codex",
-        "context-b",
-        "checkpoint-b",
-        "command-a",
-        "attempt-b",
-        "payload-b",
-    )
-    assert retried["state"] == "prepared"
-    assert retried["attempt_id"] == "attempt-b"
+    with pytest.raises(ConflictError, match="prior context delivery"):
+        store.prepare_context_delivery(
+            created.session_id,
+            "codex",
+            "context-b",
+            "checkpoint-b",
+            "command-a",
+            "attempt-b",
+            "payload-b",
+        )
     store.close()
 
     recovered = StateStore(database)
     delivered = recovered.accept_context_delivery(
         created.session_id,
         "codex",
-        "context-b",
-        "attempt-b",
+        "context-a",
+        "attempt-a",
     )
     assert delivered["state"] == "delivered"
     assert delivered["accepted_at"]

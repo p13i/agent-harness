@@ -11,7 +11,10 @@ from agent_harness.errors import HarnessError
 from agent_harness.goals import goal_contract_digest
 from agent_harness.ids import require_uuid, utc_now
 from agent_harness.models import Evidence, Goal, Milestone
-from agent_harness.orchestration import command_envelope_digest
+from agent_harness.orchestration import (
+    command_envelope_digest,
+    legacy_command_envelope_digest,
+)
 from agent_harness.storage import StateStore
 
 PROOF_SCHEMA = "p13i/agent-harness/proof-snapshot/v1"
@@ -1405,16 +1408,24 @@ def _proof_command(
         turn_id = command_turns.get(command_id, "")
     profile = command_envelope_profiles.get(command_id, "")
     envelope_digest = ""
+    legacy_envelope_digest = ""
     if profile:
         envelope_digest = command_envelope_digest(
             str(row.get("command_type", "")),
             _json_object(row.get("payload_json")),
             profile,
         )
+        legacy_envelope_digest = legacy_command_envelope_digest(
+            str(row.get("command_type", "")),
+            _json_object(row.get("payload_json")),
+            profile,
+        )
     return {
+        "command_envelope_version": 2,
         "command_id": command_id,
         "session_id": str(row.get("session_id", "")),
         "command_envelope_digest": envelope_digest,
+        "legacy_command_envelope_digest": legacy_envelope_digest,
         "idempotency_key_digest": _text_digest(str(row.get("idempotency_key", ""))),
         "command_type": str(row.get("command_type", "")),
         "status": str(row.get("status", "")),
@@ -1713,6 +1724,8 @@ def _proof_context_deliveries(
         delivery = {
             **binding,
             "idempotency_digest": _digest(binding),
+            "delivery_version": 2,
+            "transport": str(row.get("transport", "context-package")),
             "state": str(row.get("state", "")),
             "accepted_at": str(row.get("accepted_at", "")),
             "delivered_at": str(row.get("delivered_at", "")),

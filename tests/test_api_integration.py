@@ -522,6 +522,7 @@ async def test_api_inspects_and_resolves_reconciliation(
         assert proof["context_deliveries"][0]["command_id"] == command_id
         assert proof["context_deliveries"][0]["turn_id"] == turn_id
         assert proof["context_deliveries"][0]["attempt_id"] == (attempt.attempt_id)
+        assert proof["context_deliveries"][0]["transport"] == "context-package"
         assert len(proof["context_deliveries"][0]["idempotency_digest"]) == 64
         assert len(proof["context_deliveries"][0]["context_delivery_digest"]) == 64
         children = {item["child_id"]: item for item in proof["children"]}
@@ -1129,7 +1130,7 @@ async def test_api_creates_session_and_accepts_message(
             headers=headers,
         )
         capabilities_value = await capabilities.json()
-        assert capabilities_value["api_version"] == "1.10.0"
+        assert capabilities_value["api_version"] == "1.11.0"
         assert capabilities_value["control_protocol_version"] == (
             CONTROL_PROTOCOL_VERSION
         )

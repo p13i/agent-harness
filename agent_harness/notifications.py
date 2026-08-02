@@ -150,10 +150,14 @@ def notification_from_event(
         )
     if event_type == "reconciliation.requested":
         reconciliation_id = _text(metadata.get("reconciliation_id"))
+        detail = "Provider outcome is ambiguous."
+        reason = _text(metadata.get("reason"))
+        if reason:
+            detail = "Provider outcome is ambiguous: " + reason
         return Notification(
             key="recovery:" + reconciliation_id,
             title="Recovery needed",
-            detail="Provider outcome is ambiguous.",
+            detail=_bounded(detail),
             severity=NotificationSeverity.ACTION,
             persistence=NotificationPersistence.ACTION,
             source_sequence=sequence,
@@ -185,6 +189,7 @@ def notification_from_event(
         "goal.budget_exhausted",
         "safety.guarded",
         "guard.triggered",
+        "guard.tripped",
     }:
         reason = _text(metadata.get("reason"))
         if not reason:

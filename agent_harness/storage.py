@@ -41,6 +41,7 @@ from agent_harness.models import (
 from agent_harness.orchestration import (
     command_envelope_digest,
     creation_digest,
+    legacy_command_envelope_digest,
     normalize_command_payload,
     normalize_external_ref,
     normalize_turn_ref,
@@ -49,7 +50,7 @@ from agent_harness.orchestration import (
 from agent_harness.safety import effort_requires_xhigh_authorization
 from agent_harness.workspace_state import inspect_workspace
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 PROOF_SNAPSHOT_MAX_PER_SESSION = 128
 PROOF_SNAPSHOT_RETENTION_HOURS = 336
 TRANSITION_CONTROL_COMMANDS = frozenset(
@@ -200,6 +201,15 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL,
     PRIMARY KEY(session_id, sequence)
 );
+CREATE INDEX IF NOT EXISTS events_command_instruction_v2
+ON events(
+    session_id,
+    CASE WHEN json_valid(metadata_json)
+        THEN json_extract(metadata_json, '$.command_id')
+        ELSE NULL
+    END,
+    sequence
+) WHERE event_type = 'user.message';
 CREATE TABLE IF NOT EXISTS commands (
     idempotency_key TEXT PRIMARY KEY,
     command_id TEXT NOT NULL UNIQUE,
@@ -471,7 +481,8 @@ CREATE TABLE IF NOT EXISTS context_deliveries (
     state TEXT NOT NULL DEFAULT 'delivered',
     payload_digest TEXT NOT NULL DEFAULT '',
     accepted_at TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY(session_id, provider, context_digest)
+    transport TEXT NOT NULL DEFAULT 'context-package',
+    PRIMARY KEY(attempt_id)
 );
 CREATE TABLE IF NOT EXISTS process_leases (
     lease_id TEXT PRIMARY KEY,
@@ -625,6 +636,7 @@ class StateStore:
                     (SCHEMA_VERSION,),
                 )
                 self._migrate_to_v4(connection)
+                self._migrate_to_v5(connection)
             else:
                 version = int(row["version"])
                 if version in {1, 2}:
@@ -634,12 +646,18 @@ class StateStore:
                     self._migrate_to_v4(connection)
                     connection.execute(
                         "UPDATE schema_meta SET version = ?",
+                        (4,),
+                    )
+                    version = 4
+                if version == 4:
+                    self._migrate_to_v5(connection)
+                    connection.execute(
+                        "UPDATE schema_meta SET version = ?",
                         (SCHEMA_VERSION,),
                     )
                     version = SCHEMA_VERSION
                 if version != SCHEMA_VERSION:
                     raise RuntimeError("unsupported database schema version")
-                self._migrate_to_v4(connection)
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS sessions_external_ref
@@ -678,6 +696,7 @@ class StateStore:
             ("state", "TEXT NOT NULL DEFAULT 'delivered'"),
             ("payload_digest", "TEXT NOT NULL DEFAULT ''"),
             ("accepted_at", "TEXT NOT NULL DEFAULT ''"),
+            ("transport", "TEXT NOT NULL DEFAULT 'context-package'"),
         ):
             self._add_column(
                 connection,
@@ -706,6 +725,151 @@ class StateStore:
         self._ensure_goal_policy_columns(connection)
         self._ensure_context_delivery_columns(connection)
         self._ensure_process_lease_columns(connection)
+
+    def _migrate_to_v5(self, connection: sqlite3.Connection) -> None:
+        self._ensure_context_delivery_columns(connection)
+        primary_key = connection.execute(
+            "PRAGMA table_info(context_deliveries)"
+        ).fetchall()
+        primary_key_columns = [
+            str(row["name"])
+            for row in primary_key
+            if int(row["pk"]) > 0
+        ]
+        if primary_key_columns != ["attempt_id"]:
+            rows = connection.execute(
+                "SELECT rowid, * FROM context_deliveries ORDER BY rowid"
+            ).fetchall()
+            attempt_counts: dict[str, int] = {}
+            for row in rows:
+                attempt_id = str(row["attempt_id"])
+                if attempt_id:
+                    attempt_counts[attempt_id] = (
+                        attempt_counts.get(attempt_id, 0) + 1
+                    )
+            assigned_attempt_ids = {
+                attempt_id
+                for attempt_id, count in attempt_counts.items()
+                if count == 1
+            }
+            connection.execute(
+                "ALTER TABLE context_deliveries RENAME TO context_deliveries_v4"
+            )
+            connection.execute(
+                """
+                CREATE TABLE context_deliveries (
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                    provider TEXT NOT NULL,
+                    context_digest TEXT NOT NULL,
+                    checkpoint_id TEXT NOT NULL,
+                    delivered_at TEXT NOT NULL,
+                    command_id TEXT NOT NULL DEFAULT '',
+                    attempt_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'delivered',
+                    payload_digest TEXT NOT NULL DEFAULT '',
+                    accepted_at TEXT NOT NULL DEFAULT '',
+                    transport TEXT NOT NULL DEFAULT 'context-package',
+                    PRIMARY KEY(attempt_id)
+                )
+                """
+            )
+            for row in rows:
+                attempt_id = str(row["attempt_id"])
+                duplicate_attempt = attempt_counts.get(attempt_id, 0) > 1
+                if not attempt_id or duplicate_attempt:
+                    legacy_identity = {
+                        "attempt_id": attempt_id,
+                        "rowid": int(row["rowid"]),
+                        "session_id": str(row["session_id"]),
+                        "provider": str(row["provider"]),
+                        "context_digest": str(row["context_digest"]),
+                    }
+                    legacy_prefix = "legacy-"
+                    if duplicate_attempt:
+                        legacy_prefix = "legacy-duplicate-"
+                    attempt_id = legacy_prefix + normalized_digest(legacy_identity)
+                    collision = 0
+                    while attempt_id in assigned_attempt_ids:
+                        collision += 1
+                        legacy_identity["collision"] = collision
+                        attempt_id = legacy_prefix + normalized_digest(
+                            legacy_identity
+                        )
+                assigned_attempt_ids.add(attempt_id)
+                connection.execute(
+                    """
+                    INSERT INTO context_deliveries VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(row["session_id"]),
+                        str(row["provider"]),
+                        str(row["context_digest"]),
+                        str(row["checkpoint_id"]),
+                        str(row["delivered_at"]),
+                        str(row["command_id"]),
+                        attempt_id,
+                        str(row["state"]),
+                        str(row["payload_digest"]),
+                        str(row["accepted_at"]),
+                        str(row["transport"]),
+                    ),
+                )
+            connection.execute("DROP TABLE context_deliveries_v4")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS context_deliveries_context
+            ON context_deliveries(session_id, provider, context_digest)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS events_command_instruction_v2
+            ON events(
+                session_id,
+                CASE WHEN json_valid(metadata_json)
+                    THEN json_extract(metadata_json, '$.command_id')
+                    ELSE NULL
+                END,
+                sequence
+            ) WHERE event_type = 'user.message'
+            """
+        )
+        missing = connection.execute(
+            """
+            SELECT d.*, a.provider
+            FROM command_dispatches AS d
+            JOIN provider_attempts AS a USING(attempt_id)
+            JOIN commands AS m USING(command_id)
+            LEFT JOIN context_deliveries AS c USING(attempt_id)
+            WHERE d.crossed_boundary = 1
+                AND m.status = 'dispatching'
+                AND c.attempt_id IS NULL
+            """
+        ).fetchall()
+        for row in missing:
+            attempt_id = str(row["attempt_id"])
+            context_digest = "legacy-ambiguous-" + hashlib.sha256(
+                attempt_id.encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO context_deliveries VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, 'legacy-ambiguous', '', '',
+                    'legacy-unknown'
+                )
+                """,
+                (
+                    str(row["session_id"]),
+                    str(row["provider"]),
+                    context_digest,
+                    str(row["checkpoint_id"]),
+                    str(row["updated_at"]),
+                    str(row["command_id"]),
+                    attempt_id,
+                ),
+            )
 
     def _migrate_to_v3(self, connection: sqlite3.Connection) -> None:
         self._add_column(
@@ -1218,8 +1382,8 @@ class StateStore:
             metadata = {}
         if event_id is None:
             event_id = new_uuid()
-        created_at = utc_now()
         with self.transaction() as connection:
+            created_at = utc_now()
             row = connection.execute(
                 """
                 SELECT COALESCE(MAX(sequence), 0) AS sequence
@@ -1287,33 +1451,59 @@ class StateStore:
             ).fetchall()
         return [_event(row) for row in rows]
 
-    def context_events(
+    def context_events_for_command(
         self,
         session_id: str,
+        command_id: str,
+        instruction_sequence: int,
         *,
         limit: int = 5000,
-        before_sequence: int | None = None,
     ) -> list[SessionEvent]:
         bounded = max(1, min(limit, 5000))
         with self._lock:
-            if before_sequence is None:
-                rows = self._connection.execute(
-                    """
-                    SELECT * FROM events
-                    WHERE session_id = ?
-                    ORDER BY sequence DESC LIMIT ?
-                    """,
-                    (session_id, bounded),
-                ).fetchall()
-            else:
-                rows = self._connection.execute(
-                    """
-                    SELECT * FROM events
-                    WHERE session_id = ? AND sequence < ?
-                    ORDER BY sequence DESC LIMIT ?
-                    """,
-                    (session_id, before_sequence, bounded),
-                ).fetchall()
+            rows = self._connection.execute(
+                """
+                SELECT * FROM events AS e
+                WHERE e.session_id = ? AND (
+                    e.sequence < ?
+                    OR (
+                        e.sequence > ?
+                        AND (
+                            e.turn_id IN (
+                                SELECT turn_id FROM command_dispatches
+                                WHERE command_id = ?
+                            )
+                            OR CASE
+                                WHEN json_valid(e.metadata_json)
+                                THEN json_extract(
+                                    e.metadata_json,
+                                    '$.command_id'
+                                )
+                                ELSE NULL
+                            END = ?
+                            OR CASE
+                                WHEN json_valid(e.metadata_json)
+                                THEN json_extract(
+                                    e.metadata_json,
+                                    '$.target_command_id'
+                                )
+                                ELSE NULL
+                            END = ?
+                        )
+                    )
+                )
+                ORDER BY e.sequence DESC LIMIT ?
+                """,
+                (
+                    session_id,
+                    instruction_sequence,
+                    instruction_sequence,
+                    command_id,
+                    command_id,
+                    command_id,
+                    bounded,
+                ),
+            ).fetchall()
         rows.reverse()
         return [_event(row) for row in rows]
 
@@ -1323,19 +1513,127 @@ class StateStore:
         command_id: str,
     ) -> int:
         with self._lock:
-            rows = self._connection.execute(
+            row = self._connection.execute(
                 """
-                SELECT * FROM events
+                SELECT sequence FROM events
                 WHERE session_id = ? AND event_type = 'user.message'
-                ORDER BY sequence
+                    AND CASE WHEN json_valid(metadata_json)
+                        THEN json_extract(metadata_json, '$.command_id')
+                        ELSE NULL
+                    END = ?
+                ORDER BY sequence LIMIT 1
                 """,
-                (session_id,),
-            ).fetchall()
-        for row in rows:
-            event = _event(row)
-            if str(event.metadata.get("command_id", "")) == command_id:
-                return event.sequence
+                (session_id, command_id),
+            ).fetchone()
+            if row is not None:
+                return int(row["sequence"])
         raise NotFoundError("command instruction event")
+
+    def repair_command_instruction_event(
+        self,
+        session_id: str,
+        command_id: str,
+    ) -> int:
+        with self.transaction() as connection:
+            command = connection.execute(
+                """
+                SELECT * FROM commands
+                WHERE session_id = ? AND command_id = ?
+                    AND command_type = 'message'
+                """,
+                (session_id, command_id),
+            ).fetchone()
+            if command is None:
+                raise NotFoundError("command instruction event")
+            if str(command["status"]) not in {
+                CommandStatus.QUEUED,
+                CommandStatus.DISPATCHING,
+            }:
+                raise ConflictError(
+                    "terminal message command cannot repair its instruction event: "
+                    + command_id
+                )
+            payload = _load_object(str(command["payload_json"]))
+            try:
+                repaired_at = utc_now()
+                return self._ensure_command_instruction_event(
+                    connection,
+                    session_id,
+                    command_id,
+                    payload,
+                    created_at=repaired_at,
+                    repaired=True,
+                )
+            except NotFoundError as error:
+                raise ConflictError(
+                    "message command has no recoverable instruction text: "
+                    + command_id
+                ) from error
+
+    def _ensure_command_instruction_event(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        command_id: str,
+        payload: dict[str, Any],
+        *,
+        created_at: str,
+        repaired: bool,
+    ) -> int:
+        row = connection.execute(
+            """
+            SELECT sequence FROM events
+            WHERE session_id = ? AND event_type = 'user.message'
+                AND CASE WHEN json_valid(metadata_json)
+                    THEN json_extract(metadata_json, '$.command_id')
+                    ELSE NULL
+                END = ?
+            ORDER BY sequence LIMIT 1
+            """,
+            (session_id, command_id),
+        ).fetchone()
+        if row is not None:
+            return int(row["sequence"])
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            raise NotFoundError("command instruction event")
+        sequence_row = connection.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0) AS sequence
+            FROM events WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        sequence = int(sequence_row["sequence"]) + 1
+        metadata = {
+            "command_id": command_id,
+            "turn_ref": normalize_turn_ref(payload.get("turn_ref")),
+        }
+        if repaired:
+            metadata["repaired"] = True
+        connection.execute(
+            """
+            INSERT INTO events(
+                session_id, sequence, event_id, event_type, role,
+                text, status, metadata_json, blob_digest, turn_id,
+                created_at
+            ) VALUES (?, ?, ?, 'user.message', 'user', ?, 'accepted',
+                ?, '', '', ?)
+            """,
+            (
+                session_id,
+                sequence,
+                new_uuid(),
+                text,
+                _dump(metadata),
+                created_at,
+            ),
+        )
+        connection.execute(
+            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+            (created_at, session_id),
+        )
+        return sequence
 
     def event_count(self, session_id: str) -> int:
         with self._lock:
@@ -1652,26 +1950,79 @@ class StateStore:
         payload: dict[str, Any],
         idempotency_key: str,
     ) -> tuple[CommandReceipt, bool]:
+        return self._ensure_command(
+            session_id,
+            command_type,
+            payload,
+            idempotency_key,
+            instruction_event=False,
+        )
+
+    def ensure_message_command(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> tuple[CommandReceipt, bool]:
+        return self._ensure_command(
+            session_id,
+            "message",
+            payload,
+            idempotency_key,
+            instruction_event=True,
+        )
+
+    def _ensure_command(
+        self,
+        session_id: str,
+        command_type: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+        *,
+        instruction_event: bool,
+    ) -> tuple[CommandReceipt, bool]:
         normalized_payload = normalize_command_payload(payload)
         turn_ref = normalize_turn_ref(normalized_payload.get("turn_ref"))
-        now = utc_now()
-        command_id = new_uuid()
         with self.transaction() as connection:
             existing = connection.execute(
                 "SELECT * FROM commands WHERE idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()
             if existing is not None:
+                existing_payload = normalize_command_payload(
+                    _load_object(str(existing["payload_json"]))
+                )
                 same_request = (
                     str(existing["session_id"]) == session_id
                     and str(existing["command_type"]) == command_type
-                    and str(existing["payload_json"]) == _dump(normalized_payload)
+                    and _dump(existing_payload) == _dump(normalized_payload)
                 )
                 if not same_request:
                     raise ConflictError(
                         "idempotency key was already used with different command input"
                     )
+                if instruction_event and str(existing["status"]) in {
+                    CommandStatus.QUEUED,
+                    CommandStatus.DISPATCHING,
+                }:
+                    repaired_at = utc_now()
+                    try:
+                        self._ensure_command_instruction_event(
+                            connection,
+                            session_id,
+                            str(existing["command_id"]),
+                            existing_payload,
+                            created_at=repaired_at,
+                            repaired=True,
+                        )
+                    except NotFoundError as error:
+                        raise ConflictError(
+                            "message command has no recoverable instruction text: "
+                            + str(existing["command_id"])
+                        ) from error
                 return _command(existing), False
+            now = utc_now()
+            command_id = new_uuid()
             connection.execute(
                 """
                 INSERT INTO commands(
@@ -1695,8 +2046,16 @@ class StateStore:
                     turn_ref.get("agent_role", ""),
                 ),
             )
-        return (
-            CommandReceipt(
+            if instruction_event:
+                self._ensure_command_instruction_event(
+                    connection,
+                    session_id,
+                    command_id,
+                    normalized_payload,
+                    created_at=now,
+                    repaired=False,
+                )
+            receipt = CommandReceipt(
                 command_id=command_id,
                 idempotency_key=idempotency_key,
                 session_id=session_id,
@@ -1706,7 +2065,9 @@ class StateStore:
                 created_at=now,
                 updated_at=now,
                 turn_ref=turn_ref,
-            ),
+            )
+        return (
+            receipt,
             True,
         )
 
@@ -1847,8 +2208,8 @@ class StateStore:
         status: str,
         result: dict[str, Any],
     ) -> CommandReceipt:
-        now = utc_now()
         with self.transaction() as connection:
+            now = utc_now()
             cursor = connection.execute(
                 """
                 UPDATE commands SET status = ?, result_json = ?,
@@ -4007,7 +4368,15 @@ class StateStore:
                 _load_object(str(command["payload_json"])),
                 str(envelope["profile"]),
             )
-            if authorization.get("next_command_digest") != actual_command_digest:
+            legacy_command_digest = legacy_command_envelope_digest(
+                str(command["command_type"]),
+                _load_object(str(command["payload_json"])),
+                str(envelope["profile"]),
+            )
+            if authorization.get("next_command_digest") not in {
+                actual_command_digest,
+                legacy_command_digest,
+            }:
                 return "command-mismatch"
             if latest_state == "reserved":
                 if bound_command_id == command_id:
@@ -4160,7 +4529,15 @@ class StateStore:
             _load_object(str(command["payload_json"])),
             str(envelope["profile"]),
         )
-        if authorization.get("next_command_digest") != actual_command_digest:
+        legacy_command_digest = legacy_command_envelope_digest(
+            str(command["command_type"]),
+            _load_object(str(command["payload_json"])),
+            str(envelope["profile"]),
+        )
+        if authorization.get("next_command_digest") not in {
+            actual_command_digest,
+            legacy_command_digest,
+        }:
             raise ConflictError("dispatch transition command changed")
         latest_state = str(row["state"] or "")
         bound_command_id = str(row["reserved_command_id"] or "")
@@ -4222,8 +4599,8 @@ class StateStore:
         checkpoint_id: str,
     ) -> None:
         command = self.get_command(command_id)
-        now = utc_now()
         with self.transaction() as connection:
+            now = utc_now()
             connection.execute(
                 """
                 INSERT INTO command_dispatches VALUES (
@@ -4379,15 +4756,15 @@ class StateStore:
                 (session_id, CommandStatus.DISPATCHING),
             ).fetchall()
             for command in commands:
-                dispatch = connection.execute(
+                dispatches = connection.execute(
                     """
                     SELECT * FROM command_dispatches
                     WHERE command_id = ? AND crossed_boundary = 1
-                    ORDER BY created_at DESC LIMIT 1
+                    ORDER BY created_at DESC, attempt_id DESC
                     """,
                     (command["command_id"],),
-                ).fetchone()
-                if dispatch is None:
+                ).fetchall()
+                if not dispatches:
                     self._requeue_pre_boundary(
                         connection,
                         str(command["command_id"]),
@@ -4395,7 +4772,13 @@ class StateStore:
                     )
                     requeued.append(str(command["command_id"]))
                     continue
-                if self._dispatch_known_undelivered(connection, dispatch):
+                ambiguous_dispatch = None
+                for dispatch in dispatches:
+                    if self._dispatch_known_undelivered(connection, dispatch):
+                        continue
+                    ambiguous_dispatch = dispatch
+                    break
+                if ambiguous_dispatch is None:
                     self._requeue_pre_boundary(
                         connection,
                         str(command["command_id"]),
@@ -4406,7 +4789,7 @@ class StateStore:
                 record = self._create_reconciliation(
                     connection,
                     command,
-                    dispatch,
+                    ambiguous_dispatch,
                     current_workspace_digest,
                     current_workspace_summary,
                     now,
@@ -4422,8 +4805,6 @@ class StateStore:
         connection: sqlite3.Connection,
         dispatch: sqlite3.Row,
     ) -> bool:
-        if str(dispatch["state"]) not in {"failed", "exhausted"}:
-            return False
         delivery = connection.execute(
             """
             SELECT state, accepted_at FROM context_deliveries
@@ -4431,11 +4812,32 @@ class StateStore:
             """,
             (str(dispatch["attempt_id"]),),
         ).fetchone()
+        return self._context_delivery_known_undelivered(
+            dispatch,
+            delivery,
+        )
+
+    def _context_delivery_known_undelivered(
+        self,
+        dispatch: sqlite3.Row | None,
+        delivery: sqlite3.Row | None,
+    ) -> bool:
         if delivery is None:
-            return True
-        if str(delivery["state"]) == "delivered":
             return False
-        return not str(delivery["accepted_at"])
+        if str(delivery["state"]) not in {"prepared", "superseded"}:
+            return False
+        if str(delivery["accepted_at"]):
+            return False
+        if dispatch is None:
+            return False
+        crossed_boundary = int(dispatch["crossed_boundary"]) > 0
+        if not crossed_boundary:
+            return True
+        return str(dispatch["state"]) in {
+            "failed",
+            "exhausted",
+            "interrupted",
+        }
 
     def _requeue_pre_boundary(
         self,
@@ -4647,6 +5049,52 @@ class StateStore:
         if row is None:
             raise NotFoundError("reconciliation")
         return _reconciliation(row)
+
+    def set_reconciliation_command_error(
+        self,
+        reconciliation_id: str,
+        code: str,
+        message: str,
+    ) -> CommandReceipt:
+        with self.transaction() as connection:
+            reconciliation = connection.execute(
+                """
+                SELECT command_id FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if reconciliation is None:
+                raise NotFoundError("reconciliation")
+            command = connection.execute(
+                "SELECT * FROM commands WHERE command_id = ?",
+                (str(reconciliation["command_id"]),),
+            ).fetchone()
+            if command is None or str(command["status"]) != CommandStatus.FAILED:
+                raise ConflictError(
+                    "reconciliation command is not in its failed state"
+                )
+            result = _load_object(str(command["result_json"]))
+            if str(result.get("reconciliation_id", "")) != reconciliation_id:
+                raise ConflictError("reconciliation command result changed")
+            result["code"] = code
+            result["message"] = message
+            connection.execute(
+                """
+                UPDATE commands SET result_json = ?, updated_at = ?
+                WHERE command_id = ?
+                """,
+                (
+                    _dump(result),
+                    utc_now(),
+                    str(command["command_id"]),
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM commands WHERE command_id = ?",
+                (str(command["command_id"]),),
+            ).fetchone()
+        return _command(updated)
 
     def record_reconciliation_discovery(
         self,
@@ -6003,32 +6451,6 @@ class StateStore:
             for row in rows
         ]
 
-    def record_context_delivery(
-        self,
-        session_id: str,
-        provider: str,
-        context_digest: str,
-        checkpoint_id: str,
-    ) -> bool:
-        with self.transaction() as connection:
-            cursor = connection.execute(
-                """
-                INSERT OR IGNORE INTO context_deliveries(
-                    session_id, provider, context_digest,
-                    checkpoint_id, delivered_at, state, accepted_at
-                ) VALUES (?, ?, ?, ?, ?, 'delivered', ?)
-                """,
-                (
-                    session_id,
-                    provider,
-                    context_digest,
-                    checkpoint_id,
-                    utc_now(),
-                    utc_now(),
-                ),
-            )
-        return cursor.rowcount == 1
-
     def prepare_context_delivery(
         self,
         session_id: str,
@@ -6038,7 +6460,11 @@ class StateStore:
         command_id: str,
         attempt_id: str,
         payload_digest: str,
+        *,
+        transport: str = "context-package",
     ) -> dict[str, Any]:
+        if transport not in {"context-package", "native-resume"}:
+            raise ValueError("context delivery transport is unsupported")
         with self.transaction() as connection:
             prior_command_rows = connection.execute(
                 """
@@ -6056,41 +6482,32 @@ class StateStore:
                     """,
                     (str(prior["attempt_id"]),),
                 ).fetchone()
-                crossed_boundary = False
-                known_undelivered = False
-                if dispatch is not None:
-                    crossed_boundary = int(dispatch["crossed_boundary"]) > 0
-                    known_undelivered = (
-                        str(dispatch["state"]) in {"failed", "exhausted"}
-                        and str(prior["state"]) != "delivered"
-                        and not str(prior["accepted_at"])
-                    )
-                if str(prior["state"]) == "delivered" or (
-                    crossed_boundary and not known_undelivered
+                if not self._context_delivery_known_undelivered(
+                    dispatch,
+                    prior,
                 ):
                     raise ConflictError(
                         "prior context delivery for this command is ambiguous"
                     )
                 connection.execute(
                     """
-                    DELETE FROM context_deliveries
-                    WHERE session_id = ? AND provider = ? AND context_digest = ?
+                    UPDATE context_deliveries SET state = 'superseded'
+                    WHERE attempt_id = ?
                     """,
-                    (
-                        session_id,
-                        provider,
-                        str(prior["context_digest"]),
-                    ),
+                    (str(prior["attempt_id"]),),
                 )
-            existing = connection.execute(
+            existing_rows = connection.execute(
                 """
                 SELECT * FROM context_deliveries
                 WHERE session_id = ? AND provider = ? AND context_digest = ?
+                ORDER BY delivered_at, attempt_id
                 """,
                 (session_id, provider, context_digest),
-            ).fetchone()
-            if existing is not None:
+            ).fetchall()
+            for existing in existing_rows:
                 if str(existing["attempt_id"]) == attempt_id:
+                    if str(existing["transport"]) != transport:
+                        raise ConflictError("context delivery transport changed")
                     return dict(existing)
                 if str(existing["state"]) == "delivered":
                     raise ConflictError(
@@ -6103,60 +6520,45 @@ class StateStore:
                     """,
                     (str(existing["attempt_id"]),),
                 ).fetchone()
-                crossed_boundary = False
-                known_undelivered = False
-                if dispatch is not None:
-                    crossed_boundary = int(dispatch["crossed_boundary"]) > 0
-                    known_undelivered = (
-                        str(dispatch["state"]) in {"failed", "exhausted"}
-                        and not str(existing["accepted_at"])
-                    )
-                if crossed_boundary and not known_undelivered:
+                if not self._context_delivery_known_undelivered(
+                    dispatch,
+                    existing,
+                ):
                     raise ConflictError(
                         "context package delivery is ambiguous; reconcile first"
                     )
                 connection.execute(
                     """
-                    UPDATE context_deliveries SET checkpoint_id = ?,
-                        command_id = ?, attempt_id = ?, state = 'prepared',
-                        payload_digest = ?, delivered_at = '', accepted_at = ''
-                    WHERE session_id = ? AND provider = ? AND context_digest = ?
+                    UPDATE context_deliveries SET state = 'superseded'
+                    WHERE attempt_id = ?
                     """,
-                    (
-                        checkpoint_id,
-                        command_id,
-                        attempt_id,
-                        payload_digest,
-                        session_id,
-                        provider,
-                        context_digest,
-                    ),
+                    (str(existing["attempt_id"]),),
                 )
-            else:
-                connection.execute(
-                    """
-                    INSERT INTO context_deliveries(
-                        session_id, provider, context_digest, checkpoint_id,
-                        delivered_at, command_id, attempt_id, state,
-                        payload_digest, accepted_at
-                    ) VALUES (?, ?, ?, ?, '', ?, ?, 'prepared', ?, '')
-                    """,
-                    (
-                        session_id,
-                        provider,
-                        context_digest,
-                        checkpoint_id,
-                        command_id,
-                        attempt_id,
-                        payload_digest,
-                    ),
-                )
+            connection.execute(
+                """
+                INSERT INTO context_deliveries(
+                    session_id, provider, context_digest, checkpoint_id,
+                    delivered_at, command_id, attempt_id, state,
+                    payload_digest, accepted_at, transport
+                ) VALUES (?, ?, ?, ?, '', ?, ?, 'prepared', ?, '', ?)
+                """,
+                (
+                    session_id,
+                    provider,
+                    context_digest,
+                    checkpoint_id,
+                    command_id,
+                    attempt_id,
+                    payload_digest,
+                    transport,
+                ),
+            )
             row = connection.execute(
                 """
                 SELECT * FROM context_deliveries
-                WHERE session_id = ? AND provider = ? AND context_digest = ?
+                WHERE attempt_id = ?
                 """,
-                (session_id, provider, context_digest),
+                (attempt_id,),
             ).fetchone()
             if row is None:
                 raise RuntimeError("context delivery preparation was not recorded")
@@ -6175,36 +6577,38 @@ class StateStore:
                 """
                 UPDATE context_deliveries SET state = 'delivered',
                     delivered_at = ?, accepted_at = ?
-                WHERE session_id = ? AND provider = ? AND context_digest = ?
-                    AND attempt_id = ? AND state = 'prepared'
+                WHERE attempt_id = ? AND session_id = ? AND provider = ?
+                    AND context_digest = ? AND state = 'prepared'
                 """,
                 (
                     now,
                     now,
+                    attempt_id,
                     session_id,
                     provider,
                     context_digest,
-                    attempt_id,
                 ),
             )
             if cursor.rowcount != 1:
                 row = connection.execute(
                     """
                     SELECT * FROM context_deliveries
-                    WHERE session_id = ? AND provider = ? AND context_digest = ?
+                    WHERE attempt_id = ? AND session_id = ? AND provider = ?
+                        AND context_digest = ?
                     """,
-                    (session_id, provider, context_digest),
+                    (attempt_id, session_id, provider, context_digest),
                 ).fetchone()
-                if row is None or str(row["attempt_id"]) != attempt_id:
+                if row is None:
                     raise ConflictError("context delivery acceptance is stale")
                 if str(row["state"]) != "delivered":
                     raise ConflictError("context delivery acceptance is invalid")
             row = connection.execute(
                 """
                 SELECT * FROM context_deliveries
-                WHERE session_id = ? AND provider = ? AND context_digest = ?
+                WHERE attempt_id = ? AND session_id = ? AND provider = ?
+                    AND context_digest = ?
                 """,
-                (session_id, provider, context_digest),
+                (attempt_id, session_id, provider, context_digest),
             ).fetchone()
             if row is None:
                 raise RuntimeError("context delivery acceptance was not recorded")
@@ -7746,9 +8150,10 @@ def _dispatch_transition_anchor(
         command_type in TRANSITION_CONTROL_COMMANDS
     ):
         anchor_kind = "control-command"
-    elif status == CommandStatus.FAILED and result.get("code") == (
-        "E_NEEDS_RECONCILIATION"
-    ):
+    elif status == CommandStatus.FAILED and result.get("code") in {
+        "E_NEEDS_RECONCILIATION",
+        "E_SAFETY_GUARD",
+    }:
         reconciliations = connection.execute(
             """
             SELECT * FROM reconciliations WHERE command_id = ?

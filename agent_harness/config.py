@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-API_VERSION = "1.10.0"
+API_VERSION = "1.11.0"
 CONTROL_PROTOCOL_VERSION = 3
 
 

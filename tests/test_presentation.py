@@ -385,7 +385,10 @@ def test_notification_projection_covers_every_lifecycle() -> None:
         ),
         (
             "reconciliation.requested",
-            {"reconciliation_id": "recovery-1"},
+            {
+                "reconciliation_id": "recovery-1",
+                "reason": "proof-service-fault-timeout",
+            },
             "Recovery needed",
         ),
         (
@@ -396,6 +399,11 @@ def test_notification_projection_covers_every_lifecycle() -> None:
         (
             "guard.triggered",
             {"guard_reason": "bounded guard"},
+            "Turn paused",
+        ),
+        (
+            "guard.tripped",
+            {"reason": "repeated context"},
             "Turn paused",
         ),
         (
@@ -422,6 +430,10 @@ def test_notification_projection_covers_every_lifecycle() -> None:
         )
         assert notification is not None
         assert notification.title == title
+        if event_type == "reconciliation.requested":
+            assert notification.detail == (
+                "Provider outcome is ambiguous: proof-service-fault-timeout"
+            )
 
     failed = notification_from_event(
         {

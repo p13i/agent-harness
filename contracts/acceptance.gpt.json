@@ -1,6 +1,6 @@
 {
   "schema": "p13i/agent-harness/acceptance/v1",
-  "contract_version": "1.10.0",
+  "contract_version": "1.11.0",
   "journeys": [
     {
       "id": "AH-AC-001",
@@ -208,7 +208,7 @@
     },
     {
       "id": "AH-AC-025",
-      "title": "Share one envelope across downgrade and failover",
+      "title": "Bound pre-acceptance stagnation recovery in one envelope",
       "local_evidence": ["//tests:e2e_tests"]
     },
     {

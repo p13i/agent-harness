@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,7 @@ import pytest
 
 import agent_harness.api as api_module
 import agent_harness.proof as proof_module
+import agent_harness.storage as storage_module
 import agent_harness.worker as worker_module
 from agent_harness.blobs import BlobStore
 from agent_harness.config import paths
@@ -24,6 +26,10 @@ from agent_harness.errors import (
 )
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import Checkpoint, CommandStatus, ProviderAttempt
+from agent_harness.orchestration import (
+    command_envelope_digest,
+    legacy_command_envelope_digest,
+)
 from agent_harness.process_control import ProcessGroupIdentity
 from agent_harness.providers import claude, codex, kimi
 from agent_harness.providers.base import ChildLaunchGate, ProviderEvent
@@ -33,7 +39,6 @@ from agent_harness.safety import (
     effective_effort,
     effort_requires_xhigh_authorization,
     limits_for,
-    lower_effort,
 )
 from agent_harness.service import HarnessService
 from agent_harness.storage import StateStore
@@ -252,7 +257,6 @@ def test_max_effort_uses_exact_single_use_xhigh_authorization(
     assert effort_requires_xhigh_authorization("max")
     assert not effort_requires_xhigh_authorization("high")
     assert not effort_requires_xhigh_authorization("unsupported")
-    assert lower_effort("max") == "xhigh"
     with pytest.raises(ValueError, match="explicit unattended authorization"):
         effective_effort("max", limits, xhigh_authorized=False)
     assert effective_effort("max", limits, xhigh_authorized=True) == "max"
@@ -628,7 +632,7 @@ async def test_retry_hydrates_persisted_consumption_and_keeps_extension(
     ) -> dict[str, Any]:
         del unused_command_id, unused_payload, unused_text
         captured.append(guard.consumption)
-        raise SafetyGuardError("persisted-stop", "automatic routing", recoverable=False)
+        raise SafetyGuardError("persisted-stop", "automatic routing")
 
     monkeypatch.setattr(worker, "_execute_with_failover", stop_after_hydration)
     monkeypatch.setattr(worker_module, "require_state_headroom", lambda *unused: 1)
@@ -669,13 +673,38 @@ def test_cross_provider_context_excludes_the_current_instruction(
     )
     store.append_event(
         created.session_id,
+        "agent.message",
+        role="assistant",
+        text="The first attempt changed one bounded file.",
+        status="complete",
+        metadata={"command_id": command_id},
+    )
+    store.append_event(
+        created.session_id,
+        "user.steer",
+        role="user",
+        text="Preserve that file during failover.",
+        status="accepted",
+        metadata={"target_command_id": command_id},
+    )
+    store.append_event(
+        created.session_id,
         "user.message",
         role="user",
         text="Future queued instruction.",
         status="accepted",
         metadata={"command_id": "future"},
     )
-    assert len(store.context_events(created.session_id)) == 3
+    assert len(store.events(created.session_id, limit=5000)) == 5
+    instruction_sequence = store.command_instruction_sequence(
+        created.session_id,
+        command_id,
+    )
+    assert [
+        event.text
+        for event in store.events(created.session_id, limit=5000)
+        if event.sequence < instruction_sequence + 1
+    ] == ["Earlier instruction.", current_text]
     with pytest.raises(NotFoundError, match="instruction event"):
         store.command_instruction_sequence(created.session_id, "missing")
     worker = SessionWorker(
@@ -693,13 +722,17 @@ def test_cross_provider_context_excludes_the_current_instruction(
     )
     prompt = context.text + "\n\n# Next instruction\n\n" + current_text
     assert "Earlier instruction." in prompt
+    assert "The first attempt changed one bounded file." in prompt
+    assert "Preserve that file during failover." in prompt
     assert "Future queued instruction." not in prompt
     assert prompt.count(current_text) == 1
     store.close()
 
 
+@pytest.mark.parametrize("terminal_state", ["failed", "exhausted", "interrupted"])
 def test_known_undelivered_terminal_dispatch_requeues_after_restart(
     tmp_path: Path,
+    terminal_state: str,
 ) -> None:
     store, created = _store(tmp_path)
     limits = limits_for("unattended", "implementation")
@@ -732,8 +765,8 @@ def test_known_undelivered_terminal_dispatch_requeues_after_restart(
         "payload-digest",
     )
     store.mark_provider_boundary(attempt.attempt_id)
-    store.update_attempt(attempt.attempt_id, status="failed")
-    store.complete_dispatch(attempt.attempt_id, "failed")
+    store.update_attempt(attempt.attempt_id, status=terminal_state)
+    store.complete_dispatch(attempt.attempt_id, terminal_state)
 
     recovery = store.recover_interrupted_commands(
         created.session_id,
@@ -802,7 +835,8 @@ def test_delivery_evidence_distinguishes_retry_from_reconciliation(
         "material",
         "summary",
     )
-    assert retry.requeued_command_ids == (command.command_id,)
+    assert retry.requeued_command_ids == ()
+    assert len(retry.reconciliations) == 1
     no_delivery.close()
 
     delivered, delivered_session = _store(tmp_path / "delivered")
@@ -851,6 +885,764 @@ def test_delivery_evidence_distinguishes_retry_from_reconciliation(
     assert reconciliation.requeued_command_ids == ()
     assert len(reconciliation.reconciliations) == 1
     delivered.close()
+
+
+def test_recovery_retains_every_superseded_undelivered_dispatch(
+    tmp_path: Path,
+) -> None:
+    limits = limits_for("unattended", "implementation")
+    store, created = _store(tmp_path)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "do not repeat an ambiguous earlier attempt"},
+        new_uuid(),
+    )
+    assert store.claim_command(created.session_id) is not None
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        limits.as_dict(),
+    )
+    first, unused_turn_id, first_checkpoint = _dispatch(
+        store,
+        created,
+        command.command_id,
+    )
+    del unused_turn_id
+    store.prepare_context_delivery(
+        created.session_id,
+        "codex",
+        "first-context",
+        first_checkpoint.checkpoint_id,
+        command.command_id,
+        first.attempt_id,
+        "first-payload",
+    )
+    store.mark_provider_boundary(first.attempt_id)
+    store.update_attempt(first.attempt_id, status="failed")
+    store.complete_dispatch(first.attempt_id, "failed")
+
+    second, unused_turn_id, checkpoint = _dispatch(
+        store,
+        created,
+        command.command_id,
+    )
+    del unused_turn_id
+    store.prepare_context_delivery(
+        created.session_id,
+        "codex",
+        "second-context",
+        checkpoint.checkpoint_id,
+        command.command_id,
+        second.attempt_id,
+        "second-payload",
+    )
+    store.mark_provider_boundary(second.attempt_id)
+    store.update_attempt(second.attempt_id, status="failed")
+    store.complete_dispatch(second.attempt_id, "failed")
+
+    recovery = store.recover_interrupted_commands(
+        created.session_id,
+        "material",
+        "summary",
+    )
+    assert recovery.requeued_command_ids == (command.command_id,)
+    assert recovery.reconciliations == ()
+    deliveries = store.portable_session(created.session_id)["tables"][
+        "context_deliveries"
+    ]
+    assert [item["attempt_id"] for item in deliveries] == [
+        first.attempt_id,
+        second.attempt_id,
+    ]
+    assert [item["state"] for item in deliveries] == [
+        "superseded",
+        "prepared",
+    ]
+    store.close()
+
+
+def test_schema_v5_backfills_legacy_missing_delivery_as_ambiguous(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    limits = limits_for("unattended", "implementation")
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "retain ambiguous legacy dispatch"},
+        new_uuid(),
+    )
+    assert store.claim_command(created.session_id) is not None
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        limits.as_dict(),
+    )
+    attempt, unused_turn_id, unused_checkpoint = _dispatch(
+        store,
+        created,
+        command.command_id,
+    )
+    del unused_turn_id, unused_checkpoint
+    store.mark_provider_boundary(attempt.attempt_id)
+    store.update_attempt(attempt.attempt_id, status="failed")
+    store.complete_dispatch(attempt.attempt_id, "failed")
+
+    historical = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "Do not backfill a completed historical dispatch."},
+        new_uuid(),
+    )
+    assert store.claim_command(created.session_id) is not None
+    historical_attempt, historical_turn, unused_checkpoint = _dispatch(
+        store,
+        created,
+        historical.command_id,
+    )
+    del unused_checkpoint
+    store.mark_provider_boundary(historical_attempt.attempt_id)
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE provider_attempts SET status = 'complete' "
+            "WHERE attempt_id = ?",
+            (historical_attempt.attempt_id,),
+        )
+        connection.execute(
+            "UPDATE turns SET status = 'complete' WHERE turn_id = ?",
+            (historical_turn,),
+        )
+        connection.execute(
+            "UPDATE command_dispatches SET state = 'complete' "
+            "WHERE attempt_id = ?",
+            (historical_attempt.attempt_id,),
+        )
+        connection.execute(
+            "UPDATE commands SET status = 'complete' WHERE command_id = ?",
+            (historical.command_id,),
+        )
+    with store.transaction() as connection:
+        connection.execute(
+            "DELETE FROM context_deliveries WHERE attempt_id = ?",
+            (attempt.attempt_id,),
+        )
+        connection.execute("UPDATE schema_meta SET version = 4")
+    database = store.path
+    store.close()
+
+    recovered = StateStore(database)
+    deliveries = recovered.portable_session(created.session_id)["tables"][
+        "context_deliveries"
+    ]
+    assert len(deliveries) == 1
+    delivery = deliveries[0]
+    assert delivery["attempt_id"] == attempt.attempt_id
+    assert delivery["attempt_id"] != historical_attempt.attempt_id
+    assert delivery["state"] == "legacy-ambiguous"
+    assert delivery["transport"] == "legacy-unknown"
+    restart = recovered.recover_interrupted_commands(
+        created.session_id,
+        "material",
+        "summary",
+    )
+    assert restart.requeued_command_ids == ()
+    assert len(restart.reconciliations) == 1
+    reconciliation = restart.reconciliations[0]
+    updated = recovered.set_reconciliation_command_error(
+        reconciliation.reconciliation_id,
+        "E_SAFETY_GUARD",
+        "retained safety error",
+    )
+    assert updated.result == {
+        "code": "E_SAFETY_GUARD",
+        "message": "retained safety error",
+        "reconciliation_id": reconciliation.reconciliation_id,
+    }
+    with pytest.raises(NotFoundError, match="reconciliation"):
+        recovered.set_reconciliation_command_error(
+            new_uuid(),
+            "E_SAFETY_GUARD",
+            "missing",
+        )
+    with recovered.transaction() as connection:
+        connection.execute(
+            "UPDATE commands SET status = 'queued' WHERE command_id = ?",
+            (command.command_id,),
+        )
+    with pytest.raises(ConflictError, match="failed state"):
+        recovered.set_reconciliation_command_error(
+            reconciliation.reconciliation_id,
+            "E_SAFETY_GUARD",
+            "wrong state",
+        )
+    with recovered.transaction() as connection:
+        connection.execute(
+            "UPDATE commands SET status = 'failed', result_json = '{}' "
+            "WHERE command_id = ?",
+            (command.command_id,),
+        )
+    with pytest.raises(ConflictError, match="result changed"):
+        recovered.set_reconciliation_command_error(
+            reconciliation.reconciliation_id,
+            "E_SAFETY_GUARD",
+            "wrong result",
+        )
+    recovered.close()
+
+
+def test_recovery_orders_equal_timestamp_dispatches_by_attempt_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = limits_for("unattended", "implementation")
+    store, created = _store(tmp_path)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "reconcile the newest deterministic attempt"},
+        new_uuid(),
+    )
+    assert store.claim_command(created.session_id) is not None
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        limits.as_dict(),
+    )
+    generated = iter(
+        [
+            "attempt-a",
+            "checkpoint-a",
+            "attempt-z",
+            "checkpoint-z",
+        ]
+    )
+    monkeypatch.setattr(
+        "tests.test_adversarial_regressions.new_uuid",
+        lambda: next(generated),
+    )
+    attempts = []
+    context_digests = []
+    providers = []
+    for suffix, provider in (("a", "codex"), ("z", "claude")):
+        attempt, unused_turn_id, checkpoint = _dispatch(
+            store,
+            created,
+            command.command_id,
+        )
+        del unused_turn_id
+        context_digest = "context-" + suffix
+        store.prepare_context_delivery(
+            created.session_id,
+            provider,
+            context_digest,
+            checkpoint.checkpoint_id,
+            command.command_id,
+            attempt.attempt_id,
+            "payload-" + suffix,
+        )
+        context_digests.append(context_digest)
+        attempts.append(attempt)
+        providers.append(provider)
+    for attempt, context_digest, provider in zip(
+        attempts,
+        context_digests,
+        providers,
+        strict=True,
+    ):
+        store.accept_context_delivery(
+            created.session_id,
+            provider,
+            context_digest,
+            attempt.attempt_id,
+        )
+        store.mark_provider_boundary(attempt.attempt_id)
+        store.update_attempt(attempt.attempt_id, status="failed")
+        store.complete_dispatch(attempt.attempt_id, "failed")
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE command_dispatches SET created_at = ? WHERE command_id = ?",
+            ("2026-08-02T00:00:00+00:00", command.command_id),
+        )
+
+    recovery = store.recover_interrupted_commands(
+        created.session_id,
+        "material",
+        "summary",
+    )
+
+    assert len(recovery.reconciliations) == 1
+    assert recovery.reconciliations[0].audit["dispatch_identity"]["attempt_id"] == (
+        "attempt-z"
+    )
+    assert [attempt.attempt_id for attempt in attempts] == [
+        "attempt-a",
+        "attempt-z",
+    ]
+    store.close()
+
+
+def test_command_context_filters_future_instructions_before_limiting(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    current = store.append_event(
+        created.session_id,
+        "user.message",
+        role="user",
+        text="Current instruction.",
+        status="accepted",
+        metadata={"command_id": "current"},
+    )
+    store.append_event(
+        created.session_id,
+        "user.message",
+        role="user",
+        text="Future instruction one.",
+        status="accepted",
+        metadata={"command_id": "future-one"},
+    )
+    store.append_event(
+        created.session_id,
+        "agent.message",
+        role="assistant",
+        text="Retain this attempt output.",
+        status="complete",
+        metadata={"command_id": "current"},
+    )
+    store.append_event(
+        created.session_id,
+        "agent.message",
+        role="assistant",
+        text="Exclude another command output.",
+        status="complete",
+        metadata={"command_id": "future-one"},
+    )
+    store.append_event(
+        created.session_id,
+        "user.message",
+        role="user",
+        text="Future instruction two.",
+        status="accepted",
+        metadata={"command_id": "future-two"},
+    )
+
+    events = store.context_events_for_command(
+        created.session_id,
+        "current",
+        current.sequence,
+        limit=1,
+    )
+
+    assert [event.text for event in events] == ["Retain this attempt output."]
+    store.close()
+
+
+def test_message_command_creation_and_repair_are_idempotent(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    payload = {"text": "Record one durable instruction."}
+    first, first_created = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "atomic-message",
+    )
+    second, second_created = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "atomic-message",
+    )
+
+    assert first_created
+    assert not second_created
+    assert first.command_id == second.command_id
+    assert [
+        event.text
+        for event in store.events(created.session_id, limit=5000)
+        if event.event_type == "user.message"
+    ] == ["Record one durable instruction."]
+    prior_event = store.append_event(
+        created.session_id,
+        "checkpoint.created",
+        status="complete",
+    )
+    with store.transaction() as connection:
+        connection.execute(
+            "DELETE FROM events WHERE session_id = ? AND event_type = 'user.message'",
+            (created.session_id,),
+        )
+    repaired, repaired_created = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "atomic-message",
+    )
+    assert repaired.command_id == first.command_id
+    assert not repaired_created
+    repaired_sequence = store.command_instruction_sequence(
+        created.session_id,
+        first.command_id,
+    )
+    assert repaired_sequence > prior_event.sequence
+    repaired_event = store.events(
+        created.session_id,
+        after=repaired_sequence - 1,
+        limit=1,
+    )[0]
+    assert repaired_event.created_at >= prior_event.created_at
+    assert store.get_session(created.session_id).updated_at >= repaired_event.created_at
+    store.close()
+
+
+def test_command_instruction_lookup_uses_its_partial_index(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    command, was_created = store.ensure_message_command(
+        created.session_id,
+        {"text": "Use the command instruction index."},
+        "indexed-message",
+    )
+
+    assert was_created
+    plan = store._connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT sequence FROM events
+        WHERE session_id = ? AND event_type = 'user.message'
+            AND CASE WHEN json_valid(metadata_json)
+                THEN json_extract(metadata_json, '$.command_id')
+                ELSE NULL
+            END = ?
+        ORDER BY sequence LIMIT 1
+        """,
+        (created.session_id, command.command_id),
+    ).fetchall()
+    assert any(
+        "events_command_instruction_v2" in str(row["detail"])
+        for row in plan
+    )
+    store.close()
+
+
+def test_message_timestamp_is_captured_after_transaction_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, created = _store(tmp_path)
+    entered = threading.Event()
+    clock_called = threading.Event()
+    result: list[Any] = []
+
+    def clock() -> str:
+        clock_called.set()
+        return "2026-08-02T00:00:03+00:00"
+
+    def create_message() -> None:
+        entered.set()
+        result.append(
+            store.ensure_message_command(
+                created.session_id,
+                {"text": "Retain monotonic timestamps."},
+                "transaction-timestamp",
+            )
+        )
+
+    monkeypatch.setattr(storage_module, "utc_now", clock)
+    thread = threading.Thread(target=create_message)
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+            ("2026-08-02T00:00:02+00:00", created.session_id),
+        )
+        thread.start()
+        assert entered.wait(timeout=1)
+        assert not clock_called.wait(timeout=0.1)
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    receipt, was_created = result[0]
+    assert was_created
+    assert receipt.created_at == "2026-08-02T00:00:03+00:00"
+    assert store.get_session(created.session_id).updated_at == (
+        "2026-08-02T00:00:03+00:00"
+    )
+    store.close()
+
+
+def test_event_timestamp_is_captured_after_transaction_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, created = _store(tmp_path)
+    entered = threading.Event()
+    clock_called = threading.Event()
+    result: list[Any] = []
+
+    def clock() -> str:
+        clock_called.set()
+        return "2026-08-02T00:00:03+00:00"
+
+    def append() -> None:
+        entered.set()
+        result.append(
+            store.append_event(
+                created.session_id,
+                "transaction.admitted",
+                status="complete",
+            )
+        )
+
+    monkeypatch.setattr(storage_module, "utc_now", clock)
+    thread = threading.Thread(target=append)
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+            ("2026-08-02T00:00:02+00:00", created.session_id),
+        )
+        thread.start()
+        assert entered.wait(timeout=1)
+        assert not clock_called.wait(timeout=0.1)
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert result[0].created_at == "2026-08-02T00:00:03+00:00"
+    assert store.get_session(created.session_id).updated_at == (
+        "2026-08-02T00:00:03+00:00"
+    )
+    store.close()
+
+
+def test_terminal_message_replay_does_not_resurrect_missing_instruction(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    payload = {"text": "Run this terminal instruction once."}
+    command, was_created = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "terminal-message",
+    )
+    assert was_created
+    store.resolve_command(
+        command.command_id,
+        CommandStatus.COMPLETE,
+        {"status": "complete"},
+    )
+    with store.transaction() as connection:
+        connection.execute(
+            "DELETE FROM events WHERE session_id = ? AND event_type = 'user.message'",
+            (created.session_id,),
+        )
+
+    replayed, created_again = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "terminal-message",
+    )
+
+    assert replayed.command_id == command.command_id
+    assert not created_again
+    assert store.events(created.session_id, limit=5000) == []
+    with pytest.raises(NotFoundError, match="instruction event"):
+        store.command_instruction_sequence(created.session_id, command.command_id)
+    with pytest.raises(ConflictError, match="terminal message command"):
+        store.repair_command_instruction_event(
+            created.session_id,
+            command.command_id,
+        )
+    store.close()
+
+
+def test_missing_instruction_event_is_repaired_from_the_command(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    idempotency_key = new_uuid()
+    payload = {
+        "text": "Recover the durable instruction.",
+        "turn_ref": {"step_id": "recover", "agent_role": "builder"},
+    }
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        payload,
+        idempotency_key,
+    )
+
+    with pytest.raises(NotFoundError, match="instruction event"):
+        store.command_instruction_sequence(created.session_id, command.command_id)
+    with pytest.raises(NotFoundError, match="instruction event"):
+        store.repair_command_instruction_event(
+            created.session_id,
+            new_uuid(),
+        )
+    retried, created_again = store.ensure_message_command(
+        created.session_id,
+        payload,
+        idempotency_key,
+    )
+    sequence = store.command_instruction_sequence(created.session_id, command.command_id)
+
+    assert retried.command_id == command.command_id
+    assert not created_again
+    assert sequence == 1
+    event = store.events(created.session_id, limit=5000)[0]
+    assert event.text == "Recover the durable instruction."
+    assert event.metadata == {
+        "command_id": command.command_id,
+        "repaired": True,
+        "turn_ref": {"step_id": "recover", "agent_role": "builder"},
+    }
+    empty = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "   "},
+        "empty-message",
+    )
+    with pytest.raises(NotFoundError, match="instruction event"):
+        store.command_instruction_sequence(created.session_id, empty.command_id)
+    with pytest.raises(ConflictError, match="no recoverable instruction text"):
+        store.repair_command_instruction_event(
+            created.session_id,
+            empty.command_id,
+        )
+    with pytest.raises(ConflictError, match="no recoverable instruction text"):
+        store.ensure_message_command(
+            created.session_id,
+            {"text": "   "},
+            "empty-message",
+        )
+    store.close()
+
+
+def test_legacy_effort_spelling_remains_idempotent_after_normalization(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "Retain one request.", "effort": "high"},
+        "legacy-effort",
+    )
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE commands SET payload_json = ? WHERE command_id = ?",
+            (
+                json.dumps(
+                    {"text": "Retain one request.", "effort": " HIGH "},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                command.command_id,
+            ),
+        )
+
+    retried, created_again = store.ensure_command(
+        created.session_id,
+        "message",
+        {"text": "Retain one request.", "effort": "high"},
+        "legacy-effort",
+    )
+
+    assert retried.command_id == command.command_id
+    assert not created_again
+    default_effort = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "Use the provider default."},
+        "default-effort",
+    )
+    blank_effort, blank_created = store.ensure_command(
+        created.session_id,
+        "message",
+        {"text": "Use the provider default.", "effort": "  "},
+        "default-effort",
+    )
+    assert blank_effort.command_id == default_effort.command_id
+    assert not blank_created
+    legacy_payload = {"text": "Retain one request.", "effort": " HIGH "}
+    assert command_envelope_digest(
+        "message",
+        legacy_payload,
+        "unattended",
+    ) != legacy_command_envelope_digest(
+        "message",
+        legacy_payload,
+        "unattended",
+    )
+
+    typed = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "Keep JSON types exact.", "_effort_pinned": True},
+        "typed-idempotency",
+    )
+    assert typed.command_id
+    with pytest.raises(ConflictError, match="different command input"):
+        store.ensure_command(
+            created.session_id,
+            "message",
+            {"text": "Keep JSON types exact.", "_effort_pinned": 1},
+            "typed-idempotency",
+        )
+    store.close()
+
+
+def test_delivery_v2_preserves_the_v1_idempotency_binding() -> None:
+    dispatch = {
+        "attempt_id": "attempt-one",
+        "turn_id": "turn-one",
+    }
+    base = {
+        "session_id": "session-one",
+        "provider": "codex",
+        "context_digest": "context-one",
+        "checkpoint_id": "checkpoint-one",
+        "command_id": "command-one",
+        "attempt_id": "attempt-one",
+        "payload_digest": "payload-one",
+        "state": "delivered",
+        "accepted_at": "2026-08-02T00:00:00+00:00",
+        "delivered_at": "2026-08-02T00:00:00+00:00",
+    }
+    context_package = proof_module._proof_context_deliveries(
+        [{**base, "transport": "context-package"}],
+        [dispatch],
+    )[0]
+    native_resume = proof_module._proof_context_deliveries(
+        [{**base, "transport": "native-resume"}],
+        [dispatch],
+    )[0]
+
+    assert context_package["delivery_version"] == 2
+    assert context_package["idempotency_digest"] == native_resume[
+        "idempotency_digest"
+    ]
+    assert context_package["context_delivery_digest"] != native_resume[
+        "context_delivery_digest"
+    ]
+
+
+def test_command_proof_marks_the_versioned_envelope_shape() -> None:
+    command = proof_module._proof_command(
+        {
+            "command_id": "command-one",
+            "session_id": "session-one",
+            "command_type": "message",
+            "payload_json": '{"text":"one"}',
+            "result_json": "{}",
+        },
+        {},
+        {"command-one": "unattended"},
+    )
+
+    assert command["command_envelope_version"] == 2
 
 
 def test_persisted_proof_payload_must_match_its_retained_digest(

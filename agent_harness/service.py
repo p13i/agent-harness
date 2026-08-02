@@ -823,9 +823,8 @@ class HarnessService:
                 session.permission_mode,
                 requested_permission,
             )
-        receipt, created = self.store.ensure_command(
+        receipt, created = self.store.ensure_message_command(
             session_id,
-            "message",
             payload,
             idempotency_key,
         )
@@ -836,17 +835,6 @@ class HarnessService:
                     session_id,
                     name=_message_session_name(text),
                 )
-            self.store.append_event(
-                session_id,
-                "user.message",
-                role="user",
-                text=text,
-                status="accepted",
-                metadata={
-                    "command_id": receipt.command_id,
-                    "turn_ref": receipt.turn_ref,
-                },
-            )
         self.workers.ensure(session_id)
         return receipt.as_dict()
 
@@ -1304,7 +1292,6 @@ class HarnessService:
             raise SafetyGuardError(
                 "fresh provider usage is required",
                 provider,
-                recoverable=False,
             )
         observed_at = str(usage.get("observed_at", ""))
         try:
@@ -1313,7 +1300,6 @@ class HarnessService:
             raise SafetyGuardError(
                 "provider usage timestamp is invalid",
                 provider,
-                recoverable=False,
             ) from error
         if observed.tzinfo is None:
             observed = observed.replace(tzinfo=datetime.UTC)
@@ -1322,33 +1308,28 @@ class HarnessService:
             raise SafetyGuardError(
                 "provider usage is stale",
                 provider,
-                recoverable=False,
             )
         binding = _optional_number(usage.get("binding_percent"))
         if binding is None:
             raise SafetyGuardError(
                 "provider binding usage is unavailable",
                 provider,
-                recoverable=False,
             )
         if binding < 0:
             raise SafetyGuardError(
                 "provider binding usage is invalid",
                 provider,
-                recoverable=False,
             )
         if bool(usage.get("credits_engaged", False)):
             raise SafetyGuardError(
                 "metered provider credits would engage",
                 provider,
-                recoverable=False,
             )
         ceiling = limits_for(profile, "operations").binding_ceiling
         if binding >= ceiling:
             raise SafetyGuardError(
                 "provider binding usage reached the safety ceiling",
                 provider,
-                recoverable=False,
             )
 
     def update_process_lease(

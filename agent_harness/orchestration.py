@@ -64,6 +64,13 @@ def normalize_turn_ref(value: object) -> dict[str, str]:
 
 def normalize_command_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
+    effort = normalized.get("effort")
+    if isinstance(effort, str):
+        normalized_effort = effort.strip().casefold()
+        if normalized_effort:
+            normalized["effort"] = normalized_effort
+        else:
+            normalized.pop("effort", None)
     turn_ref = normalize_turn_ref(payload.get("turn_ref"))
     if turn_ref:
         normalized["turn_ref"] = turn_ref
@@ -81,6 +88,26 @@ def command_envelope_digest(
         {
             "command_type": command_type,
             "payload": normalize_command_payload(payload),
+            "execution_profile": execution_profile,
+        }
+    )
+
+
+def legacy_command_envelope_digest(
+    command_type: str,
+    payload: dict[str, Any],
+    execution_profile: str,
+) -> str:
+    legacy_payload = dict(payload)
+    turn_ref = normalize_turn_ref(payload.get("turn_ref"))
+    if turn_ref:
+        legacy_payload["turn_ref"] = turn_ref
+    else:
+        legacy_payload.pop("turn_ref", None)
+    return normalized_digest(
+        {
+            "command_type": command_type,
+            "payload": legacy_payload,
             "execution_profile": execution_profile,
         }
     )

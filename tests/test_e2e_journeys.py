@@ -521,25 +521,89 @@ async def test_e2e_provider_resume_and_cross_provider_continuity(
         assert all(row["state"] == "complete" for row in dispatches)
         deliveries = rig.store._connection.execute(
             """
-            SELECT provider, checkpoint_id, context_digest, state,
-                payload_digest, accepted_at
+            SELECT command_id, provider, checkpoint_id, context_digest, state,
+                payload_digest, accepted_at, transport
             FROM context_deliveries ORDER BY delivered_at
             """
         ).fetchall()
         assert [row["provider"] for row in deliveries] == [
             "codex",
+            "codex",
             "claude",
             "codex",
             "claude",
         ]
-        assert len({row["context_digest"] for row in deliveries}) == 4
+        assert [row["transport"] for row in deliveries] == [
+            "context-package",
+            "native-resume",
+            "context-package",
+            "context-package",
+            "context-package",
+        ]
+        assert [row["command_id"] for row in deliveries] == [
+            first.command_id,
+            second.command_id,
+            third.command_id,
+            fourth.command_id,
+            fifth.command_id,
+        ]
+        assert deliveries[3]["provider"] == "codex"
+        assert deliveries[3]["transport"] == "context-package"
+        assert len({row["context_digest"] for row in deliveries}) == 5
         assert all(row["state"] == "delivered" for row in deliveries)
         assert all(row["payload_digest"] for row in deliveries)
         assert all(row["accepted_at"] for row in deliveries)
         assert deliveries[0]["checkpoint_id"] == dispatches[0]["checkpoint_id"]
-        assert deliveries[1]["checkpoint_id"] == dispatches[2]["checkpoint_id"]
-        assert deliveries[2]["checkpoint_id"] == dispatches[3]["checkpoint_id"]
-        assert deliveries[3]["checkpoint_id"] == dispatches[4]["checkpoint_id"]
+        assert deliveries[1]["checkpoint_id"] == dispatches[1]["checkpoint_id"]
+        assert deliveries[2]["checkpoint_id"] == dispatches[2]["checkpoint_id"]
+        assert deliveries[3]["checkpoint_id"] == dispatches[3]["checkpoint_id"]
+        assert deliveries[4]["checkpoint_id"] == dispatches[4]["checkpoint_id"]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_native_resume_delivery_identity_includes_the_command(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.prime_capacity()
+    try:
+        established = await rig.message(
+            "Establish the native session.",
+            provider="claude",
+        )
+        first = await rig.message(
+            "Run the unchanged tests.",
+            provider="claude",
+        )
+        (Path(rig.session.worktree) / "operator-change.txt").write_text(
+            "new material generation\n",
+            encoding="utf-8",
+        )
+        second = await rig.message(
+            "Run the unchanged tests.",
+            provider="claude",
+        )
+
+        assert established.status == "complete"
+        assert first.status == "complete"
+        assert second.status == "complete"
+        deliveries = rig.store._connection.execute(
+            """
+            SELECT command_id, context_digest, transport
+            FROM context_deliveries ORDER BY delivered_at
+            """
+        ).fetchall()
+        assert len(deliveries) == 3
+        assert len({row["command_id"] for row in deliveries}) == 3
+        assert len({row["context_digest"] for row in deliveries}) == 3
+        assert [row["transport"] for row in deliveries] == [
+            "context-package",
+            "native-resume",
+            "native-resume",
+        ]
     finally:
         rig.close()
 
@@ -727,6 +791,21 @@ async def test_pre_admission_setup_failure_leaves_no_capacity_slot(
         assert rig.store.active_process_leases() == []
         assert rig.store.active_unattended_provider_count("claude") == 0
         assert rig.store.active_unattended_provider_count("codex") == 0
+        if failure_stage == "context-delivery":
+            attempts = rig.store.attempts(rig.session.session_id)
+            assert [attempt.status for attempt in attempts] == ["failed"]
+            transition = rig.store._connection.execute(
+                """
+                SELECT turns.status AS turn_status,
+                    command_dispatches.state AS dispatch_state
+                FROM turns JOIN command_dispatches USING(turn_id)
+                WHERE command_dispatches.attempt_id = ?
+                """,
+                (attempts[0].attempt_id,),
+            ).fetchone()
+            assert transition is not None
+            assert transition["turn_status"] == "failed"
+            assert transition["dispatch_state"] == "failed"
         rig.store.recover_interrupted_commands(
             rig.session.session_id,
             "recovered-digest",
@@ -1677,9 +1756,53 @@ async def test_worker_attempt_guard_event_lease_and_failure_boundaries(
     finally:
         runtime_rig.close()
 
+    gate_root = tmp_path / "child-gate"
+    gate_root.mkdir()
+    gate_rig = JourneyRig(gate_root, codex=ScriptedAdapter("codex"))
+    try:
+        gate_rig.prime_capacity(claude=95, codex=10)
+
+        def fail_child_gate(**unused: object) -> None:
+            del unused
+            raise RuntimeError("child gate construction failed")
+
+        monkeypatch.setattr(
+            worker_module,
+            "ChildLaunchGate",
+            fail_child_gate,
+        )
+        with pytest.raises(RuntimeError, match="child gate construction failed"):
+            await gate_rig.message("fail before provider start", provider="codex")
+        tables = gate_rig.store.portable_session(gate_rig.session.session_id)[
+            "tables"
+        ]
+        command_id = str(tables["commands"][0]["command_id"])
+        dispatch = next(
+            item
+            for item in tables["command_dispatches"]
+            if item["command_id"] == command_id
+        )
+        attempt = next(
+            item
+            for item in tables["provider_attempts"]
+            if item["attempt_id"] == dispatch["attempt_id"]
+        )
+        turn = next(
+            item
+            for item in tables["turns"]
+            if item["turn_id"] == dispatch["turn_id"]
+        )
+        assert dispatch["state"] == "failed"
+        assert attempt["status"] == "failed"
+        assert turn["status"] == "failed"
+        assert gate_rig.worker._active_command_id == ""
+        assert gate_rig.worker._active_turn_id == ""
+    finally:
+        gate_rig.close()
+
 
 @pytest.mark.asyncio
-async def test_stagnation_downgrades_then_fails_over(
+async def test_stagnation_after_acceptance_requires_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1734,7 +1857,61 @@ async def test_stagnation_downgrades_then_fails_over(
     try:
         receipt = await rig.message("Recover a stagnant provider turn.")
         assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_SAFETY_GUARD"
+        assert receipt.result["reconciliation_id"]
         incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert [item["action"] for item in incidents] == ["pause"]
+        recoveries = [
+            item
+            for item in rig.store.all_events(rig.session.session_id)
+            if item.event_type == "recovery.started"
+        ]
+        assert recoveries == []
+        reconciliations = rig.store.pending_reconciliations(
+            rig.session.session_id
+        )
+        assert len(reconciliations) == 1
+    finally:
+        rig.close()
+
+    class PreAcceptanceAdapter(ScriptedAdapter):
+        def __init__(self, provider: str) -> None:
+            super().__init__(provider)
+            self.release: asyncio.Event | None = None
+
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            del values
+            self.release = asyncio.Event()
+            await self.release.wait()
+            return ProviderResult(
+                provider=self.provider_id,
+                native_session_id="",
+                native_turn_id="",
+                status="cancelled",
+            )
+
+        async def interrupt(self) -> None:
+            self.interruptions += 1
+            assert self.release is not None
+            self.release.set()
+
+    pre_acceptance_root = tmp_path / "pre-acceptance"
+    pre_acceptance_root.mkdir()
+    pre_acceptance_rig = JourneyRig(
+        pre_acceptance_root,
+        claude=PreAcceptanceAdapter("claude"),
+        codex=PreAcceptanceAdapter("codex"),
+    )
+    pre_acceptance_rig.prime_capacity(claude=80, codex=10)
+    try:
+        receipt = await pre_acceptance_rig.message(
+            "Recover only before provider acceptance."
+        )
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_SAFETY_GUARD", receipt.result
+        incidents = pre_acceptance_rig.store.guard_incidents(
+            pre_acceptance_rig.session.session_id
+        )
         assert [item["action"] for item in incidents] == [
             "downgrade",
             "failover",
@@ -1742,12 +1919,30 @@ async def test_stagnation_downgrades_then_fails_over(
         ]
         recoveries = [
             item
-            for item in rig.store.all_events(rig.session.session_id)
+            for item in pre_acceptance_rig.store.all_events(
+                pre_acceptance_rig.session.session_id
+            )
             if item.event_type == "recovery.started"
         ]
         assert [item.metadata["stage"] for item in recoveries] == [1, 2]
+        attempts = pre_acceptance_rig.store.attempts(
+            pre_acceptance_rig.session.session_id
+        )
+        assert [item.provider for item in attempts] == [
+            "codex",
+            "codex",
+            "claude",
+        ]
+        assert [item.effort for item in attempts] == [
+            "high",
+            "medium",
+            "low",
+        ]
+        assert not pre_acceptance_rig.store.pending_reconciliations(
+            pre_acceptance_rig.session.session_id
+        )
     finally:
-        rig.close()
+        pre_acceptance_rig.close()
 
 
 def test_goal_limit_and_workspace_digest_boundaries(
@@ -2010,6 +2205,7 @@ async def test_e2e_transport_loss_after_dispatch_requires_reconciliation(
         attempts = rig.store.attempts(rig.session.session_id)
         assert receipt.status == "failed", receipt.result
         assert receipt.result["code"] == "E_NEEDS_RECONCILIATION"
+        assert receipt.result["reconciliation_id"]
         assert [item.provider for item in attempts] == ["codex"]
         assert [item.status for item in attempts] == ["ambiguous"]
         assert not rig.adapters["claude"].prompts
@@ -2481,7 +2677,22 @@ async def test_e2e_metered_work_requires_exact_bounded_cost(
         envelope = rig.store.command_envelope(receipt.command_id)
         if expected_cost is None:
             assert receipt.status == "failed"
+            assert receipt.result["code"] == "E_SAFETY_GUARD"
+            assert receipt.result["message"].endswith("dollar-accounting")
+            assert not rig.store.pending_reconciliations(rig.session.session_id)
+            checkpoints = rig.store.checkpoints(rig.session.session_id)
+            assert checkpoints[-1].provider == "claude"
             assert envelope["guard_reason"] == "dollar-accounting"
+            incidents = rig.store.guard_incidents(rig.session.session_id)
+            assert incidents[0]["reason"] == "dollar-accounting"
+            assert incidents[0]["action"] == "pause"
+            events = rig.store.all_events(rig.session.session_id)
+            requested = [
+                event
+                for event in events
+                if event.event_type == "reconciliation.requested"
+            ]
+            assert requested == []
         else:
             assert receipt.status == "complete"
             assert envelope["consumption"]["dollars"] == expected_cost
@@ -2535,13 +2746,23 @@ async def test_e2e_hard_usage_limit_interrupts_without_recovery(
 
         assert receipt.status == "failed"
         assert receipt.result["code"] == "E_SAFETY_GUARD"
+        assert receipt.result["reconciliation_id"]
         assert claude.interruptions == 1
         assert len(rig.store.attempts(rig.session.session_id)) == 1
         envelope = rig.store.command_envelope(receipt.command_id)
         assert envelope["state"] == "paused"
         assert envelope["guard_reason"] == "output-tokens"
         incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert incidents[0]["reason"] == "output-tokens"
         assert incidents[0]["action"] == "pause"
+        events = rig.store.all_events(rig.session.session_id)
+        requested = [
+            event
+            for event in events
+            if event.event_type == "reconciliation.requested"
+        ]
+        assert len(requested) == 1
+        assert requested[0].metadata["reason"] == "output-tokens"
     finally:
         rig.close()
 

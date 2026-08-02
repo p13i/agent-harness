@@ -83,7 +83,6 @@ def require_state_headroom(
         raise SafetyGuardError(
             "state-volume-headroom",
             provider,
-            recoverable=False,
         )
     return free_bytes
 

@@ -29,6 +29,7 @@ from agent_harness.config import paths, prepare_paths
 from agent_harness.errors import (
     ConflictError,
     HarnessError,
+    NotFoundError,
     ProviderUnavailableError,
     ReconciliationRequiredError,
     SafetyGuardError,
@@ -3245,7 +3246,7 @@ class BoundaryAdapter(ProviderAdapter):
         if pre_prompt_gate is not None:
             await pre_prompt_gate()
         if self.behavior == "safety":
-            raise SafetyGuardError("stagnation", "codex", recoverable=True)
+            raise SafetyGuardError("stagnation", "codex")
         if self.behavior == "reconciliation":
             raise ReconciliationRequiredError("reconciliation")
         event_handler = values["event_handler"]
@@ -3256,13 +3257,17 @@ class BoundaryAdapter(ProviderAdapter):
                 native_session_id="native",
             )
         )
+        result_status = "complete"
+        if self.behavior == "cancelled-metered":
+            result_status = "cancelled"
         return ProviderResult(
             provider="codex",
             native_session_id="native",
             native_turn_id="turn",
-            status="complete",
+            status=result_status,
             usage={"total_tokens": 1},
-            ambiguous_mutation=self.behavior == "ambiguous",
+            ambiguous_mutation=self.behavior
+            in {"ambiguous", "ambiguous-metered"},
         )
 
     async def models(self, workspace: Path) -> tuple[ProviderModel, ...]:
@@ -3287,6 +3292,9 @@ class BoundaryAdapter(ProviderAdapter):
 
 
 class BoundaryScheduler:
+    def __init__(self, *, credits_engaged: bool = False) -> None:
+        self.credits_engaged = credits_engaged
+
     async def choose(self, *unused: object, **values: object) -> RoutingDecision:
         return RoutingDecision(
             provider="codex",
@@ -3295,6 +3303,7 @@ class BoundaryScheduler:
             reason="boundary",
             ranked=(),
             rejected=(),
+            credits_engaged=self.credits_engaged,
             execution_profile=str(values.get("execution_profile", "")),
             workload=str(values.get("workload", "")),
         )
@@ -3347,7 +3356,10 @@ def _worker_attempt(
     worker = SessionWorker(
         service.store,
         service.blobs,
-        BoundaryScheduler(),  # type: ignore[arg-type]
+        BoundaryScheduler(
+            credits_engaged=adapter.behavior
+            in {"ambiguous-metered", "cancelled-metered"}
+        ),  # type: ignore[arg-type]
         {"codex": adapter},
         created.session_id,
     )
@@ -3467,10 +3479,10 @@ def test_worker_context_repetition_goal_and_reconciliation_boundaries(
 
     captured: dict[str, Any] = {}
     context_store = SimpleNamespace(
-            goal_for_session=lambda unused: None,
-            fork_lineage=lambda unused: {"source_context_digest": "inherited"},
-            command_instruction_sequence=lambda *unused: 2,
-            context_events=lambda *unused, **values: [],
+        goal_for_session=lambda unused: None,
+        fork_lineage=lambda unused: {"source_context_digest": "inherited"},
+        command_instruction_sequence=lambda *unused: 2,
+        context_events_for_command=lambda *unused, **values: [],
         context_history_summary=lambda *unused: {},
         event_count=lambda unused: 0,
         context_unresolved_decisions=lambda unused: [],
@@ -3514,6 +3526,24 @@ def test_worker_context_repetition_goal_and_reconciliation_boundaries(
     )
     assert captured["inherited_context_digest"] == "inherited"
     assert captured["inherited_context"] == "text:inherited"
+
+    repaired_commands: list[str] = []
+
+    def missing_instruction(*unused: object) -> int:
+        raise NotFoundError("command instruction event")
+
+    def repair_instruction(unused_session: str, command_id: str) -> int:
+        repaired_commands.append(command_id)
+        return 2
+
+    context_store.command_instruction_sequence = missing_instruction
+    context_store.repair_command_instruction_event = repair_instruction
+    worker._compile_context(
+        created,
+        limits_for("interactive", "implementation"),
+        "legacy-command",
+    )
+    assert repaired_commands == ["legacy-command"]
 
     updated_goal = SimpleNamespace(goal_id="goal", milestones=("new",))
     goal_store = SimpleNamespace(
@@ -3571,7 +3601,7 @@ def test_worker_fault_barrier_timing_boundaries(
             tmp_path / "service-fault",
             BoundaryAdapter(),
         )
-        with pytest.raises(SafetyGuardError, match="proof-service-fault-timeout"):
+        with pytest.raises(ReconciliationRequiredError):
             asyncio.run(
                 worker._execute_attempt(
                     command.command_id,
@@ -3592,6 +3622,13 @@ def test_worker_fault_barrier_timing_boundaries(
             event.event_type == "proof.service-fault.timeout"
             for event in service.store.all_events(worker.session_id)
         )
+        requested = [
+            event
+            for event in service.store.all_events(worker.session_id)
+            if event.event_type == "reconciliation.requested"
+        ]
+        assert len(requested) == 1
+        assert requested[0].metadata["reason"] == "proof-service-fault-timeout"
         service.close()
 
     class TimedLoop:
@@ -3731,6 +3768,9 @@ def test_worker_attempt_admission_ownership_and_result_boundaries(
                 enforce_concurrency=True,
             )
         )
+    assert worker._active_adapter is None
+    assert worker._active_command_id == ""
+    assert worker._active_turn_id == ""
     monkeypatch.undo()
     service.close()
 
@@ -3758,6 +3798,9 @@ def test_worker_attempt_admission_ownership_and_result_boundaries(
             )
         )
     assert service.store.process_leases(worker.session_id)[0]["state"] == "released"
+    assert worker._active_adapter is None
+    assert worker._active_command_id == ""
+    assert worker._active_turn_id == ""
     monkeypatch.undo()
     service.close()
 
@@ -3792,7 +3835,7 @@ def test_worker_attempt_admission_ownership_and_result_boundaries(
     monkeypatch.undo()
     service.close()
 
-    for stage, action in ((0, "downgrade"), (1, "failover")):
+    for stage in (0, 1):
         service, worker, command, guard = _worker_attempt(
             tmp_path / ("safety-" + str(stage)),
             BoundaryAdapter("safety"),
@@ -3809,7 +3852,7 @@ def test_worker_attempt_admission_ownership_and_result_boundaries(
                     enforce_concurrency=True,
                 )
             )
-        assert service.store.guard_incidents(worker.session_id)[0]["action"] == action
+        assert service.store.guard_incidents(worker.session_id)[0]["action"] == "pause"
         service.close()
 
     service, worker, command, guard = _worker_attempt(
@@ -3827,16 +3870,70 @@ def test_worker_attempt_admission_ownership_and_result_boundaries(
                 0,
                 enforce_concurrency=True,
             )
+    )
+    service.close()
+
+    pause_reasons: list[str] = []
+
+    async def pause(*values: object, **unused: object) -> str:
+        pause_reasons.append(str(values[3]))
+        return "reconciliation"
+
+    service, worker, command, guard = _worker_attempt(
+        tmp_path / "cancelled-metered-result",
+        BoundaryAdapter("cancelled-metered"),
+    )
+    with pytest.raises(SafetyGuardError, match="dollar-accounting"):
+        asyncio.run(
+            worker._execute_attempt(
+                command.command_id,
+                {},
+                "boundary",
+                frozenset(),
+                guard,
+                0,
+                enforce_concurrency=True,
+            )
         )
+    incidents = service.store.guard_incidents(worker.session_id)
+    assert incidents[0]["reason"] == "dollar-accounting"
+    assert incidents[0]["action"] == "pause"
+    terminal_checkpoints = [
+        event
+        for event in service.store.all_events(worker.session_id)
+        if event.event_type == "checkpoint.created"
+        and event.status == "cancelled"
+    ]
+    assert len(terminal_checkpoints) == 1
+    service.close()
+
+    service, worker, command, guard = _worker_attempt(
+        tmp_path / "ambiguous-metered-result",
+        BoundaryAdapter("ambiguous-metered"),
+    )
+    monkeypatch.setattr(worker, "_pause_for_ambiguous_dispatch", pause)
+    with pytest.raises(ReconciliationRequiredError):
+        asyncio.run(
+            worker._execute_attempt(
+                command.command_id,
+                {},
+                "boundary",
+                frozenset(),
+                guard,
+                0,
+                enforce_concurrency=True,
+            )
+        )
+    incidents = service.store.guard_incidents(worker.session_id)
+    assert incidents[0]["reason"] == "dollar-accounting"
+    assert incidents[0]["action"] == "reconcile"
+    assert pause_reasons[-1] == "dollar-accounting"
     service.close()
 
     service, worker, command, guard = _worker_attempt(
         tmp_path / "ambiguous-result",
         BoundaryAdapter("ambiguous"),
     )
-
-    async def pause(*unused: object) -> str:
-        return "reconciliation"
 
     monkeypatch.setattr(worker, "_pause_for_ambiguous_dispatch", pause)
     with pytest.raises(ReconciliationRequiredError):
@@ -3851,6 +3948,7 @@ def test_worker_attempt_admission_ownership_and_result_boundaries(
                 enforce_concurrency=True,
             )
         )
+    assert pause_reasons[-1] == "E_PROVIDER_AMBIGUOUS_MUTATION"
     service.close()
 
 

@@ -148,7 +148,7 @@ def test_state_headroom_fails_closed_before_provider_use(
             free_bytes=available - 1,
         )
     assert raised.value.provider == "claude"
-    assert raised.value.recoverable is False
+    assert raised.value.detail.retryable is False
 
 
 def test_xhigh_requires_an_unattended_authorization() -> None:
@@ -617,7 +617,6 @@ def test_guard_warning_recovery_and_nonrepeating_cycles() -> None:
     assert repeating.violation() == "repeated-tool"
     with pytest.raises(ValueError, match="hard safety"):
         repeating.recover()
-
     interleaved = TurnGuard(base)
     interleaved.observe(
         ProviderEvent(

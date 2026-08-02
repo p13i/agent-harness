@@ -321,7 +321,16 @@ bodies. Child lifecycle, routing decisions, historical
 routing usage samples, and context deliveries retain typed
 identity joins. Context rows expose command, turn, attempt,
 provider, checkpoint, state, a stable idempotency digest,
-and a lifecycle-bound context-delivery digest. Routing rows
+and a versioned lifecycle-bound context-delivery digest.
+Command rows with `command_envelope_version` 2 bind the
+current request and immutable execution profile. An absent
+version denotes the legacy version 1 shape, whose retained
+normalization is exposed as `legacy_command_envelope_digest`
+for historical verification. Delivery version 2 adds
+`transport` outside the stable idempotency binding, so
+existing idempotency digests retain their definition while
+new lifecycle digests explicitly bind `context-package`,
+`native-resume`, or a legacy migration state. Routing rows
 include `usage_sample_bound`, `route_recorded_at`,
 `attempt_admitted_at`, usage age and freshness at both
 boundaries, and `admissible_at_route`. Long-tier verifiers
@@ -481,6 +490,11 @@ route pins, effort, permission mode, metered budget, turn
 reference, and any proof probes when supplied; only HTTP
 idempotency transport headers are outside it.
 
+Database v5 does not rewrite historical command payloads.
+Effort spelling is normalized for new request idempotency,
+while retained transition receipts continue to bind the
+stored payload bytes used when they were authorized.
+
 The transition authorization schema is
 `p13i/agent-harness/dispatch-generation-transition-authorization/v1`.
 It binds the session and external reference, current goal,
@@ -509,7 +523,8 @@ the interrupt event and control result must both bind its
 command identifier and the current certified checkpoint and
 material. Only completed control commands may occur between
 that target and the anchor. A `resolved-reconciliation`
-anchor requires a failed `E_NEEDS_RECONCILIATION` message,
+anchor requires a failed `E_NEEDS_RECONCILIATION` or
+`E_SAFETY_GUARD` message,
 exactly one resolved reconciliation, an `accept-current` or
 `restore-pre-turn` decision, and its latest resolution
 checkpoint. Its protected `resolution_workspace_digest` must
@@ -620,12 +635,22 @@ that approval, then retry with the same observed digest and
 a new reconciliation idempotency key carrying the approval
 ID.
 
-Hard safety limits do not fail over. Recoverable soft
-violations can lower effort once and switch provider once,
-while retaining cumulative use in the original command
-envelope. A session requiring more capacity stays paused
-until an operator explicitly extends time, tokens, or one
-xhigh authorization.
+Hard safety limits and repeated digest guards do not fail
+over. Before `provider.prompt.accepted`, stagnation may lower
+an unpinned effort once and then change provider once while
+retaining the original command envelope and cumulative
+consumption. Other guard stops return `E_SAFETY_GUARD`
+without another provider attempt. After acknowledgment, a
+guard stop retains `E_SAFETY_GUARD`,
+adds a `reconciliation_id` while the provider outcome is
+ambiguous, records the specific guard reason in the incident
+and reconciliation-requested event, and blocks another
+message until the ambiguous turn is resolved. A stop
+detected after a known terminal provider result records a
+post-turn checkpoint and returns `E_SAFETY_GUARD` without a
+retry. A session requiring more capacity stays paused until
+an operator explicitly extends time, tokens, or one xhigh
+authorization.
 
 The current goal's remaining time, total and context/output
 token, tool-call, attempt, child-agent, and dollar budgets

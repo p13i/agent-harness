@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: p13i agent harness
-  version: 1.10.0
+  version: 1.11.0
   description: >-
     Durable provider-neutral agent sessions, goals, events,
     approvals, routing, checkpoints, terminals, and fleet
@@ -866,6 +866,15 @@ components:
             $ref: "#/components/schemas/PresentationAttempt"
         result:
           type: object
+          description: >-
+            Terminal command result. A safety stop before
+            provider acceptance reports E_SAFETY_GUARD. A
+            safety stop after provider acceptance retains
+            E_SAFETY_GUARD and adds a reconciliation_id
+            while provider effects remain ambiguous. A stop
+            detected after a known terminal provider result
+            records a post-turn checkpoint and reports
+            E_SAFETY_GUARD without retrying that result.
         safety:
           type: object
         checkpoint_id:
@@ -1155,6 +1164,10 @@ components:
           type: string
         effort:
           type: string
+          description: >-
+            Case-insensitive effort name. Surrounding
+            whitespace is ignored; blank is equivalent to an
+            unspecified provider-default effort.
         workload:
           type: string
         turn_ref:

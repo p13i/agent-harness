@@ -624,6 +624,53 @@ def _dispatched_attempt(
     return attempt
 
 
+def test_dispatch_timestamp_is_sampled_under_the_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "order this dispatch"},
+        new_uuid(),
+    )
+    attempt = _attempt(store, created.session_id)
+    turn_id = store.start_turn(created.session_id, attempt.attempt_id)
+    checkpoint = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=store.last_sequence(created.session_id),
+        provider="codex",
+        native_session_id="",
+        base_commit="base",
+        patch_digest="patch",
+        untracked_digest="untracked",
+        context_digest="context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(checkpoint)
+    original_now = storage_module.utc_now
+    lock_observations: list[bool] = []
+
+    def observe_lock() -> str:
+        lock_observations.append(store._lock._is_owned())
+        return original_now()
+
+    monkeypatch.setattr(storage_module, "utc_now", observe_lock)
+    store.record_dispatch_checkpoint(
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        checkpoint.checkpoint_id,
+    )
+
+    assert lock_observations == [True]
+    store.close()
+
+
 def test_nested_transactions_roll_back_to_their_savepoint(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.sqlite3")
     created = session(tmp_path)
@@ -904,6 +951,29 @@ def test_context_delivery_preparation_and_acceptance_fail_closed(
         "payload-1",
     )
     assert prepared["state"] == "prepared"
+    assert prepared["transport"] == "context-package"
+    with pytest.raises(ValueError, match="transport is unsupported"):
+        store.prepare_context_delivery(
+            created.session_id,
+            "codex",
+            "digest-invalid",
+            "checkpoint-1",
+            command.command_id,
+            first.attempt_id,
+            "payload-1",
+            transport="unsupported",
+        )
+    with pytest.raises(ConflictError, match="transport changed"):
+        store.prepare_context_delivery(
+            created.session_id,
+            "codex",
+            "digest-1",
+            "checkpoint-1",
+            command.command_id,
+            first.attempt_id,
+            "payload-1",
+            transport="native-resume",
+        )
     assert (
         store.prepare_context_delivery(
             created.session_id,
@@ -941,6 +1011,20 @@ def test_context_delivery_preparation_and_acceptance_fail_closed(
         )["state"]
         == "delivered"
     )
+    with pytest.raises(ConflictError, match="acceptance is stale"):
+        store.accept_context_delivery(
+            created.session_id,
+            "claude",
+            "digest-1",
+            first.attempt_id,
+        )
+    with pytest.raises(ConflictError, match="acceptance is stale"):
+        store.accept_context_delivery(
+            created.session_id,
+            "codex",
+            "wrong-digest",
+            first.attempt_id,
+        )
     with pytest.raises(ConflictError, match="already delivered without native"):
         store.prepare_context_delivery(
             created.session_id,
@@ -1031,6 +1115,39 @@ def test_context_delivery_rejects_ambiguous_prior_dispatches(
             third.attempt_id,
             "payload-3",
         )
+    store.complete_dispatch(second.attempt_id, "failed")
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE context_deliveries SET state = 'prepared', accepted_at = ? "
+            "WHERE attempt_id = ?",
+            (utc_now(), second.attempt_id),
+        )
+    with pytest.raises(ConflictError, match="prior context delivery"):
+        store.prepare_context_delivery(
+            created.session_id,
+            "codex",
+            "digest-3",
+            checkpoint.checkpoint_id,
+            command.command_id,
+            third.attempt_id,
+            "payload-3",
+        )
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE context_deliveries SET state = 'legacy-ambiguous', "
+            "accepted_at = '' WHERE attempt_id = ?",
+            (second.attempt_id,),
+        )
+    with pytest.raises(ConflictError, match="prior context delivery"):
+        store.prepare_context_delivery(
+            created.session_id,
+            "codex",
+            "digest-3",
+            checkpoint.checkpoint_id,
+            command.command_id,
+            third.attempt_id,
+            "payload-3",
+        )
     store.close()
 
 
@@ -1043,7 +1160,9 @@ def _forget_row(store: StateStore, statement: str, value: str) -> None:
         store._connection.execute("PRAGMA foreign_keys=ON")
 
 
-def test_context_delivery_retargets_a_prepared_package(tmp_path: Path) -> None:
+def test_context_delivery_without_dispatch_cannot_be_retargeted(
+    tmp_path: Path,
+) -> None:
     store = StateStore(tmp_path / "state.sqlite3")
     created = session(tmp_path)
     store.create_session(created)
@@ -1059,6 +1178,54 @@ def test_context_delivery_retargets_a_prepared_package(tmp_path: Path) -> None:
         first.attempt_id,
         "payload-1",
     )
+    with pytest.raises(ConflictError, match="delivery is ambiguous"):
+        store.prepare_context_delivery(
+            created.session_id,
+            "codex",
+            "digest-1",
+            "checkpoint-2",
+            new_uuid(),
+            second.attempt_id,
+            "payload-2",
+        )
+
+    deliveries = store.portable_session(created.session_id)["tables"][
+        "context_deliveries"
+    ]
+    assert [item["state"] for item in deliveries] == ["prepared"]
+    store.close()
+
+
+def test_context_delivery_retargets_a_proven_preboundary_failure(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "prove non-delivery"},
+        new_uuid(),
+    )
+    assert store.claim_command(created.session_id) is not None
+    first = _dispatched_attempt(
+        store,
+        created.session_id,
+        command.command_id,
+    )
+    store.prepare_context_delivery(
+        created.session_id,
+        "codex",
+        "digest-1",
+        "checkpoint-1",
+        command.command_id,
+        first.attempt_id,
+        "payload-1",
+    )
+    store.complete_dispatch(first.attempt_id, "failed")
+    second = _attempt(store, created.session_id)
+
     retargeted = store.prepare_context_delivery(
         created.session_id,
         "codex",
@@ -1070,8 +1237,13 @@ def test_context_delivery_retargets_a_prepared_package(tmp_path: Path) -> None:
     )
 
     assert retargeted["attempt_id"] == second.attempt_id
-    assert retargeted["checkpoint_id"] == "checkpoint-2"
-    assert retargeted["state"] == "prepared"
+    deliveries = store.portable_session(created.session_id)["tables"][
+        "context_deliveries"
+    ]
+    assert [item["state"] for item in deliveries] == [
+        "superseded",
+        "prepared",
+    ]
     store.close()
 
 
@@ -1520,7 +1692,7 @@ def test_proof_command_and_transition_helper_boundaries(
     failed = {
         "command_type": "message",
         "status": CommandStatus.FAILED,
-        "result_json": storage_module._dump({"code": "E_NEEDS_RECONCILIATION"}),
+        "result_json": storage_module._dump({"code": "E_SAFETY_GUARD"}),
         "command_id": "missing-reconciliation",
     }
     with pytest.raises(ConflictError, match="exactly one reconciliation"):
@@ -1581,6 +1753,20 @@ def test_proof_command_and_transition_helper_boundaries(
             "latest",
             "a" * 64,
         )
+    reconciliation["audit_json"] = storage_module._dump(
+        {
+            "resolution_checkpoint_id": "latest",
+            "resolution_workspace_digest": "a" * 64,
+        }
+    )
+    anchor = storage_module._dispatch_transition_anchor(
+        ReconciliationConnection(reconciliation),  # type: ignore[arg-type]
+        failed,  # type: ignore[arg-type]
+        "latest",
+        "a" * 64,
+    )
+    assert anchor["prior_anchor_kind"] == "resolved-reconciliation"
+    assert anchor["prior_reconciliation_id"] == "reconciliation"
     store.close()
 
 

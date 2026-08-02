@@ -98,6 +98,7 @@ class SessionWorker:
         self._stopping = False
         self._active_adapter: ProviderAdapter | None = None
         self._active_command_id = ""
+        self._active_turn_id = ""
 
     async def run(self) -> None:
         prior_leases = [
@@ -406,7 +407,7 @@ class SessionWorker:
         if effort_requires_xhigh_authorization(effort) and profile != "interactive":
             limits = replace(limits, max_attempts=1)
         payload = dict(payload)
-        payload["_effort_pinned"] = bool(requested_effort)
+        payload["_effort_pinned"] = bool(requested_effort.strip())
         payload["effort"] = effort
         envelope = self.store.create_command_envelope(
             command.command_id,
@@ -451,7 +452,7 @@ class SessionWorker:
                 text,
                 guard,
             )
-        except ReconciliationRequiredError:
+        except ReconciliationRequiredError as error:
             self.store.update_session(
                 self.session_id,
                 lifecycle=Lifecycle.PAUSED,
@@ -461,7 +462,7 @@ class SessionWorker:
                 command.command_id,
                 state="paused",
                 consumption=guard.consumption.as_dict(),
-                guard_reason="ambiguous-provider-dispatch",
+                guard_reason=error.reason,
             )
             return
         except HarnessError as error:
@@ -689,18 +690,31 @@ class SessionWorker:
         prompt = text
         context_digest = ""
         context_payload_digest = ""
+        context_transport = "context-package"
+        generation_digest = self.store.repetition_generation(self.session_id)[
+            "generation_digest"
+        ]
         if not native_session_id or session.active_provider != decision.provider:
             prompt = context.text + "\n\n# Next instruction\n\n" + text
             context_payload_digest = hashlib.sha256(
                 context.text.encode("utf-8")
             ).hexdigest()
-            generation_digest = self.store.repetition_generation(self.session_id)[
-                "generation_digest"
-            ]
             context_digest = _structured_digest(
                 {
                     "checkpoint_generation": generation_digest,
                     "payload_digest": context_payload_digest,
+                }
+            )
+        else:
+            context_transport = "native-resume"
+            context_payload_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            context_digest = _structured_digest(
+                {
+                    "checkpoint_generation": generation_digest,
+                    "command_id": command_id,
+                    "instruction_digest": context_payload_digest,
+                    "native_session_id": native_session_id,
+                    "transport": "native-resume",
                 }
             )
         submitted_tokens = (len(prompt) + 3) // 4
@@ -709,7 +723,6 @@ class SessionWorker:
             raise SafetyGuardError(
                 violation,
                 decision.provider,
-                recoverable=False,
             )
         lease_id = ""
         attempt_id = new_uuid()
@@ -768,8 +781,6 @@ class SessionWorker:
             },
             turn_id=turn_id,
         )
-        self._active_adapter = adapter
-        self._active_command_id = command_id
         if unavailable_native_session_id:
             self.store.append_event(
                 self.session_id,
@@ -801,13 +812,12 @@ class SessionWorker:
                 not context_delivery_accepted
                 and event.event_type == "provider.prompt.accepted"
             ):
-                if context_digest:
-                    self.store.accept_context_delivery(
-                        self.session_id,
-                        decision.provider,
-                        context_digest,
-                        attempt_id,
-                    )
+                self.store.accept_context_delivery(
+                    self.session_id,
+                    decision.provider,
+                    context_digest,
+                    attempt_id,
+                )
                 context_delivery_accepted = True
             if (
                 event.native_session_id
@@ -886,7 +896,6 @@ class SessionWorker:
                 raise SafetyGuardError(
                     "proof-service-fault-timeout",
                     decision.provider,
-                    recoverable=False,
                 )
 
         async def approval_handler(
@@ -917,7 +926,7 @@ class SessionWorker:
         )
         del unused_summary
         guard.establish_material_state(material_digest)
-        if context_digest:
+        try:
             self.store.prepare_context_delivery(
                 self.session_id,
                 decision.provider,
@@ -926,7 +935,18 @@ class SessionWorker:
                 command_id,
                 attempt_id,
                 context_payload_digest,
+                transport=context_transport,
             )
+        except BaseException:
+            self.store.update_attempt(attempt_id, status="failed")
+            self.store.finish_turn(turn_id, "failed")
+            self.store.complete_dispatch(attempt_id, "failed")
+            self.store.update_command_envelope(
+                command_id,
+                state="reserved",
+                consumption=guard.consumption.as_dict(),
+            )
+            raise
         self.store.append_event(
             self.session_id,
             "checkpoint.created",
@@ -1001,7 +1021,6 @@ class SessionWorker:
                     raise SafetyGuardError(
                         "proof-fault-readiness-timeout",
                         decision.provider,
-                        recoverable=False,
                     )
                 await asyncio.sleep(0.025)
             readiness = {
@@ -1050,7 +1069,6 @@ class SessionWorker:
                     raise SafetyGuardError(
                         "proof-fault-process-identity-changed",
                         decision.provider,
-                        recoverable=False,
                     )
                 await asyncio.sleep(0.05)
             self.store.append_event(
@@ -1063,7 +1081,6 @@ class SessionWorker:
             raise SafetyGuardError(
                 "proof-fault-termination-timeout",
                 decision.provider,
-                recoverable=False,
             )
 
         try:
@@ -1117,12 +1134,18 @@ class SessionWorker:
                     pre_prompt_gate=pre_prompt_gate,
                 )
             )
+            self._active_adapter = adapter
+            self._active_command_id = command_id
+            self._active_turn_id = turn_id
         except BaseException:
             if lease_id:
                 self.store.update_process_lease(
                     lease_id,
                     state="released",
                 )
+            self.store.update_attempt(attempt_id, status="failed")
+            self.store.finish_turn(turn_id, "failed")
+            self.store.complete_dispatch(attempt_id, "failed")
             self.store.update_command_envelope(
                 command_id,
                 state="recovering",
@@ -1162,7 +1185,10 @@ class SessionWorker:
                         adapter,
                         run_task,
                     )
-                    recoverable = violation == "stagnation"
+                    recoverable = (
+                        violation == "stagnation"
+                        and not context_delivery_accepted
+                    )
                     action = "pause"
                     if recoverable and recovery_stage == 0:
                         action = "downgrade"
@@ -1217,20 +1243,6 @@ class SessionWorker:
                     metadata=result.usage,
                 )
             )
-            if decision.credits_engaged:
-                if not guard.consumption.exact_dollars:
-                    raise SafetyGuardError(
-                        "dollar-accounting",
-                        decision.provider,
-                        recoverable=False,
-                    )
-            violation = guard.violation()
-            if violation:
-                raise SafetyGuardError(
-                    violation,
-                    decision.provider,
-                    recoverable=False,
-                )
         except SafetyGuardError as error:
             matching_incident = any(
                 item["command_id"] == command_id
@@ -1239,22 +1251,29 @@ class SessionWorker:
                 for item in self.store.guard_incidents(self.session_id)
             )
             if not matching_incident:
-                action = "pause"
-                if error.recoverable and recovery_stage == 0:
-                    action = "downgrade"
-                elif error.recoverable and recovery_stage == 1:
-                    action = "failover"
                 self.store.add_guard_incident(
                     self.session_id,
                     command_id,
                     attempt_id,
                     error.reason,
-                    action,
+                    "pause",
                     guard.snapshot(),
                 )
             self.store.update_attempt(attempt_id, status="interrupted")
             self.store.finish_turn(turn_id, "interrupted")
             self.store.complete_dispatch(attempt_id, "interrupted")
+            if context_delivery_accepted:
+                reconciliation_id = await self._pause_for_ambiguous_dispatch(
+                    command_id,
+                    turn_id,
+                    decision.provider,
+                    error.reason,
+                    command_error=error,
+                )
+                raise ReconciliationRequiredError(
+                    reconciliation_id,
+                    reason=error.reason,
+                ) from error
             raise
         except (ProviderExhaustedError, ProviderUnavailableError) as error:
             if not context_delivery_accepted:
@@ -1298,6 +1317,7 @@ class SessionWorker:
             self._active_adapter = None
             if self._active_command_id == command_id:
                 self._active_command_id = ""
+                self._active_turn_id = ""
             if lease_id and worker_owned:
                 self.store.update_process_lease(
                     lease_id,
@@ -1317,6 +1337,91 @@ class SessionWorker:
                     },
                     turn_id=turn_id,
                 )
+        terminal_guard_reason = ""
+        if decision.credits_engaged and not guard.consumption.exact_dollars:
+            terminal_guard_reason = "dollar-accounting"
+        if not terminal_guard_reason:
+            terminal_guard_reason = guard.violation()
+        checkpoint = pre_dispatch_checkpoint
+        completed_material_digest = ""
+        if terminal_guard_reason or (
+            result.status == "complete" and not result.ambiguous_mutation
+        ):
+            current = self.store.get_session(self.session_id)
+            checkpoint = await asyncio.to_thread(
+                checkpoint_workspace,
+                current,
+                self.blobs,
+                sequence=self.store.last_sequence(self.session_id),
+                provider=decision.provider,
+                native_session_id=result.native_session_id,
+                context_text=context.text,
+            )
+            self.store.add_checkpoint(checkpoint)
+            completed_material_digest, unused_summary = await asyncio.to_thread(
+                inspect_workspace,
+                Path(current.worktree),
+            )
+            del unused_summary
+            self.store.append_event(
+                self.session_id,
+                "checkpoint.created",
+                status=result.status,
+                metadata=checkpoint.as_dict(),
+                turn_id=turn_id,
+            )
+        if terminal_guard_reason:
+            terminal_action = "pause"
+            if result.ambiguous_mutation:
+                terminal_action = "reconcile"
+            snapshot = guard.snapshot()
+            self.store.add_guard_incident(
+                self.session_id,
+                command_id,
+                attempt_id,
+                terminal_guard_reason,
+                terminal_action,
+                snapshot,
+            )
+            self.store.append_event(
+                self.session_id,
+                "guard.tripped",
+                status="failed",
+                metadata={
+                    "command_id": command_id,
+                    "attempt_id": attempt_id,
+                    "reason": terminal_guard_reason,
+                    "action": terminal_action,
+                    "snapshot": snapshot,
+                    "provider_terminal": True,
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                },
+                turn_id=turn_id,
+            )
+            terminal_error = SafetyGuardError(
+                terminal_guard_reason,
+                decision.provider,
+            )
+            if result.ambiguous_mutation:
+                reconciliation_id = await self._pause_for_ambiguous_dispatch(
+                    command_id,
+                    turn_id,
+                    decision.provider,
+                    terminal_guard_reason,
+                    command_error=terminal_error,
+                )
+                raise ReconciliationRequiredError(
+                    reconciliation_id,
+                    reason=terminal_guard_reason,
+                )
+            self.store.update_attempt(
+                attempt_id,
+                status="failed",
+                native_session_id=result.native_session_id,
+            )
+            self.store.finish_turn(turn_id, "failed")
+            self.store.complete_dispatch(attempt_id, "failed")
+            raise terminal_error
         if result.ambiguous_mutation:
             reconciliation_id = await self._pause_for_ambiguous_dispatch(
                 command_id,
@@ -1341,29 +1446,6 @@ class SessionWorker:
                 decision.provider + " returned a non-complete result",
                 status=502,
             )
-        current = self.store.get_session(self.session_id)
-        checkpoint = await asyncio.to_thread(
-            checkpoint_workspace,
-            current,
-            self.blobs,
-            sequence=self.store.last_sequence(self.session_id),
-            provider=decision.provider,
-            native_session_id=result.native_session_id,
-            context_text=context.text,
-        )
-        self.store.add_checkpoint(checkpoint)
-        completed_material_digest, unused_summary = await asyncio.to_thread(
-            inspect_workspace,
-            Path(current.worktree),
-        )
-        del unused_summary
-        self.store.append_event(
-            self.session_id,
-            "checkpoint.created",
-            status="complete",
-            metadata=checkpoint.as_dict(),
-            turn_id=turn_id,
-        )
         self.store.update_session(
             self.session_id,
             attention=Attention.IDLE,
@@ -1387,6 +1469,8 @@ class SessionWorker:
         turn_id: str,
         provider: str,
         reason: str,
+        *,
+        command_error: HarnessError | None = None,
     ) -> str:
         manager = ReconciliationManager(self.store, self.blobs)
         recovery = await manager.recover_after_restart(self.session_id)
@@ -1400,6 +1484,12 @@ class SessionWorker:
         )
         if record is None:
             raise RuntimeError("ambiguous dispatch did not create reconciliation")
+        if command_error is not None:
+            self.store.set_reconciliation_command_error(
+                record.reconciliation_id,
+                command_error.detail.code,
+                command_error.detail.message,
+            )
         self.store.finish_turn(turn_id, "ambiguous")
         self.store.update_session(
             self.session_id,
@@ -1565,6 +1655,8 @@ class SessionWorker:
                 role="user",
                 text=text,
                 status="complete",
+                metadata={"target_command_id": self._active_command_id},
+                turn_id=self._active_turn_id,
             )
         elif command.command_type == "pause":
             self.store.update_session(
@@ -1682,14 +1774,21 @@ class SessionWorker:
         if lineage:
             inherited_context_digest = str(lineage["source_context_digest"])
             inherited_context = self.blobs.get_text(inherited_context_digest)
-        instruction_sequence = self.store.command_instruction_sequence(
+        try:
+            instruction_sequence = self.store.command_instruction_sequence(
+                self.session_id,
+                command_id,
+            )
+        except NotFoundError:
+            instruction_sequence = self.store.repair_command_instruction_event(
+                self.session_id,
+                command_id,
+            )
+        context_events = self.store.context_events_for_command(
             self.session_id,
             command_id,
-        )
-        context_events = self.store.context_events(
-            self.session_id,
+            instruction_sequence,
             limit=5000,
-            before_sequence=instruction_sequence,
         )
         before_sequence = 0
         if context_events:
@@ -1749,31 +1848,26 @@ class SessionWorker:
             raise SafetyGuardError(
                 "dispatch-transition-stage-mismatch",
                 "automatic routing",
-                recoverable=False,
             )
         if transition == "epoch-mismatch":
             raise SafetyGuardError(
                 "dispatch-transition-epoch-mismatch",
                 "automatic routing",
-                recoverable=False,
             )
         if transition == "already-consumed":
             raise SafetyGuardError(
                 "dispatch-transition-already-consumed",
                 "automatic routing",
-                recoverable=False,
             )
         if transition == "command-mismatch":
             raise SafetyGuardError(
                 "dispatch-transition-command-mismatch",
                 "automatic routing",
-                recoverable=False,
             )
         if transition == "material-mismatch":
             raise SafetyGuardError(
                 "dispatch-transition-material-mismatch",
                 "automatic routing",
-                recoverable=False,
             )
         generation = self._dispatch_generation(
             workspace,
@@ -1842,7 +1936,6 @@ class SessionWorker:
             raise SafetyGuardError(
                 "repeated-" + repeated_component,
                 "automatic routing",
-                recoverable=False,
             )
         self.store.append_event(
             self.session_id,
@@ -1888,7 +1981,6 @@ class SessionWorker:
             raise SafetyGuardError(
                 "repeated-tool-result",
                 "automatic routing",
-                recoverable=False,
             )
         self.store.append_event(
             self.session_id,

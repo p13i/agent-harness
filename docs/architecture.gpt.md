@@ -6,7 +6,7 @@ provider transcript is the canonical database.
 
 ## State layers
 
-SQLite schema version 4 in WAL mode stores the session UUID,
+SQLite schema version 5 in WAL mode stores the session UUID,
 optional external orchestration reference, ordered event
 log, commands and turn references, goals, evidence,
 approvals, provider attempts, pre-dispatch checkpoints,
@@ -46,21 +46,31 @@ adapter submits that package as a new provider turn. Full
 observable history stays in the harness even when only a
 bounded subset fits into the target context window.
 
-Each context package has a durable `prepared` or `delivered`
-lifecycle keyed by its checkpoint generation and payload
-digest. The worker prepares it before launch and marks it
-delivered only after the adapter emits
+Each provider submission has a durable delivery row. A
+`context-package` delivery binds a compiled provider-change
+package; a `native-resume` delivery binds the new
+instruction sent to an existing provider session. The worker
+retains a known-undelivered prior attempt as `superseded`
+when it safely retries and never deletes its evidence. A
+pre-v5 crossed dispatch on a still-dispatching command with
+no delivery row is backfilled as `legacy-ambiguous`; it
+requires reconciliation and is never inferred to be
+unstarted. Terminal historical commands are not backfilled.
+The delivery record exposes its transport kind and a
+distinct payload digest. The worker prepares it before
+launch and marks it delivered only after the adapter emits
 `provider.prompt.accepted`. Claude emits that acknowledgment
 after its prompt stream is accepted; Codex emits it only
 after `turn/start` returns a nonempty turn ID. Recovery and
 provider-error events cannot acknowledge context. A crossed
 provider boundary without that acknowledgment is ambiguous
-and cannot silently resend the package. Incremental
-Claude-to-Codex-to-Claude transfers receive distinct payload
-digests and remain independently inspectable. The proof
-projection binds each delivery to its command, turn,
-attempt, provider, checkpoint, context, and payload. It
-exposes a stable `idempotency_digest` for that binding and a
+and cannot silently resend the submission. Incremental
+Claude-to-Codex-to-Claude transfers and same-provider native
+resumes receive distinct delivery identities and remain
+independently inspectable. The proof projection binds each
+delivery to its command, turn, attempt, provider,
+checkpoint, context, and payload. It exposes a stable
+`idempotency_digest` for that binding and a
 `context_delivery_digest` that also covers the explicit
 lifecycle and acceptance timestamps.
 
@@ -213,9 +223,21 @@ dollar budgets clamp the one-time session envelope. Durable
 envelope consumption from failed as well as completed
 commands counts toward those goal limits. A command cannot
 authorize metered credits with a zero or negative budget.
-Explicit effort pins remain unchanged during failover, and
-every recovery attempt repeats concurrency admission while
-excluding only its own durable command.
+An explicit effort pin remains unchanged during provider
+failover. Before provider acceptance, soft stagnation may
+lower an unpinned effort once and then change provider once.
+Those attempts share the original durable envelope. Every
+recovery attempt repeats concurrency admission while
+excluding only its own durable command. Hard limits and
+repeated instruction, context, plan, skill, cycle, or tool
+result digests never enter that recovery ladder.
+
+Proof command rows use `command_envelope_version` 2. An
+absent version denotes the legacy version 1 shape.
+`legacy_command_envelope_digest` retains the version 1
+normalization for historical verification, while
+`command_envelope_digest` binds the version 2 request and
+immutable execution profile.
 
 Child-agent admission occurs before provider execution.
 Claude uses a pre-tool hook for Agent and `spawn_agent`;
@@ -229,6 +251,18 @@ stream records stable child call identities, native thread
 identities, parent command/turn/attempt joins, terminal
 state, and numeric usage.
 
+A non-stagnation safety stop before
+`provider.prompt.accepted` retains `E_SAFETY_GUARD` without
+another provider attempt. Pre-acceptance stagnation may use
+the bounded shared-envelope recovery ladder. After
+acknowledgment, a guard stop retains `E_SAFETY_GUARD` and
+adds a `reconciliation_id` while the provider outcome is
+ambiguous. It blocks another message until that retained
+reconciliation is resolved. A guard stop detected after a
+known terminal provider result records a post-turn
+checkpoint, returns `E_SAFETY_GUARD`, and never retries that
+result.
+
 Dispatch repetition records instruction, compiled context,
 workspace-instruction, plan, and skill digests. Managed
 turns bind those digests to their durable `turn_ref`, so an
@@ -239,27 +273,29 @@ provider file-change notification clears within-turn tool
 repetition history only after an independently recomputed
 workspace digest changed.
 
-Eligible soft failures may lower effort once on the same
-provider and then use one alternate provider. Neither step
-creates a new envelope. Hard limits interrupt the active
-process, checkpoint observable work, and pause. Unattended
-effort at or above xhigh requires one explicit authorization,
-which one command consumes.
+Provider unavailability before acknowledgment may use an
+alternate provider under the same envelope. Guard failures
+other than pre-acceptance stagnation never use the
+alternate-provider path. Pre-acceptance stagnation may
+change provider once under the original envelope. Hard
+limits interrupt the active process, checkpoint observable
+work, and pause.
+Unattended effort at or above xhigh requires one explicit
+authorization, which one command consumes.
 
 All harness-managed background provider processes hold a
 durable lease containing provider, profile, PID, PID start
-identity, heartbeat expiry, and session. Machines
-launchers use the same lease contract, and a host watchdog
-terminates unleased background processes after a grace
-period. Foreground terminal sessions are outside that
-watchdog policy. Restart recovery verifies the recorded
-leader and its entire process group before releasing a
-lease. A dead leader with surviving group members or an
-unverifiable identity moves the lease to the durable
-`recovery-blocked` state. Worker supervision excludes that
-session until the exact lease is explicitly released, and
-reports the block through health state without repeatedly
-spawning a worker.
+identity, heartbeat expiry, and session. Machines launchers
+use the same lease contract, and a host watchdog terminates
+unleased background processes after a grace period.
+Foreground terminal sessions are outside that watchdog
+policy. Restart recovery verifies the recorded leader and
+its entire process group before releasing a lease. A dead
+leader with surviving group members or an unverifiable
+identity moves the lease to the durable `recovery-blocked`
+state. Worker supervision excludes that session until the
+exact lease is explicitly released, and reports the block
+through health state without repeatedly spawning a worker.
 
 ## Goals
 

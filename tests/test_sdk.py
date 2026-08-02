@@ -170,7 +170,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
     ):
         requests.append((method, path, payload, idempotency_key))
         if path == "/v1/capabilities":
-            return {"api_version": "1.10.0"}
+            return {"api_version": "1.11.0"}
         if path == "/v1/sessions" and method == "GET":
             return {"sessions": [{"session_id": "session-1"}]}
         if path == "/v1/sessions?archived=1":
@@ -285,7 +285,7 @@ def test_typed_sdk_covers_the_complete_control_plane(
     monkeypatch.setattr(client.raw, "request", request)
 
     async def scenario() -> None:
-        assert (await client.capabilities())["api_version"] == "1.10.0"
+        assert (await client.capabilities())["api_version"] == "1.11.0"
         assert len(await client.list_sessions()) == 1
         assert len(await client.list_sessions(include_archived=True)) == 1
         external = await client.session_by_external_ref(

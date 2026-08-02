@@ -389,16 +389,6 @@ def test_context_delivery_missing_writes_roll_back_atomically(
     )
     assert prepared["state"] == "prepared"
 
-    replaced = store.prepare_context_delivery(
-        created.session_id,
-        "codex",
-        "context-a",
-        "checkpoint-b",
-        "command-b",
-        "attempt-b",
-        "payload-b",
-    )
-    assert replaced["attempt_id"] == "attempt-b"
     with store.transaction() as connection:
         connection.execute(
             """
@@ -415,7 +405,7 @@ def test_context_delivery_missing_writes_roll_back_atomically(
             created.session_id,
             "codex",
             "context-a",
-            "attempt-b",
+            "attempt-a",
         )
     with store.transaction() as connection:
         connection.execute("DROP TRIGGER erase_accepted_context")
@@ -423,10 +413,10 @@ def test_context_delivery_missing_writes_roll_back_atomically(
         created.session_id,
         "codex",
         "context-a",
-        "checkpoint-b",
-        "command-b",
-        "attempt-b",
-        "payload-b",
+        "checkpoint-a",
+        "command-a",
+        "attempt-a",
+        "payload-a",
     )["state"] == "prepared"
     store.close()
 
