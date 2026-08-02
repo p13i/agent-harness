@@ -3,32 +3,33 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
 import signal
 import socket
+from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
-from agent_harness.config import HarnessPaths
-from agent_harness.config import API_VERSION
-from agent_harness.config import CONTROL_BUILD_ID
-from agent_harness.config import CONTROL_PROTOCOL_VERSION
-from agent_harness.config import api_token
-from agent_harness.config import public_paths
+from agent_harness.config import (
+    API_VERSION,
+    CONTROL_BUILD_ID,
+    CONTROL_PROTOCOL_VERSION,
+    HarnessPaths,
+    api_token,
+    public_paths,
+    runtime_build_id,
+)
 from agent_harness.errors import HarnessError
 from agent_harness.ids import new_uuid
 from agent_harness.service import HarnessService
-from agent_harness.sync import publish_all
-from agent_harness.sync import read_sync_status
-from agent_harness.terminal import terminal_socket
 from agent_harness.storage import SCHEMA_VERSION
-
+from agent_harness.sync import publish_all, read_sync_status
+from agent_harness.terminal import terminal_socket
 
 STREAM_HEARTBEAT_LIMIT = 3600
 
@@ -51,9 +52,7 @@ def create_app(
         request["correlation_id"] = correlation_id[:128]
         response = await handler(request)
         if not response.prepared:
-            response.headers["X-Correlation-ID"] = request[
-                "correlation_id"
-            ]
+            response.headers["X-Correlation-ID"] = request["correlation_id"]
         return response
 
     @web.middleware
@@ -152,6 +151,7 @@ def create_app(
         _set_ui_state,
     )
     app.router.add_get("/v1/sessions/{session_id}/events", _events)
+    app.router.add_get("/v1/sessions/{session_id}/proof", _proof)
     app.router.add_get("/v1/sessions/{session_id}/turns", _turns)
     app.router.add_get(
         "/v1/sessions/{session_id}/turns/{turn_id}",
@@ -173,6 +173,22 @@ def create_app(
         _resolve_approval,
     )
     app.router.add_get("/v1/sessions/{session_id}/goal", _goal)
+    app.router.add_post(
+        "/v1/sessions/{session_id}/goal/promotions",
+        _promote_goal,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/contract-adoptions",
+        _adopt_session_contract,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/dispatch-invalidations",
+        _invalidate_dispatch_generation,
+    )
+    app.router.add_get(
+        "/v1/sessions/{session_id}/dispatch-transition-anchor",
+        _dispatch_transition_anchor,
+    )
     app.router.add_get(
         "/v1/sessions/{session_id}/usage",
         _session_usage,
@@ -252,7 +268,8 @@ async def run_daemon(
     await unix_site.start()
     os.chmod(paths.socket, 0o600)
     _write_daemon_pid(paths.daemon_pid)
-    sync_task = asyncio.create_task(_sync_loop(service))
+    sync_task: asyncio.Task[None] | None = None
+    supervision_task: asyncio.Task[None] | None = None
     try:
         tcp_site: web.TCPSite | None = None
         if tcp_host:
@@ -262,14 +279,19 @@ async def run_daemon(
             tcp_site = web.TCPSite(runner, tcp_host, tcp_port)
             await tcp_site.start()
         service.recover_workers()
+        sync_task = asyncio.create_task(_sync_loop(service))
+        supervision_task = asyncio.create_task(_supervision_loop(service))
         stopped = asyncio.Event()
         loop = asyncio.get_running_loop()
         _register_stop_signals(loop, stopped)
         await stopped.wait()
     finally:
-        sync_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await sync_task
+        for task in (sync_task, supervision_task):
+            if task is None:
+                continue
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
         service.workers.stop_all()
         await asyncio.to_thread(
             publish_all,
@@ -285,14 +307,24 @@ async def run_daemon(
 
 async def _health(request: web.Request) -> web.Response:
     service = _service(request)
+    supervision = service.worker_supervision()
+    status = "ok"
+    response_status = 200
+    if supervision["unrecovered"]:
+        status = "failed"
+        response_status = 503
     return web.json_response(
         {
-            "status": "ok",
+            "status": status,
             "control_build_id": CONTROL_BUILD_ID,
+            "runtime_build_id": runtime_build_id(),
             "control_protocol_version": CONTROL_PROTOCOL_VERSION,
             "state_root": str(service.paths.state_dir),
+            "quiescence": service.quiescence(),
             "sync": read_sync_status(service.paths),
-        }
+            "worker_supervision": supervision,
+        },
+        status=response_status,
     )
 
 
@@ -354,18 +386,44 @@ async def _sync_now(request: web.Request) -> web.Response:
 
 async def _sync_loop(service: HarnessService) -> None:
     while True:
-        await asyncio.to_thread(
-            publish_all,
-            service.paths,
-            service.store,
-        )
+        try:
+            await asyncio.to_thread(
+                publish_all,
+                service.paths,
+                service.store,
+            )
+        except (OSError, RuntimeError):
+            pass
         await asyncio.sleep(30)
+
+
+async def _supervision_loop(service: HarnessService) -> None:
+    while True:
+        try:
+            service.supervise_workers()
+        except Exception as error:
+            service.record_worker_supervision_failure(error)
+        await asyncio.sleep(1)
 
 
 async def _ready(request: web.Request) -> web.Response:
     service = _service(request)
     service.store.list_sessions()
-    return web.json_response({"status": "ready"})
+    supervision = service.worker_supervision()
+    if supervision["unrecovered"]:
+        return web.json_response(
+            {
+                "status": "not-ready",
+                "worker_supervision": supervision,
+            },
+            status=503,
+        )
+    return web.json_response(
+        {
+            "status": "ready",
+            "worker_supervision": supervision,
+        }
+    )
 
 
 async def _sessions(request: web.Request) -> web.Response:
@@ -377,8 +435,7 @@ async def _sessions(request: web.Request) -> web.Response:
     if orchestrator or job_id:
         if not orchestrator or not job_id:
             raise ValueError(
-                "external_orchestrator and external_job_id are "
-                "both required"
+                "external_orchestrator and external_job_id are both required"
             )
         external_ref = {
             "orchestrator": orchestrator,
@@ -388,9 +445,7 @@ async def _sessions(request: web.Request) -> web.Response:
         include_archived,
         external_ref=external_ref,
     )
-    return web.json_response(
-        {"sessions": [item.as_dict() for item in sessions]}
-    )
+    return web.json_response({"sessions": [item.as_dict() for item in sessions]})
 
 
 async def _create_session(request: web.Request) -> web.Response:
@@ -473,9 +528,7 @@ def _session_archive_response(
 
 
 async def _ui_state(request: web.Request) -> web.Response:
-    state = _service(request).ui_state(
-        request.match_info["session_id"]
-    )
+    state = _service(request).ui_state(request.match_info["session_id"])
     return web.json_response({"ui_state": state})
 
 
@@ -496,17 +549,28 @@ async def _events(request: web.Request) -> web.Response:
         after=after,
         limit=limit,
     )
-    return web.json_response(
-        {"events": [item.as_dict() for item in events]}
+    return web.json_response({"events": [item.as_dict() for item in events]})
+
+
+async def _proof(request: web.Request) -> web.Response:
+    through_value = request.query.get("through_sequence")
+    through_sequence = None
+    if through_value is not None:
+        through_sequence = _integer(through_value)
+    value = _service(request).proof(
+        request.match_info["session_id"],
+        after_sequence=_integer(request.query.get("after_sequence", "0")),
+        event_limit=_integer(request.query.get("event_limit", "1000")),
+        through_sequence=through_sequence,
+        snapshot_id=request.query.get("snapshot_id", ""),
     )
+    return web.json_response({"proof": value})
 
 
 async def _turns(request: web.Request) -> web.Response:
     value = _service(request).turns(
         request.match_info["session_id"],
-        after_sequence=_integer(
-            request.query.get("after_sequence", "0")
-        ),
+        after_sequence=_integer(request.query.get("after_sequence", "0")),
         limit=_integer(request.query.get("limit", "50")),
     )
     return web.json_response(value)
@@ -600,9 +664,7 @@ async def _command_status(request: web.Request) -> web.Response:
 
 async def _approvals(request: web.Request) -> web.Response:
     service = _service(request)
-    approvals = service.store.pending_approvals(
-        request.match_info["session_id"]
-    )
+    approvals = service.store.pending_approvals(request.match_info["session_id"])
     return web.json_response({"approvals": approvals})
 
 
@@ -638,9 +700,7 @@ async def _goal(request: web.Request) -> web.Response:
 
 
 async def _session_usage(request: web.Request) -> web.Response:
-    safety = _service(request).safety_state(
-        request.match_info["session_id"]
-    )
+    safety = _service(request).safety_state(request.match_info["session_id"])
     return web.json_response({"safety": safety})
 
 
@@ -648,14 +708,14 @@ async def _budget_extension(request: web.Request) -> web.Response:
     payload = await _body(request)
     return _idempotent_response(
         request,
-        "budget-extension:"
-        + request.match_info["session_id"],
+        "budget-extension:" + request.match_info["session_id"],
         payload,
         201,
         lambda: {
             "safety": _service(request).extend_budget(
                 request.match_info["session_id"],
                 payload,
+                idempotency_key=_idempotency_key(request),
             )
         },
     )
@@ -664,18 +724,49 @@ async def _budget_extension(request: web.Request) -> web.Response:
 async def _evidence(request: web.Request) -> web.Response:
     payload = await _body(request)
     session_id = request.match_info["session_id"]
-    return _optional_idempotent_response(
-        request,
-        "evidence-create:" + session_id,
+    evidence = _service(request).add_evidence(
+        session_id,
         payload,
-        201,
-        lambda: {
-            "evidence": _service(request).add_evidence(
-                session_id,
-                payload,
-            )
-        },
+        idempotency_key=request.headers.get("Idempotency-Key", ""),
     )
+    return web.json_response({"evidence": evidence}, status=201)
+
+
+async def _promote_goal(request: web.Request) -> web.Response:
+    payload = await _body(request)
+    result = _service(request).promote_goal(
+        request.match_info["session_id"],
+        payload,
+        idempotency_key=_idempotency_key(request),
+    )
+    return web.json_response(result, status=201)
+
+
+async def _adopt_session_contract(request: web.Request) -> web.Response:
+    payload = await _body(request)
+    result = _service(request).adopt_session_contract(
+        request.match_info["session_id"],
+        payload,
+        idempotency_key=_idempotency_key(request),
+    )
+    return web.json_response(result, status=201)
+
+
+async def _invalidate_dispatch_generation(request: web.Request) -> web.Response:
+    payload = await _body(request)
+    result = _service(request).invalidate_dispatch_generation(
+        request.match_info["session_id"],
+        payload,
+        idempotency_key=_idempotency_key(request),
+    )
+    return web.json_response({"invalidation": result}, status=201)
+
+
+async def _dispatch_transition_anchor(request: web.Request) -> web.Response:
+    anchor = _service(request).dispatch_transition_anchor(
+        request.match_info["session_id"]
+    )
+    return web.json_response({"transition_anchor": anchor})
 
 
 async def _export(request: web.Request) -> web.Response:
@@ -696,9 +787,7 @@ async def _checkpoint(request: web.Request) -> web.Response:
         "checkpoint-create:" + session_id,
         {},
         201,
-        lambda: {
-            "checkpoint": _service(request).checkpoint(session_id)
-        },
+        lambda: {"checkpoint": _service(request).checkpoint(session_id)},
     )
 
 
@@ -721,9 +810,7 @@ async def _fork(request: web.Request) -> web.Response:
         payload,
         201,
         lambda: {
-            "session": _service(request)
-            .fork_session(session_id, payload)
-            .as_dict()
+            "session": _service(request).fork_session(session_id, payload).as_dict()
         },
     )
 
@@ -744,9 +831,7 @@ async def _providers(request: web.Request) -> web.Response:
 
 
 async def _leases(request: web.Request) -> web.Response:
-    return web.json_response(
-        {"leases": _service(request).process_leases()}
-    )
+    return web.json_response({"leases": _service(request).process_leases()})
 
 
 async def _create_lease(request: web.Request) -> web.Response:
@@ -756,11 +841,7 @@ async def _create_lease(request: web.Request) -> web.Response:
         "lease-create",
         payload,
         201,
-        lambda: {
-            "lease": _service(request).create_process_lease(
-                payload
-            )
-        },
+        lambda: {"lease": _service(request).create_process_lease(payload)},
     )
 
 
@@ -782,9 +863,7 @@ async def _update_lease(request: web.Request) -> web.Response:
 
 async def _registry(request: web.Request) -> web.Response:
     service = _service(request)
-    return web.json_response(
-        {"entries": service.store.registry_entries()}
-    )
+    return web.json_response({"entries": service.store.registry_entries()})
 
 
 async def _fleet_keys(request: web.Request) -> web.Response:
@@ -815,9 +894,7 @@ async def _import_transfer(request: web.Request) -> web.Response:
         "transfer-import",
         payload,
         201,
-        lambda: {
-            "transfer": _service(request).import_transfer(payload)
-        },
+        lambda: {"transfer": _service(request).import_transfer(payload)},
     )
 
 
@@ -864,29 +941,19 @@ async def _resolve_reconciliation(
 ) -> web.Response:
     payload = await _body(request)
     reconciliation_id = request.match_info["reconciliation_id"]
-    return await _async_idempotent_response(
-        request,
-        "reconciliation-resolve:" + reconciliation_id,
-        payload,
-        200,
-        lambda: _resolved_reconciliation(
-            request,
-            reconciliation_id,
-            payload,
-        ),
-    )
-
-
-async def _resolved_reconciliation(
-    request: web.Request,
-    reconciliation_id: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
     record = await _service(request).resolve_reconciliation(
         reconciliation_id,
         payload,
+        idempotency_key=_idempotency_key(request),
+        request_digest=hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
     )
-    return {"reconciliation": record}
+    return web.json_response({"reconciliation": record})
 
 
 async def _body(request: web.Request) -> dict[str, Any]:
@@ -929,18 +996,11 @@ def _idempotent_response(
     ).encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     store = _service(request).store
-    receipt = store.mutation_receipt(key, operation, digest)
-    if receipt is not None:
-        return web.json_response(
-            receipt["response"],
-            status=receipt["status_code"],
-        )
-    response = mutate()
-    receipt = store.record_mutation_receipt(
+    receipt = store.idempotent_mutation(
         key,
         operation,
         digest,
-        response,
+        mutate,
         status,
     )
     return web.json_response(
@@ -965,41 +1025,6 @@ def _optional_idempotent_response(
             mutate,
         )
     return web.json_response(mutate(), status=status)
-
-
-async def _async_idempotent_response(
-    request: web.Request,
-    operation: str,
-    payload: dict[str, Any],
-    status: int,
-    mutate: Any,
-) -> web.Response:
-    key = _idempotency_key(request)
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = hashlib.sha256(encoded).hexdigest()
-    store = _service(request).store
-    receipt = store.mutation_receipt(key, operation, digest)
-    if receipt is not None:
-        return web.json_response(
-            receipt["response"],
-            status=receipt["status_code"],
-        )
-    response = await mutate()
-    receipt = store.record_mutation_receipt(
-        key,
-        operation,
-        digest,
-        response,
-        status,
-    )
-    return web.json_response(
-        receipt["response"],
-        status=receipt["status_code"],
-    )
 
 
 def _integer(value: str) -> int:

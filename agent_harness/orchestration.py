@@ -6,7 +6,6 @@ import hashlib
 import json
 from typing import Any
 
-
 MAX_ORCHESTRATOR_LENGTH = 128
 MAX_JOB_ID_LENGTH = 256
 MAX_STEP_ID_LENGTH = 256
@@ -31,9 +30,7 @@ def normalize_external_ref(value: object) -> dict[str, str]:
     if not orchestrator and not job_id:
         return {}
     if not orchestrator or not job_id:
-        raise ValueError(
-            "external_ref requires both orchestrator and job_id"
-        )
+        raise ValueError("external_ref requires both orchestrator and job_id")
     return {
         "orchestrator": orchestrator,
         "job_id": job_id,
@@ -63,6 +60,30 @@ def normalize_turn_ref(value: object) -> dict[str, str]:
         "step_id": step_id,
         "agent_role": agent_role,
     }
+
+
+def normalize_command_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    turn_ref = normalize_turn_ref(payload.get("turn_ref"))
+    if turn_ref:
+        normalized["turn_ref"] = turn_ref
+    else:
+        normalized.pop("turn_ref", None)
+    return normalized
+
+
+def command_envelope_digest(
+    command_type: str,
+    payload: dict[str, Any],
+    execution_profile: str,
+) -> str:
+    return normalized_digest(
+        {
+            "command_type": command_type,
+            "payload": normalize_command_payload(payload),
+            "execution_profile": execution_profile,
+        }
+    )
 
 
 def normalize_creation_input(value: dict[str, Any]) -> dict[str, Any]:
@@ -122,10 +143,7 @@ def _identifier(value: object, field: str, maximum: int) -> str:
 
 
 def _normalized_object(value: dict[str, Any]) -> dict[str, Any]:
-    return {
-        str(key): _normalized_value(item)
-        for key, item in sorted(value.items())
-    }
+    return {str(key): _normalized_value(item) for key, item in sorted(value.items())}
 
 
 def _normalized_value(value: Any) -> Any:

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import json
-from pathlib import Path
+import math
+import os
+import stat
 import subprocess
-from typing import Any
+import sys
 import urllib.error
 import urllib.request
-
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -40,6 +43,17 @@ async def probe_all() -> dict[str, UsageSnapshot]:
         _timed_probe("claude", _probe_claude),
     )
     return {item.provider: item for item in results}
+
+
+def provider_auth_ready(provider: str) -> bool:
+    """Return whether a provider has its required local launch credential."""
+    if provider == "claude":
+        token = _claude_token()
+        return bool(token)
+    if provider == "codex":
+        token, account_id = _codex_credentials()
+        return bool(token and account_id)
+    raise ValueError("unknown provider: " + provider)
 
 
 async def _timed_probe(
@@ -178,9 +192,7 @@ def _json_get(url: str, headers: dict[str, str]) -> dict[str, Any]:
 def _codex_credentials() -> tuple[str | None, str | None]:
     try:
         payload = json.loads(
-            (Path.home() / ".codex" / "auth.json").read_text(
-                encoding="utf-8"
-            )
+            (Path.home() / ".codex" / "auth.json").read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError):
         return None, None
@@ -195,6 +207,15 @@ def _codex_credentials() -> tuple[str | None, str | None]:
 
 
 def _claude_token() -> str | None:
+    environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if environment_token:
+        return environment_token
+    if sys.platform != "darwin":
+        return _claude_file_token(Path.home() / ".claude" / ".credentials.json")
+    return _claude_keychain_token()
+
+
+def _claude_keychain_token() -> str | None:
     try:
         completed = subprocess.run(
             (
@@ -224,6 +245,25 @@ def _claude_token() -> str | None:
     return token
 
 
+def _claude_file_token(path: Path) -> str | None:
+    try:
+        if path.is_symlink():
+            return None
+        details = path.stat()
+        if details.st_size > 1024 * 1024:
+            return None
+        if stat.S_IMODE(details.st_mode) & 0o077:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    oauth = _object(payload.get("claudeAiOauth"))
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token.strip():
+        return None
+    return token
+
+
 def _object(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -234,7 +274,9 @@ def _number(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        normalized = float(value)
+        if math.isfinite(normalized) and normalized >= 0:
+            return normalized
     return None
 
 
@@ -267,9 +309,7 @@ def _public_payload(
         result["credits"] = {
             "has_credits": credits.get("has_credits"),
             "unlimited": credits.get("unlimited"),
-            "overage_limit_reached": credits.get(
-                "overage_limit_reached"
-            ),
+            "overage_limit_reached": credits.get("overage_limit_reached"),
         }
     if provider == "claude":
         for name in (

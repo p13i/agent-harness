@@ -2,37 +2,58 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import replace
+import datetime
+import hashlib
 import json
 import os
-from pathlib import Path
 import sqlite3
 import threading
-from typing import Any
-from typing import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Callable, Iterator
 
-from agent_harness.errors import ConflictError
-from agent_harness.errors import NotFoundError
-from agent_harness.ids import new_uuid
-from agent_harness.ids import utc_now
-from agent_harness.models import Checkpoint
-from agent_harness.models import CommandReceipt
-from agent_harness.models import CommandStatus
-from agent_harness.models import Evidence
-from agent_harness.models import Goal
-from agent_harness.models import ProviderAttempt
-from agent_harness.models import ReconciliationRecord
-from agent_harness.models import ReconciliationStatus
-from agent_harness.models import RestartRecovery
-from agent_harness.models import Session
-from agent_harness.models import SessionEvent
-from agent_harness.orchestration import creation_digest
-from agent_harness.orchestration import normalize_external_ref
-from agent_harness.orchestration import normalize_turn_ref
+from agent_harness.errors import (
+    ConflictError,
+    NotFoundError,
+    WorkerOwnershipLostError,
+)
+from agent_harness.goals import goal_contract_digest
+from agent_harness.ids import new_uuid, utc_now
+from agent_harness.models import (
+    Attention,
+    Checkpoint,
+    CommandReceipt,
+    CommandStatus,
+    Evidence,
+    Goal,
+    GoalStatus,
+    Lifecycle,
+    Milestone,
+    ProviderAttempt,
+    ReconciliationDecision,
+    ReconciliationRecord,
+    ReconciliationStatus,
+    RestartRecovery,
+    Session,
+    SessionEvent,
+)
+from agent_harness.orchestration import (
+    command_envelope_digest,
+    creation_digest,
+    normalize_command_payload,
+    normalize_external_ref,
+    normalize_turn_ref,
+    normalized_digest,
+)
+from agent_harness.workspace_state import inspect_workspace
 
-
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+PROOF_SNAPSHOT_MAX_PER_SESSION = 128
+PROOF_SNAPSHOT_RETENTION_HOURS = 336
+TRANSITION_CONTROL_COMMANDS = frozenset(
+    {"interrupt", "pause", "resume", "stop", "steer"}
+)
 
 PORTABLE_SESSION_TABLES = (
     "sessions",
@@ -41,12 +62,23 @@ PORTABLE_SESSION_TABLES = (
     "events",
     "commands",
     "goals",
+    "goal_promotions",
+    "goal_contract_adoptions",
+    "goal_milestones",
     "milestones",
     "evidence",
+    "goal_promotion_evidence",
+    "dispatch_transition_policies",
+    "authorization_receipts",
+    "dispatch_invalidations",
+    "dispatch_transition_ledger",
     "approvals",
     "checkpoints",
     "session_safety",
+    "xhigh_authorization_receipts",
     "command_envelopes",
+    "child_launch_gates",
+    "child_launch_admissions",
     "guard_incidents",
     "context_deliveries",
     "routing_decisions",
@@ -60,6 +92,41 @@ PORTABLE_SESSION_TABLES = (
 PORTABLE_GLOBAL_TABLES = (
     "usage_samples",
     "mutation_receipts",
+)
+_GOAL_PROMOTION_COLUMNS = (
+    "promotion_id",
+    "session_id",
+    "previous_goal_id",
+    "next_goal_id",
+    "stage",
+    "authorization_digest",
+    "request_digest",
+    "idempotency_key",
+    "previous_goal_digest",
+    "next_goal_digest",
+    "created_at",
+)
+_GOAL_PROMOTION_EVIDENCE_COLUMNS = (
+    "promotion_id",
+    "source_evidence_id",
+    "copied_evidence_id",
+    "value_digest",
+    "created_at",
+)
+_GOAL_CONTRACT_ADOPTION_COLUMNS = (
+    "adoption_id",
+    "session_id",
+    "previous_goal_id",
+    "next_goal_id",
+    "external_orchestrator",
+    "external_job_id",
+    "authorization_digest",
+    "request_digest",
+    "creation_digest",
+    "previous_goal_digest",
+    "next_goal_digest",
+    "idempotency_key",
+    "created_at",
 )
 
 
@@ -157,7 +224,50 @@ CREATE TABLE IF NOT EXISTS goals (
     predicates_json TEXT NOT NULL,
     budgets_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    permitted_providers_json TEXT NOT NULL DEFAULT '[]',
+    permitted_efforts_json TEXT NOT NULL DEFAULT '[]',
+    max_concurrency INTEGER NOT NULL DEFAULT 1,
+    completion_policy TEXT NOT NULL DEFAULT 'evidence-all',
+    incident_policy TEXT NOT NULL DEFAULT 'recover-then-pause'
+);
+CREATE TABLE IF NOT EXISTS goal_promotions (
+    promotion_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    previous_goal_id TEXT NOT NULL REFERENCES goals(goal_id),
+    next_goal_id TEXT NOT NULL REFERENCES goals(goal_id),
+    stage TEXT NOT NULL,
+    authorization_digest TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    previous_goal_digest TEXT NOT NULL,
+    next_goal_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_contract_adoptions (
+    adoption_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    previous_goal_id TEXT NOT NULL,
+    next_goal_id TEXT NOT NULL REFERENCES goals(goal_id),
+    external_orchestrator TEXT NOT NULL,
+    external_job_id TEXT NOT NULL,
+    authorization_digest TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    creation_digest TEXT NOT NULL,
+    previous_goal_digest TEXT NOT NULL,
+    next_goal_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_milestones (
+    goal_id TEXT NOT NULL REFERENCES goals(goal_id),
+    milestone_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    dependencies_json TEXT NOT NULL,
+    predicates_json TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY(goal_id, milestone_id)
 );
 CREATE TABLE IF NOT EXISTS milestones (
     milestone_id TEXT PRIMARY KEY,
@@ -176,6 +286,78 @@ CREATE TABLE IF NOT EXISTS evidence (
     outcome TEXT NOT NULL,
     value_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_promotion_evidence (
+    promotion_id TEXT NOT NULL REFERENCES goal_promotions(promotion_id),
+    source_evidence_id TEXT NOT NULL REFERENCES evidence(evidence_id),
+    copied_evidence_id TEXT NOT NULL UNIQUE REFERENCES evidence(evidence_id),
+    value_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(promotion_id, source_evidence_id)
+);
+CREATE TABLE IF NOT EXISTS authorization_receipts (
+    authorization_digest TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    operation TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    schema TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispatch_transition_policies (
+    policy_sha256 TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    goal_id TEXT NOT NULL REFERENCES goals(goal_id),
+    epoch_id TEXT NOT NULL,
+    schema TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, goal_id, epoch_id)
+);
+CREATE INDEX IF NOT EXISTS dispatch_transition_policies_session
+ON dispatch_transition_policies(session_id, goal_id, epoch_id);
+CREATE TABLE IF NOT EXISTS dispatch_invalidations (
+    invalidation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    reason TEXT NOT NULL,
+    authorization_digest TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispatch_transition_ledger (
+    invalidation_id TEXT PRIMARY KEY
+        REFERENCES dispatch_invalidations(invalidation_id),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    goal_id TEXT NOT NULL REFERENCES goals(goal_id),
+    epoch_id TEXT NOT NULL,
+    transition_sequence INTEGER NOT NULL,
+    policy_sha256 TEXT NOT NULL
+        REFERENCES dispatch_transition_policies(policy_sha256),
+    authorization_digest TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    prior_command_id TEXT NOT NULL,
+    prior_command_type TEXT NOT NULL,
+    prior_anchor_kind TEXT NOT NULL,
+    prior_reconciliation_id TEXT NOT NULL,
+    prior_reconciliation_resolution TEXT NOT NULL,
+    prior_checkpoint_id TEXT NOT NULL,
+    prior_generation_digest TEXT NOT NULL,
+    prior_material_digest TEXT NOT NULL,
+    next_turn_ref_json TEXT NOT NULL,
+    next_command_digest TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reserved_command_id TEXT NOT NULL,
+    consumed_command_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(session_id, goal_id, epoch_id, transition_sequence)
+);
+CREATE INDEX IF NOT EXISTS dispatch_transition_ledger_session
+ON dispatch_transition_ledger(
+    session_id, goal_id, epoch_id, transition_sequence
 );
 CREATE TABLE IF NOT EXISTS approvals (
     approval_id TEXT PRIMARY KEY,
@@ -218,6 +400,22 @@ CREATE TABLE IF NOT EXISTS session_safety (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS xhigh_authorization_receipts (
+    authorization_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    command_id TEXT NOT NULL UNIQUE REFERENCES commands(command_id),
+    provider TEXT NOT NULL,
+    effort TEXT NOT NULL,
+    command_request_digest TEXT NOT NULL,
+    authorization_request_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    consumed_attempt_id TEXT NOT NULL,
+    consumed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS xhigh_authorizations_pending
+ON xhigh_authorization_receipts(session_id, consumed_at, expires_at);
 CREATE TABLE IF NOT EXISTS command_envelopes (
     command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
     session_id TEXT NOT NULL REFERENCES sessions(session_id),
@@ -233,6 +431,24 @@ CREATE TABLE IF NOT EXISTS command_envelopes (
 );
 CREATE INDEX IF NOT EXISTS command_envelopes_active
 ON command_envelopes(provider, state, profile);
+CREATE TABLE IF NOT EXISTS child_launch_gates (
+    command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    permit_limit INTEGER NOT NULL,
+    consumed INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (permit_limit >= 0),
+    CHECK (consumed >= 0 AND consumed <= permit_limit)
+);
+CREATE TABLE IF NOT EXISTS child_launch_admissions (
+    command_id TEXT NOT NULL REFERENCES child_launch_gates(command_id),
+    admission_key TEXT NOT NULL,
+    admitted INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(command_id, admission_key),
+    CHECK (admitted IN (0, 1))
+);
 CREATE TABLE IF NOT EXISTS guard_incidents (
     incident_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id),
@@ -249,11 +465,19 @@ CREATE TABLE IF NOT EXISTS context_deliveries (
     context_digest TEXT NOT NULL,
     checkpoint_id TEXT NOT NULL,
     delivered_at TEXT NOT NULL,
+    command_id TEXT NOT NULL DEFAULT '',
+    attempt_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'delivered',
+    payload_digest TEXT NOT NULL DEFAULT '',
+    accepted_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(session_id, provider, context_digest)
 );
 CREATE TABLE IF NOT EXISTS process_leases (
     lease_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
+    command_id TEXT NOT NULL DEFAULT '',
+    attempt_id TEXT NOT NULL DEFAULT '',
+    worker_incarnation TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL,
     profile TEXT NOT NULL,
     pid INTEGER NOT NULL,
@@ -293,6 +517,16 @@ CREATE TABLE IF NOT EXISTS command_dispatches (
 );
 CREATE INDEX IF NOT EXISTS command_dispatches_command
 ON command_dispatches(command_id, crossed_boundary, state);
+CREATE TABLE IF NOT EXISTS proof_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    through_sequence INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS proof_snapshots_session
+ON proof_snapshots(session_id, created_at);
 CREATE TABLE IF NOT EXISTS reconciliations (
     reconciliation_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id),
@@ -361,6 +595,8 @@ class StateStore:
         os.chmod(path.parent, 0o700)
         self.path = path
         self._lock = threading.RLock()
+        self._transaction_depth = 0
+        self._savepoint_sequence = 0
         self._connection = sqlite3.connect(
             path,
             isolation_level=None,
@@ -381,22 +617,28 @@ class StateStore:
             connection = self._connection
             connection.executescript(SCHEMA)
         with self.transaction() as connection:
-            row = connection.execute(
-                "SELECT version FROM schema_meta"
-            ).fetchone()
+            row = connection.execute("SELECT version FROM schema_meta").fetchone()
             if row is None:
                 connection.execute(
                     "INSERT INTO schema_meta(version) VALUES (?)",
                     (SCHEMA_VERSION,),
                 )
-            elif int(row["version"]) in {1, 2}:
-                self._migrate_to_v3(connection)
-                connection.execute(
-                    "UPDATE schema_meta SET version = ?",
-                    (SCHEMA_VERSION,),
-                )
-            elif int(row["version"]) != SCHEMA_VERSION:
-                raise RuntimeError("unsupported database schema version")
+                self._migrate_to_v4(connection)
+            else:
+                version = int(row["version"])
+                if version in {1, 2}:
+                    self._migrate_to_v3(connection)
+                    version = 3
+                if version == 3:
+                    self._migrate_to_v4(connection)
+                    connection.execute(
+                        "UPDATE schema_meta SET version = ?",
+                        (SCHEMA_VERSION,),
+                    )
+                    version = SCHEMA_VERSION
+                if version != SCHEMA_VERSION:
+                    raise RuntimeError("unsupported database schema version")
+                self._migrate_to_v4(connection)
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS sessions_external_ref
@@ -405,6 +647,64 @@ class StateStore:
                 """
             )
         os.chmod(self.path, 0o600)
+
+    def _ensure_goal_policy_columns(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        for column, declaration in (
+            ("permitted_providers_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("permitted_efforts_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("max_concurrency", "INTEGER NOT NULL DEFAULT 1"),
+            (
+                "completion_policy",
+                "TEXT NOT NULL DEFAULT 'evidence-all'",
+            ),
+            (
+                "incident_policy",
+                "TEXT NOT NULL DEFAULT 'recover-then-pause'",
+            ),
+        ):
+            self._add_column(connection, "goals", column, declaration)
+
+    def _ensure_context_delivery_columns(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        for column, declaration in (
+            ("command_id", "TEXT NOT NULL DEFAULT ''"),
+            ("attempt_id", "TEXT NOT NULL DEFAULT ''"),
+            ("state", "TEXT NOT NULL DEFAULT 'delivered'"),
+            ("payload_digest", "TEXT NOT NULL DEFAULT ''"),
+            ("accepted_at", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            self._add_column(
+                connection,
+                "context_deliveries",
+                column,
+                declaration,
+            )
+
+    def _ensure_process_lease_columns(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        for column in (
+            "command_id",
+            "attempt_id",
+            "worker_incarnation",
+        ):
+            self._add_column(
+                connection,
+                "process_leases",
+                column,
+                "TEXT NOT NULL DEFAULT ''",
+            )
+
+    def _migrate_to_v4(self, connection: sqlite3.Connection) -> None:
+        self._ensure_goal_policy_columns(connection)
+        self._ensure_context_delivery_columns(connection)
+        self._ensure_process_lease_columns(connection)
 
     def _migrate_to_v3(self, connection: sqlite3.Connection) -> None:
         self._add_column(
@@ -459,32 +759,42 @@ class StateStore:
     ) -> None:
         columns = {
             str(row["name"])
-            for row in connection.execute(
-                "PRAGMA table_info(" + table + ")"
-            ).fetchall()
+            for row in connection.execute("PRAGMA table_info(" + table + ")").fetchall()
         }
         if column in columns:
             return
         connection.execute(
-            "ALTER TABLE "
-            + table
-            + " ADD COLUMN "
-            + column
-            + " "
-            + declaration
+            "ALTER TABLE " + table + " ADD COLUMN " + column + " " + declaration
         )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
+            outermost = self._transaction_depth == 0
+            savepoint = ""
+            if outermost:
+                self._connection.execute("BEGIN IMMEDIATE")
+            else:
+                self._savepoint_sequence += 1
+                savepoint = "nested_" + str(self._savepoint_sequence)
+                self._connection.execute("SAVEPOINT " + savepoint)
+            self._transaction_depth += 1
             try:
                 yield self._connection
             except BaseException:
-                self._connection.execute("ROLLBACK")
+                self._transaction_depth -= 1
+                if outermost:
+                    self._connection.execute("ROLLBACK")
+                else:
+                    self._connection.execute("ROLLBACK TO " + savepoint)
+                    self._connection.execute("RELEASE " + savepoint)
                 raise
             else:
-                self._connection.execute("COMMIT")
+                self._transaction_depth -= 1
+                if outermost:
+                    self._connection.execute("COMMIT")
+                else:
+                    self._connection.execute("RELEASE " + savepoint)
 
     def close(self) -> None:
         with self._lock:
@@ -492,9 +802,7 @@ class StateStore:
 
     def integrity_check(self) -> str:
         with self._lock:
-            row = self._connection.execute(
-                "PRAGMA quick_check"
-            ).fetchone()
+            row = self._connection.execute("PRAGMA quick_check").fetchone()
         if row is None:
             return ""
         return str(row[0])
@@ -564,14 +872,14 @@ class StateStore:
     ) -> tuple[Session, bool]:
         request_digest = creation_digest(creation_input)
         external_ref = normalize_external_ref(session.external_ref)
-        input_ref = normalize_external_ref(
-            creation_input.get("external_ref")
-        )
+        input_ref = normalize_external_ref(creation_input.get("external_ref"))
         if external_ref != input_ref:
-            raise ValueError(
-                "session and creation input external_ref must match"
-            )
-        normalized = replace(session, external_ref=external_ref)
+            raise ValueError("session and creation input external_ref must match")
+        normalized = replace(
+            session,
+            external_ref=external_ref,
+            creation_digest=request_digest,
+        )
         with self.transaction() as connection:
             if idempotency_key:
                 receipt = connection.execute(
@@ -592,9 +900,7 @@ class StateStore:
                         (receipt["session_id"],),
                     ).fetchone()
                     if existing is None:
-                        raise RuntimeError(
-                            "session creation receipt has no session"
-                        )
+                        raise RuntimeError("session creation receipt has no session")
                     return _session(existing), False
             if external_ref:
                 existing = connection.execute(
@@ -652,9 +958,7 @@ class StateStore:
         request_digest = creation_digest(creation_input)
         normalized_ref = normalize_external_ref(external_ref)
         if external_ref is None:
-            normalized_ref = normalize_external_ref(
-                creation_input.get("external_ref")
-            )
+            normalized_ref = normalize_external_ref(creation_input.get("external_ref"))
         by_key: Session | None = None
         by_reference: Session | None = None
         with self._lock:
@@ -677,9 +981,7 @@ class StateStore:
                         (receipt["session_id"],),
                     ).fetchone()
                     if row is None:
-                        raise RuntimeError(
-                            "session creation receipt has no session"
-                        )
+                        raise RuntimeError("session creation receipt has no session")
                     by_key = _session(row)
             if normalized_ref:
                 row = self._connection.execute(
@@ -706,8 +1008,7 @@ class StateStore:
             and by_key.session_id != by_reference.session_id
         ):
             raise ConflictError(
-                "idempotency key and external reference name "
-                "different sessions"
+                "idempotency key and external reference name different sessions"
             )
         if by_key is not None:
             return by_key
@@ -721,7 +1022,7 @@ class StateStore:
     ) -> None:
         external_ref = normalize_external_ref(session.external_ref)
         connection.execute(
-                """
+            """
                 INSERT INTO sessions(
                     session_id, name, workspace, worktree, lifecycle,
                     attention, permission_mode, active_provider, model,
@@ -733,28 +1034,28 @@ class StateStore:
                     ?, ?, ?
                 )
                 """,
-                (
-                    session.session_id,
-                    session.name,
-                    session.workspace,
-                    session.worktree,
-                    session.lifecycle,
-                    session.attention,
-                    session.permission_mode,
-                    session.active_provider,
-                    session.model,
-                    session.effort,
-                    session.goal_id,
-                    session.owner_host,
-                    session.owner_epoch,
-                    session.created_at,
-                    session.updated_at,
-                    int(session.archived),
-                    external_ref.get("orchestrator", ""),
-                    external_ref.get("job_id", ""),
-                    request_digest,
-                ),
-            )
+            (
+                session.session_id,
+                session.name,
+                session.workspace,
+                session.worktree,
+                session.lifecycle,
+                session.attention,
+                session.permission_mode,
+                session.active_provider,
+                session.model,
+                session.effort,
+                session.goal_id,
+                session.owner_host,
+                session.owner_epoch,
+                session.created_at,
+                session.updated_at,
+                int(session.archived),
+                external_ref.get("orchestrator", ""),
+                external_ref.get("job_id", ""),
+                request_digest,
+            ),
+        )
 
     def _insert_creation_receipt(
         self,
@@ -785,9 +1086,7 @@ class StateStore:
     ) -> Session:
         self.get_session(source_session_id)
         normalized_ref = normalize_external_ref(external_ref)
-        return self.create_session(
-            replace(fork, external_ref=normalized_ref)
-        )
+        return self.create_session(replace(fork, external_ref=normalized_ref))
 
     def get_session(self, session_id: str) -> Session:
         with self._lock:
@@ -850,9 +1149,7 @@ class StateStore:
                     "external_job_id = ?",
                 ]
             )
-            parameters.extend(
-                [normalized["orchestrator"], normalized["job_id"]]
-            )
+            parameters.extend([normalized["orchestrator"], normalized["job_id"]])
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY updated_at DESC, session_id"
@@ -896,9 +1193,7 @@ class StateStore:
         values.append(session_id)
         with self.transaction() as connection:
             cursor = connection.execute(
-                "UPDATE sessions SET "
-                + assignments
-                + " WHERE session_id = ?",
+                "UPDATE sessions SET " + assignments + " WHERE session_id = ?",
                 tuple(values),
             )
             if cursor.rowcount != 1:
@@ -991,6 +1286,183 @@ class StateStore:
             ).fetchall()
         return [_event(row) for row in rows]
 
+    def context_events(
+        self,
+        session_id: str,
+        *,
+        limit: int = 5000,
+    ) -> list[SessionEvent]:
+        bounded = max(1, min(limit, 5000))
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM events
+                WHERE session_id = ?
+                ORDER BY sequence DESC LIMIT ?
+                """,
+                (session_id, bounded),
+            ).fetchall()
+        rows.reverse()
+        return [_event(row) for row in rows]
+
+    def event_count(self, session_id: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["count"])
+
+    def fork_lineage(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT metadata_json FROM events
+                WHERE session_id = ? AND event_type = 'session.forked'
+                ORDER BY sequence LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return {}
+            metadata = _load_object(row["metadata_json"])
+            checkpoint_id = str(metadata.get("source_checkpoint_id", ""))
+            checkpoint = self._connection.execute(
+                "SELECT * FROM checkpoints WHERE checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+        if checkpoint is None:
+            raise ConflictError("fork source checkpoint is missing")
+        return {
+            "source_session_id": str(metadata.get("source_session_id", "")),
+            "source_sequence": int(metadata.get("source_sequence", 0)),
+            "source_checkpoint_id": checkpoint_id,
+            "source_context_digest": str(checkpoint["context_digest"]),
+        }
+
+    def context_history_summary(
+        self,
+        session_id: str,
+        before_sequence: int,
+    ) -> dict[str, Any]:
+        if before_sequence <= 0:
+            return {}
+        with self._lock:
+            aggregate = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count, MIN(sequence) AS first_sequence,
+                    MAX(sequence) AS last_sequence
+                FROM events WHERE session_id = ? AND sequence <= ?
+                """,
+                (session_id, before_sequence),
+            ).fetchone()
+            type_rows = self._connection.execute(
+                """
+                SELECT event_type, COUNT(*) AS count
+                FROM events WHERE session_id = ? AND sequence <= ?
+                GROUP BY event_type ORDER BY event_type
+                """,
+                (session_id, before_sequence),
+            ).fetchall()
+            digest_rows = self._connection.execute(
+                """
+                SELECT sequence, event_type, role, text, status,
+                    metadata_json, blob_digest, turn_id
+                FROM events WHERE session_id = ? AND sequence <= ?
+                ORDER BY sequence
+                """,
+                (session_id, before_sequence),
+            ).fetchall()
+            first_rows = self._connection.execute(
+                """
+                SELECT * FROM events
+                WHERE session_id = ? AND sequence <= ?
+                ORDER BY sequence LIMIT 20
+                """,
+                (session_id, before_sequence),
+            ).fetchall()
+            last_rows = self._connection.execute(
+                """
+                SELECT * FROM events
+                WHERE session_id = ? AND sequence <= ?
+                ORDER BY sequence DESC LIMIT 80
+                """,
+                (session_id, before_sequence),
+            ).fetchall()
+        if aggregate is None or int(aggregate["count"]) == 0:
+            return {}
+        anchor_rows: dict[int, sqlite3.Row] = {}
+        for row in [*first_rows, *last_rows]:
+            anchor_rows[int(row["sequence"])] = row
+        anchors = []
+        for sequence in sorted(anchor_rows):
+            event = _event(anchor_rows[sequence])
+            anchors.append(
+                {
+                    "sequence": event.sequence,
+                    "event_type": event.event_type,
+                    "role": event.role,
+                    "status": event.status,
+                    "text": event.text[:500],
+                    "metadata": _bounded_json_value(event.metadata),
+                }
+            )
+        history_digest = hashlib.sha256()
+        for row in digest_rows:
+            history_digest.update(
+                _dump(
+                    {
+                        "sequence": int(row["sequence"]),
+                        "event_type": str(row["event_type"]),
+                        "role": str(row["role"]),
+                        "text": str(row["text"]),
+                        "status": str(row["status"]),
+                        "metadata": _load_object(row["metadata_json"]),
+                        "blob_digest": str(row["blob_digest"]),
+                        "turn_id": str(row["turn_id"]),
+                    }
+                ).encode("utf-8")
+            )
+            history_digest.update(b"\n")
+        return {
+            "schema": "p13i/agent-harness/compacted-history/v1",
+            "event_count": int(aggregate["count"]),
+            "first_sequence": int(aggregate["first_sequence"]),
+            "last_sequence": int(aggregate["last_sequence"]),
+            "history_digest": history_digest.hexdigest(),
+            "event_type_counts": {
+                str(row["event_type"]): int(row["count"]) for row in type_rows
+            },
+            "anchors": anchors,
+        }
+
+    def context_unresolved_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for approval in self.pending_approvals(session_id):
+            result.append(
+                {
+                    "kind": "approval",
+                    "id": str(approval.get("approval_id", "")),
+                    "status": str(approval.get("status", "")),
+                    "method": str(approval.get("kind", "")),
+                    "prompt": str(approval.get("prompt", "")),
+                    "reason": str(approval.get("reason", "")),
+                    "created_at": str(approval.get("created_at", "")),
+                }
+            )
+        for reconciliation in self.pending_reconciliations(session_id):
+            result.append(
+                {
+                    "kind": "reconciliation",
+                    "id": reconciliation.reconciliation_id,
+                    "status": reconciliation.status,
+                    "command_id": reconciliation.command_id,
+                    "created_at": reconciliation.created_at,
+                }
+            )
+        result.sort(key=lambda item: (str(item["kind"]), str(item["id"])))
+        return result
+
     def all_events(self, session_id: str) -> list[SessionEvent]:
         with self._lock:
             rows = self._connection.execute(
@@ -1013,6 +1485,117 @@ class StateStore:
                 (session_id,),
             ).fetchone()
         return int(row["sequence"])
+
+    def proof_event_count(
+        self,
+        session_id: str,
+        through_sequence: int,
+    ) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM events
+                WHERE session_id = ? AND sequence <= ?
+                """,
+                (session_id, through_sequence),
+            ).fetchone()
+        return int(row["count"])
+
+    def proof_event_rows(
+        self,
+        session_id: str,
+        through_sequence: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("proof event limit must be positive")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM events
+                WHERE session_id = ? AND sequence <= ?
+                ORDER BY sequence LIMIT ?
+                """,
+                (session_id, through_sequence, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def proof_source(
+        self,
+        session_id: str,
+        through_sequence: int | None,
+        event_limit: int,
+    ) -> dict[str, Any]:
+        """Capture every proof input from one SQLite read snapshot."""
+        if event_limit < 1:
+            raise ValueError("proof event limit must be positive")
+        with self._lock:
+            self._connection.execute("BEGIN")
+            try:
+                initial_last_sequence = self.last_sequence(session_id)
+                selected_sequence = through_sequence
+                if selected_sequence is None:
+                    selected_sequence = initial_last_sequence
+                if selected_sequence < 0:
+                    raise ValueError("through_sequence must not be negative")
+                if selected_sequence > initial_last_sequence:
+                    raise ValueError(
+                        "through_sequence exceeds current session sequence"
+                    )
+                event_count = self.proof_event_count(
+                    session_id,
+                    selected_sequence,
+                )
+                if event_count != selected_sequence:
+                    raise ValueError("proof event sequence is not contiguous")
+                if event_count > event_limit:
+                    return {
+                        "through_sequence": selected_sequence,
+                        "event_count": event_count,
+                    }
+                session = self.get_session(session_id)
+                portable_session = self.portable_session(
+                    session_id,
+                    include_events=False,
+                )
+                event_rows = self.proof_event_rows(
+                    session_id,
+                    selected_sequence,
+                    event_limit,
+                )
+                for expected_sequence, event_row in enumerate(
+                    event_rows,
+                    start=1,
+                ):
+                    if int(event_row["sequence"]) != expected_sequence:
+                        raise ValueError("proof event sequence is not contiguous")
+                goal = self.goal_for_session(session_id)
+                evidence: list[Evidence] = []
+                if goal is not None:
+                    evidence = self.evidence(goal.goal_id)
+                workers = [
+                    item
+                    for item in self.worker_registrations()
+                    if str(item.get("session_id", "")) == session_id
+                ]
+                return {
+                    "through_sequence": selected_sequence,
+                    "event_count": event_count,
+                    "session": session,
+                    "portable_session": portable_session,
+                    "event_rows": event_rows,
+                    "goal": goal,
+                    "evidence": evidence,
+                    "portable_global": self.portable_global(),
+                    "leases": self.process_leases(session_id),
+                    "workers": workers,
+                    "safety": self.session_safety(session_id),
+                    "envelopes": self.session_envelopes(session_id),
+                    "incidents": self.guard_incidents(session_id),
+                    "transition_anchor": self.dispatch_transition_anchor(session_id),
+                }
+            finally:
+                self._connection.execute("COMMIT")
 
     def enqueue_command(
         self,
@@ -1037,12 +1620,8 @@ class StateStore:
         payload: dict[str, Any],
         idempotency_key: str,
     ) -> tuple[CommandReceipt, bool]:
-        normalized_payload = dict(payload)
-        turn_ref = normalize_turn_ref(payload.get("turn_ref"))
-        if turn_ref:
-            normalized_payload["turn_ref"] = turn_ref
-        else:
-            normalized_payload.pop("turn_ref", None)
+        normalized_payload = normalize_command_payload(payload)
+        turn_ref = normalize_turn_ref(normalized_payload.get("turn_ref"))
         now = utc_now()
         command_id = new_uuid()
         with self.transaction() as connection:
@@ -1054,13 +1633,11 @@ class StateStore:
                 same_request = (
                     str(existing["session_id"]) == session_id
                     and str(existing["command_type"]) == command_type
-                    and str(existing["payload_json"])
-                    == _dump(normalized_payload)
+                    and str(existing["payload_json"]) == _dump(normalized_payload)
                 )
                 if not same_request:
                     raise ConflictError(
-                        "idempotency key was already used with "
-                        "different command input"
+                        "idempotency key was already used with different command input"
                     )
                 return _command(existing), False
             connection.execute(
@@ -1086,17 +1663,20 @@ class StateStore:
                     turn_ref.get("agent_role", ""),
                 ),
             )
-        return CommandReceipt(
-            command_id=command_id,
-            idempotency_key=idempotency_key,
-            session_id=session_id,
-            command_type=command_type,
-            status=CommandStatus.QUEUED,
-            result={},
-            created_at=now,
-            updated_at=now,
-            turn_ref=turn_ref,
-        ), True
+        return (
+            CommandReceipt(
+                command_id=command_id,
+                idempotency_key=idempotency_key,
+                session_id=session_id,
+                command_type=command_type,
+                status=CommandStatus.QUEUED,
+                result={},
+                created_at=now,
+                updated_at=now,
+                turn_ref=turn_ref,
+            ),
+            True,
+        )
 
     def claim_command(
         self,
@@ -1174,6 +1754,61 @@ class StateStore:
             raise NotFoundError("command")
         return _command(row)
 
+    def command_failed_before_provider_boundary(self, command_id: str) -> bool:
+        with self._lock:
+            command = self._connection.execute(
+                "SELECT status FROM commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            crossed = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM command_dispatches
+                WHERE command_id = ? AND crossed_boundary = 1
+                """,
+                (command_id,),
+            ).fetchone()
+        if command is None:
+            return False
+        if str(command["status"]) not in {
+            CommandStatus.FAILED,
+            CommandStatus.CANCELLED,
+        }:
+            return False
+        if crossed is None:
+            return True
+        return int(crossed["count"]) == 0
+
+    def active_command_summaries(self) -> list[dict[str, Any]]:
+        """Enumerate prompt-free durable restart blockers."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT c.command_id, c.session_id, c.status,
+                    COALESCE(e.profile, '') AS profile,
+                    COALESCE(e.provider, '') AS provider,
+                    COALESCE(e.state, '') AS envelope_state,
+                    COALESCE(e.recovery_stage, 0) AS recovery_stage
+                FROM commands AS c
+                LEFT JOIN command_envelopes AS e
+                    ON e.command_id = c.command_id
+                WHERE c.status = ?
+                ORDER BY c.created_at, c.command_id
+                """,
+                (CommandStatus.DISPATCHING,),
+            ).fetchall()
+        return [
+            {
+                "command_id": str(row["command_id"]),
+                "session_id": str(row["session_id"]),
+                "status": str(row["status"]),
+                "profile": str(row["profile"]),
+                "provider": str(row["provider"]),
+                "envelope_state": str(row["envelope_state"]),
+                "recovery_stage": int(row["recovery_stage"]),
+            }
+            for row in rows
+        ]
+
     def resolve_command(
         self,
         command_id: str,
@@ -1196,6 +1831,37 @@ class StateStore:
                 (command_id,),
             ).fetchone()
         return _command(row)
+
+    def xhigh_authorization_or_park(
+        self,
+        command_id: str,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.transaction() as connection:
+            authorization = connection.execute(
+                """
+                SELECT * FROM xhigh_authorization_receipts
+                WHERE command_id = ? AND consumed_at = '' AND expires_at > ?
+                """,
+                (command_id, now),
+            ).fetchone()
+            if authorization is not None:
+                return dict(authorization)
+            cursor = connection.execute(
+                """
+                UPDATE commands SET status = ?, updated_at = ?
+                WHERE command_id = ? AND status = ?
+                """,
+                (
+                    CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                    now,
+                    command_id,
+                    CommandStatus.DISPATCHING,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("xhigh command is not awaiting authorization")
+        return None
 
     def recover_dispatching(self, session_id: str) -> int:
         recovery = self.recover_interrupted_commands(
@@ -1355,9 +2021,7 @@ class StateStore:
                 """,
                 (session_id, CommandStatus.COMPLETE),
             ).fetchall()
-        return [
-            _load_object(str(row["result_json"])) for row in rows
-        ]
+        return [_load_object(str(row["result_json"])) for row in rows]
 
     def create_attempt(self, attempt: ProviderAttempt) -> ProviderAttempt:
         with self.transaction() as connection:
@@ -1394,7 +2058,13 @@ class StateStore:
         if native_session_id is not None:
             fields.append("native_session_id = ?")
             values.append(native_session_id)
-        if status in {"complete", "failed", "interrupted", "exhausted"}:
+        if status in {
+            "cancelled",
+            "complete",
+            "failed",
+            "interrupted",
+            "exhausted",
+        }:
             fields.append("ended_at = ?")
             values.append(utc_now())
         values.append(attempt_id)
@@ -1422,7 +2092,7 @@ class StateStore:
             connection.execute(
                 """
                 INSERT INTO goals VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1436,8 +2106,14 @@ class StateStore:
                     _dump(goal.budgets),
                     goal.created_at,
                     goal.updated_at,
+                    _dump(list(goal.permitted_providers)),
+                    _dump(list(goal.permitted_efforts)),
+                    goal.max_concurrency,
+                    goal.completion_policy,
+                    goal.incident_policy,
                 ),
             )
+            self._insert_milestones(connection, goal)
             connection.execute(
                 """
                 UPDATE sessions SET goal_id = ?, updated_at = ?
@@ -1447,15 +2123,680 @@ class StateStore:
             )
         return goal
 
+    def _insert_milestones(
+        self,
+        connection: sqlite3.Connection,
+        goal: Goal,
+    ) -> None:
+        for milestone in goal.milestones:
+            connection.execute(
+                "INSERT INTO goal_milestones VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    goal.goal_id,
+                    milestone.milestone_id,
+                    milestone.title,
+                    milestone.status,
+                    _dump(list(milestone.dependencies)),
+                    _dump(list(milestone.predicates)),
+                    milestone.position,
+                ),
+            )
+
+    def _insert_authorization_receipt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        operation: str,
+        operation_id: str,
+        authorization: dict[str, Any],
+        created_at: str,
+        authorization_digest: str = "",
+    ) -> str:
+        digest = authorization_digest
+        if not digest:
+            digest = normalized_digest(authorization)
+        connection.execute(
+            """
+            INSERT INTO authorization_receipts VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                digest,
+                session_id,
+                operation,
+                operation_id,
+                str(authorization.get("schema", "")),
+                str(authorization.get("receipt_sha256", "")),
+                _dump(authorization),
+                created_at,
+            ),
+        )
+        return digest
+
+    def _retain_dispatch_transition_policy(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        authorization: dict[str, Any],
+        created_at: str,
+    ) -> dict[str, Any]:
+        policy = authorization.get("policy")
+        if not isinstance(policy, dict) or not policy:
+            raise ConflictError("dispatch transition policy is missing")
+        policy_sha256 = normalized_digest(policy)
+        goal_id = str(authorization.get("goal_id", ""))
+        epoch_id = str(authorization.get("epoch_id", ""))
+        if authorization.get("policy_sha256") != policy_sha256:
+            raise ConflictError("dispatch transition policy digest changed")
+        existing = connection.execute(
+            """
+            SELECT * FROM dispatch_transition_policies
+            WHERE session_id = ? AND goal_id = ? AND epoch_id = ?
+            """,
+            (session_id, goal_id, epoch_id),
+        ).fetchone()
+        canonical_payload = _dump(policy)
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO dispatch_transition_policies VALUES (
+                    ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    policy_sha256,
+                    session_id,
+                    goal_id,
+                    epoch_id,
+                    str(policy.get("schema", "")),
+                    canonical_payload,
+                    created_at,
+                ),
+            )
+        elif (
+            str(existing["policy_sha256"]) != policy_sha256
+            or str(existing["payload_json"]) != canonical_payload
+            or str(existing["schema"]) != str(policy.get("schema", ""))
+        ):
+            raise ConflictError("dispatch transition epoch policy changed")
+        compact = dict(authorization)
+        compact.pop("policy", None)
+        compact["policy_ref"] = {
+            "policy_sha256": policy_sha256,
+            "session_id": session_id,
+            "goal_id": goal_id,
+            "epoch_id": epoch_id,
+        }
+        return compact
+
+    def _insert_mutation_receipt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        idempotency_key: str,
+        operation: str,
+        request_digest: str,
+        response: dict[str, Any],
+        status_code: int,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO mutation_receipts
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                idempotency_key,
+                operation,
+                request_digest,
+                _dump(response),
+                status_code,
+                created_at,
+            ),
+        )
+
+    def promote_goal(
+        self,
+        previous_goal: Goal,
+        next_goal: Goal,
+        *,
+        stage: str,
+        authorization_digest: str,
+        authorization: dict[str, Any],
+        request_digest: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM goal_promotions
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["session_id"]) != previous_goal.session_id
+                    or str(existing["request_digest"]) != request_digest
+                ):
+                    raise ConflictError("goal promotion idempotency key was reused")
+                return dict(existing)
+            session = connection.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (previous_goal.session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session")
+            if str(session["goal_id"]) != previous_goal.goal_id:
+                raise ConflictError("goal promotion source is not current")
+            if str(session["lifecycle"]) != Lifecycle.COMPLETED:
+                raise ConflictError("goal promotion requires a completed session")
+            current_goal = connection.execute(
+                "SELECT status FROM goals WHERE goal_id = ?",
+                (previous_goal.goal_id,),
+            ).fetchone()
+            if current_goal is None:
+                raise NotFoundError("goal")
+            if str(current_goal["status"]) != GoalStatus.COMPLETE:
+                raise ConflictError("goal promotion requires a completed goal")
+            active = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM commands
+                WHERE session_id = ? AND status IN (
+                    'queued', 'awaiting-xhigh-authorization', 'dispatching'
+                )
+                """,
+                (previous_goal.session_id,),
+            ).fetchone()
+            if active is not None and int(active["count"]) > 0:
+                raise ConflictError("goal promotion requires command quiescence")
+            pending_approvals = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM approvals
+                WHERE session_id = ? AND status = 'pending'
+                """,
+                (previous_goal.session_id,),
+            ).fetchone()
+            if pending_approvals is not None and int(pending_approvals["count"]) > 0:
+                raise ConflictError("goal promotion has a pending approval")
+            pending_reconciliations = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM reconciliations
+                WHERE session_id = ? AND status != 'resolved'
+                """,
+                (previous_goal.session_id,),
+            ).fetchone()
+            if (
+                pending_reconciliations is not None
+                and int(pending_reconciliations["count"]) > 0
+            ):
+                raise ConflictError("goal promotion has a reconciliation barrier")
+            promotion_id = new_uuid()
+            created_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO goals VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    next_goal.goal_id,
+                    next_goal.session_id,
+                    next_goal.kind,
+                    next_goal.objective,
+                    next_goal.status,
+                    _dump(list(next_goal.constraints)),
+                    _dump(list(next_goal.predicates)),
+                    _dump(next_goal.budgets),
+                    next_goal.created_at,
+                    next_goal.updated_at,
+                    _dump(list(next_goal.permitted_providers)),
+                    _dump(list(next_goal.permitted_efforts)),
+                    next_goal.max_concurrency,
+                    next_goal.completion_policy,
+                    next_goal.incident_policy,
+                ),
+            )
+            recorded_authorization_digest = self._insert_authorization_receipt(
+                connection,
+                session_id=previous_goal.session_id,
+                operation="goal-promotion",
+                operation_id=promotion_id,
+                authorization=authorization,
+                created_at=created_at,
+            )
+            if recorded_authorization_digest != authorization_digest:
+                raise ValueError("goal promotion authorization digest changed")
+            self._insert_milestones(connection, next_goal)
+            previous_digest = goal_contract_digest(previous_goal)
+            next_digest = goal_contract_digest(next_goal)
+            connection.execute(
+                """
+                INSERT INTO goal_promotions VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    promotion_id,
+                    previous_goal.session_id,
+                    previous_goal.goal_id,
+                    next_goal.goal_id,
+                    stage,
+                    authorization_digest,
+                    request_digest,
+                    idempotency_key,
+                    previous_digest,
+                    next_digest,
+                    created_at,
+                ),
+            )
+            prior_evidence = connection.execute(
+                """
+                SELECT * FROM evidence WHERE goal_id = ?
+                ORDER BY created_at, evidence_id
+                """,
+                (previous_goal.goal_id,),
+            ).fetchall()
+            for row in prior_evidence:
+                copied_evidence_id = new_uuid()
+                value = _load_object(str(row["value_json"]))
+                evidence_contract = {
+                    "source_evidence_id": str(row["evidence_id"]),
+                    "evidence_type": str(row["evidence_type"]),
+                    "subject": str(row["subject"]),
+                    "outcome": str(row["outcome"]),
+                    "value": value,
+                }
+                connection.execute(
+                    "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        copied_evidence_id,
+                        next_goal.goal_id,
+                        str(row["evidence_type"]),
+                        str(row["subject"]),
+                        str(row["outcome"]),
+                        _dump(value),
+                        created_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO goal_promotion_evidence VALUES (
+                        ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        promotion_id,
+                        str(row["evidence_id"]),
+                        copied_evidence_id,
+                        normalized_digest(evidence_contract),
+                        created_at,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE sessions SET goal_id = ?, lifecycle = ?, attention = ?,
+                    updated_at = ? WHERE session_id = ?
+                """,
+                (
+                    next_goal.goal_id,
+                    Lifecycle.STARTING,
+                    Attention.IDLE,
+                    created_at,
+                    previous_goal.session_id,
+                ),
+            )
+            sequence_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS sequence
+                FROM events WHERE session_id = ?
+                """,
+                (previous_goal.session_id,),
+            ).fetchone()
+            sequence = 1
+            if sequence_row is not None:
+                sequence = int(sequence_row["sequence"]) + 1
+            connection.execute(
+                """
+                INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    previous_goal.session_id,
+                    sequence,
+                    promotion_id,
+                    "goal.promoted",
+                    "",
+                    "",
+                    "complete",
+                    _dump(
+                        {
+                            "promotion_id": promotion_id,
+                            "previous_goal_id": previous_goal.goal_id,
+                            "next_goal_id": next_goal.goal_id,
+                            "stage": stage,
+                            "authorization_digest": authorization_digest,
+                            "previous_goal_digest": previous_digest,
+                            "next_goal_digest": next_digest,
+                        }
+                    ),
+                    "",
+                    "",
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM goal_promotions WHERE promotion_id = ?",
+                (promotion_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("goal promotion receipt was not recorded")
+            return dict(row)
+
+    def goal_promotions(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM goal_promotions WHERE session_id = ?
+                ORDER BY created_at, promotion_id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def goal_promotion_by_key(
+        self,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM goal_promotions
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def adopt_session_contract(
+        self,
+        session_id: str,
+        next_goal: Goal,
+        *,
+        external_ref: dict[str, str],
+        creation_input: dict[str, Any],
+        authorization_digest: str,
+        authorization: dict[str, Any],
+        request_digest: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        request_creation_digest = creation_digest(creation_input)
+        normalized_ref = normalize_external_ref(external_ref)
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM goal_contract_adoptions
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["session_id"]) != session_id
+                    or str(existing["request_digest"]) != request_digest
+                ):
+                    raise ConflictError("contract adoption idempotency key was reused")
+                return dict(existing)
+            session = connection.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session")
+            active = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM commands
+                WHERE session_id = ? AND status IN (
+                    'queued', 'awaiting-xhigh-authorization', 'dispatching'
+                )
+                """,
+                (session_id,),
+            ).fetchone()
+            active_leases = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM process_leases
+                WHERE session_id = ?
+                AND state IN ('reserved', 'active', 'recovery-blocked')
+                """,
+                (session_id,),
+            ).fetchone()
+            if active is not None and int(active["count"]) > 0:
+                raise ConflictError("contract adoption requires quiescence")
+            if active_leases is not None and int(active_leases["count"]) > 0:
+                raise ConflictError("contract adoption has an active process lease")
+            if str(session["attention"]) == Attention.WORKING:
+                raise ConflictError("contract adoption requires an idle session")
+            conflict = connection.execute(
+                """
+                SELECT session_id FROM sessions
+                WHERE external_orchestrator = ? AND external_job_id = ?
+                """,
+                (
+                    normalized_ref["orchestrator"],
+                    normalized_ref["job_id"],
+                ),
+            ).fetchone()
+            if conflict is not None and str(conflict["session_id"]) != session_id:
+                raise ConflictError("external reference belongs to another session")
+            previous_goal_id = str(session["goal_id"])
+            previous_goal: Goal | None = None
+            previous_digest = ""
+            if previous_goal_id:
+                previous_row = connection.execute(
+                    "SELECT * FROM goals WHERE goal_id = ?",
+                    (previous_goal_id,),
+                ).fetchone()
+                if previous_row is not None:
+                    milestone_rows = connection.execute(
+                        """
+                        SELECT * FROM goal_milestones WHERE goal_id = ?
+                        ORDER BY position, milestone_id
+                        """,
+                        (previous_goal_id,),
+                    ).fetchall()
+                    previous_goal = _goal(previous_row, milestone_rows)
+                    previous_digest = goal_contract_digest(previous_goal)
+            adoption_id = new_uuid()
+            created_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO goals VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    next_goal.goal_id,
+                    session_id,
+                    next_goal.kind,
+                    next_goal.objective,
+                    next_goal.status,
+                    _dump(list(next_goal.constraints)),
+                    _dump(list(next_goal.predicates)),
+                    _dump(next_goal.budgets),
+                    next_goal.created_at,
+                    next_goal.updated_at,
+                    _dump(list(next_goal.permitted_providers)),
+                    _dump(list(next_goal.permitted_efforts)),
+                    next_goal.max_concurrency,
+                    next_goal.completion_policy,
+                    next_goal.incident_policy,
+                ),
+            )
+            recorded_authorization_digest = self._insert_authorization_receipt(
+                connection,
+                session_id=session_id,
+                operation="contract-adoption",
+                operation_id=adoption_id,
+                authorization=authorization,
+                created_at=created_at,
+            )
+            if recorded_authorization_digest != authorization_digest:
+                raise ValueError("contract adoption authorization digest changed")
+            self._insert_milestones(connection, next_goal)
+            if (
+                previous_goal is not None
+                and previous_goal.status != GoalStatus.COMPLETE
+            ):
+                connection.execute(
+                    "UPDATE goals SET status = ?, updated_at = ? WHERE goal_id = ?",
+                    (GoalStatus.CANCELLED, utc_now(), previous_goal.goal_id),
+                )
+            next_digest = goal_contract_digest(next_goal)
+            connection.execute(
+                """
+                INSERT INTO goal_contract_adoptions VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    adoption_id,
+                    session_id,
+                    previous_goal_id,
+                    next_goal.goal_id,
+                    normalized_ref["orchestrator"],
+                    normalized_ref["job_id"],
+                    authorization_digest,
+                    request_digest,
+                    request_creation_digest,
+                    previous_digest,
+                    next_digest,
+                    idempotency_key,
+                    created_at,
+                ),
+            )
+            routing = creation_input.get("routing", {})
+            if not isinstance(routing, dict):
+                routing = {}
+            connection.execute(
+                """
+                UPDATE sessions SET goal_id = ?, external_orchestrator = ?,
+                    external_job_id = ?, lifecycle = ?, attention = ?,
+                    name = ?, permission_mode = ?, model = ?, effort = ?,
+                    updated_at = ? WHERE session_id = ?
+                """,
+                (
+                    next_goal.goal_id,
+                    normalized_ref["orchestrator"],
+                    normalized_ref["job_id"],
+                    Lifecycle.STARTING,
+                    Attention.IDLE,
+                    str(creation_input.get("name", session["name"])),
+                    str(
+                        creation_input.get(
+                            "permission_mode",
+                            session["permission_mode"],
+                        )
+                    ),
+                    str(routing.get("model", session["model"])),
+                    str(routing.get("effort", session["effort"])),
+                    created_at,
+                    session_id,
+                ),
+            )
+            profile = str(creation_input.get("execution_profile", "unattended"))
+            connection.execute(
+                """
+                INSERT INTO session_safety(
+                    session_id, profile, xhigh_authorizations,
+                    extensions_json, created_at, updated_at
+                ) VALUES (?, ?, 0, '{}', ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    profile = excluded.profile,
+                    extensions_json = '{}',
+                    xhigh_authorizations = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, profile, created_at, created_at),
+            )
+            sequence_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS sequence
+                FROM events WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            sequence = 1
+            if sequence_row is not None:
+                sequence = int(sequence_row["sequence"]) + 1
+            connection.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    sequence,
+                    adoption_id,
+                    "goal.contract_adopted",
+                    "",
+                    "",
+                    "complete",
+                    _dump(
+                        {
+                            "adoption_id": adoption_id,
+                            "previous_goal_id": previous_goal_id,
+                            "next_goal_id": next_goal.goal_id,
+                            "previous_goal_digest": previous_digest,
+                            "next_goal_digest": next_digest,
+                            "authorization_digest": authorization_digest,
+                        }
+                    ),
+                    "",
+                    "",
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM goal_contract_adoptions WHERE adoption_id = ?",
+                (adoption_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("contract adoption receipt was not recorded")
+            return dict(row)
+
+    def goal_contract_adoption_by_key(
+        self,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM goal_contract_adoptions
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
     def get_goal(self, goal_id: str) -> Goal:
         with self._lock:
             row = self._connection.execute(
                 "SELECT * FROM goals WHERE goal_id = ?",
                 (goal_id,),
             ).fetchone()
+            milestone_rows = self._connection.execute(
+                """
+                SELECT * FROM goal_milestones WHERE goal_id = ?
+                ORDER BY position, milestone_id
+                """,
+                (goal_id,),
+            ).fetchall()
         if row is None:
             raise NotFoundError("goal")
-        return _goal(row)
+        return _goal(row, milestone_rows)
 
     def goal_for_session(self, session_id: str) -> Goal | None:
         session = self.get_session(session_id)
@@ -1477,6 +2818,29 @@ class StateStore:
                 raise NotFoundError("goal")
         return self.get_goal(goal_id)
 
+    def update_milestone_statuses(
+        self,
+        goal_id: str,
+        milestones: tuple[Milestone, ...],
+    ) -> Goal:
+        now = utc_now()
+        with self.transaction() as connection:
+            for milestone in milestones:
+                cursor = connection.execute(
+                    """
+                    UPDATE goal_milestones SET status = ?
+                    WHERE goal_id = ? AND milestone_id = ?
+                    """,
+                    (milestone.status, goal_id, milestone.milestone_id),
+                )
+                if cursor.rowcount != 1:
+                    raise NotFoundError("goal milestone")
+            connection.execute(
+                "UPDATE goals SET updated_at = ? WHERE goal_id = ?",
+                (now, goal_id),
+            )
+        return self.get_goal(goal_id)
+
     def add_evidence(self, evidence: Evidence) -> Evidence:
         with self.transaction() as connection:
             connection.execute(
@@ -1488,6 +2852,97 @@ class StateStore:
                     evidence.subject,
                     evidence.outcome,
                     _dump(evidence.value),
+                    evidence.created_at,
+                ),
+            )
+        return evidence
+
+    def add_evidence_once(
+        self,
+        session_id: str,
+        evidence: Evidence,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> Evidence:
+        operation = "evidence-create:" + session_id
+        with self.transaction() as connection:
+            receipt = connection.execute(
+                "SELECT * FROM mutation_receipts WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if receipt is not None:
+                if (
+                    str(receipt["operation"]) != operation
+                    or str(receipt["request_digest"]) != request_digest
+                ):
+                    raise ConflictError(
+                        "idempotency key was already used for another mutation"
+                    )
+                response = _load_object(str(receipt["response_json"]))
+                value = _object_or_empty(response.get("evidence"))
+                row = connection.execute(
+                    "SELECT * FROM evidence WHERE evidence_id = ?",
+                    (str(value.get("evidence_id", "")),),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("evidence receipt has no evidence row")
+                return _evidence(row)
+            session = connection.execute(
+                "SELECT goal_id FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session")
+            if str(session["goal_id"]) != evidence.goal_id:
+                raise ConflictError("evidence goal is no longer current")
+            connection.execute(
+                "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    evidence.evidence_id,
+                    evidence.goal_id,
+                    evidence.evidence_type,
+                    evidence.subject,
+                    evidence.outcome,
+                    _dump(evidence.value),
+                    evidence.created_at,
+                ),
+            )
+            sequence_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS sequence
+                FROM events WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            sequence = 1
+            if sequence_row is not None:
+                sequence = int(sequence_row["sequence"]) + 1
+            connection.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    sequence,
+                    evidence.evidence_id,
+                    "goal.evidence",
+                    "",
+                    "",
+                    "complete",
+                    _dump(evidence.as_dict()),
+                    "",
+                    "",
+                    evidence.created_at,
+                ),
+            )
+            response = {"evidence": evidence.as_dict()}
+            connection.execute(
+                "INSERT INTO mutation_receipts VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    idempotency_key,
+                    operation,
+                    request_digest,
+                    _dump(response),
+                    201,
                     evidence.created_at,
                 ),
             )
@@ -1522,6 +2977,1187 @@ class StateStore:
                 ),
             )
         return checkpoint
+
+    def repetition_generation(self, session_id: str) -> dict[str, str]:
+        with self._lock:
+            checkpoint = self._connection.execute(
+                """
+                SELECT * FROM checkpoints WHERE session_id = ?
+                ORDER BY sequence DESC, created_at DESC, checkpoint_id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            invalidation = self._connection.execute(
+                """
+                SELECT * FROM dispatch_invalidations WHERE session_id = ?
+                ORDER BY created_at DESC, invalidation_id DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        checkpoint_id = ""
+        material: dict[str, Any] = {}
+        if checkpoint is not None:
+            checkpoint_id = str(checkpoint["checkpoint_id"])
+            material = {
+                "base_commit": str(checkpoint["base_commit"]),
+                "patch_digest": str(checkpoint["patch_digest"]),
+                "untracked_digest": str(checkpoint["untracked_digest"]),
+            }
+        invalidation_id = ""
+        if invalidation is not None:
+            invalidation_id = str(invalidation["invalidation_id"])
+        return {
+            "generation_digest": normalized_digest(
+                {
+                    "material": material,
+                    "invalidation_id": invalidation_id,
+                }
+            ),
+            "checkpoint_id": checkpoint_id,
+            "invalidation_id": invalidation_id,
+        }
+
+    def dispatch_transition_anchor(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            session = self._connection.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session")
+            base = {
+                "schema": "p13i/agent-harness/dispatch-transition-anchor/v1",
+                "session_id": session_id,
+                "external_ref": {
+                    "orchestrator": str(session["external_orchestrator"]),
+                    "job_id": str(session["external_job_id"]),
+                },
+                "goal_id": str(session["goal_id"]),
+                "epoch_id": "",
+                "eligible": False,
+                "reason": "",
+            }
+            if str(session["attention"]) == Attention.WORKING:
+                base["reason"] = "session-is-working"
+                return base
+            active = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM commands
+                WHERE session_id = ? AND status IN (
+                    'queued', 'awaiting-xhigh-authorization', 'dispatching'
+                )
+                """,
+                (session_id,),
+            ).fetchone()
+            if active is not None and int(active["count"]) > 0:
+                base["reason"] = "active-command"
+                return base
+            goal = self._connection.execute(
+                "SELECT constraints_json FROM goals WHERE goal_id = ?",
+                (str(session["goal_id"]),),
+            ).fetchone()
+            if goal is not None:
+                constraints = json.loads(str(goal["constraints_json"]))
+                for constraint in constraints:
+                    prefix = "dispatch-generation-transition-epoch:"
+                    if isinstance(constraint, str) and constraint.startswith(prefix):
+                        base["epoch_id"] = constraint.removeprefix(prefix)
+                        break
+            if not base["goal_id"] or not base["epoch_id"]:
+                base["reason"] = "missing-goal-epoch"
+                return base
+            if (
+                not base["external_ref"]["orchestrator"]
+                or not base["external_ref"]["job_id"]
+            ):
+                base["reason"] = "missing-external-reference"
+                return base
+            prior = self._connection.execute(
+                """
+                SELECT * FROM commands WHERE session_id = ?
+                ORDER BY created_at DESC, command_id DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if prior is None:
+                base["reason"] = "missing-prior-command"
+                return base
+            latest_checkpoint = self._connection.execute(
+                """
+                SELECT * FROM checkpoints WHERE session_id = ?
+                ORDER BY sequence DESC, created_at DESC, checkpoint_id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if latest_checkpoint is None:
+                base["reason"] = "missing-certified-checkpoint"
+                return base
+            live_material_digest, unused_summary = inspect_workspace(
+                Path(str(session["worktree"]))
+            )
+            del unused_summary
+            try:
+                anchor = _dispatch_transition_anchor(
+                    self._connection,
+                    prior,
+                    str(latest_checkpoint["checkpoint_id"]),
+                    live_material_digest,
+                )
+            except ConflictError as error:
+                base["reason"] = error.detail.message
+                return base
+            generation = self.repetition_generation(session_id)
+            base.update(
+                {
+                    **anchor,
+                    "eligible": True,
+                    "reason": "",
+                    "prior_command_id": str(prior["command_id"]),
+                    "prior_command_status": str(prior["status"]),
+                    "prior_checkpoint_id": str(latest_checkpoint["checkpoint_id"]),
+                    "prior_material_digest": live_material_digest,
+                    "prior_generation_digest": generation["generation_digest"],
+                }
+            )
+            return base
+
+    def dispatch_transition_policy(
+        self,
+        session_id: str,
+        goal_id: str,
+        epoch_id: str,
+        policy_sha256: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT payload_json FROM dispatch_transition_policies
+                WHERE session_id = ? AND goal_id = ? AND epoch_id = ?
+                  AND policy_sha256 = ?
+                """,
+                (session_id, goal_id, epoch_id, policy_sha256),
+            ).fetchone()
+        if row is None:
+            raise ConflictError("dispatch transition policy reference is unknown")
+        policy = _load_object(str(row["payload_json"]))
+        if normalized_digest(policy) != policy_sha256:
+            raise ConflictError("dispatch transition retained policy is corrupt")
+        return policy
+
+    def create_dispatch_invalidation(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        authorization: dict[str, Any],
+        request_digest: str,
+        idempotency_key: str,
+        prior_command_id: str = "",
+        next_turn_ref: dict[str, str] | None = None,
+        authorization_digest: str = "",
+    ) -> dict[str, Any]:
+        if not authorization_digest:
+            authorization_digest = normalized_digest(authorization)
+        normalized_next_turn_ref = normalize_turn_ref(next_turn_ref)
+        with self.transaction() as connection:
+            session = connection.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session")
+            existing = connection.execute(
+                """
+                SELECT * FROM dispatch_invalidations
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["session_id"]) != session_id
+                    or str(existing["request_digest"]) != request_digest
+                ):
+                    raise ConflictError(
+                        "dispatch invalidation idempotency key was reused"
+                    )
+                existing_authorization = connection.execute(
+                    """
+                    SELECT schema, payload_json FROM authorization_receipts
+                    WHERE operation = 'dispatch-invalidation'
+                      AND operation_id = ?
+                    """,
+                    (str(existing["invalidation_id"]),),
+                ).fetchone()
+                transition_schema = (
+                    "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+                )
+                if (
+                    existing_authorization is not None
+                    and str(existing_authorization["schema"]) == transition_schema
+                    and not _dispatch_transition_epoch_is_active(
+                        connection,
+                        session_id,
+                        _load_object(str(existing_authorization["payload_json"])),
+                    )
+                ):
+                    raise ConflictError("dispatch transition epoch is no longer active")
+                result = dict(existing)
+                result["prior_command_id"] = prior_command_id
+                result["next_turn_ref"] = normalized_next_turn_ref
+                if prior_command_id:
+                    for name in (
+                        "goal_id",
+                        "prior_command_type",
+                        "prior_anchor_kind",
+                        "prior_reconciliation_id",
+                        "prior_reconciliation_resolution",
+                        "prior_checkpoint_id",
+                        "prior_generation_digest",
+                        "prior_material_digest",
+                        "transition_sequence",
+                        "epoch_id",
+                        "policy_sha256",
+                        "next_command_digest",
+                    ):
+                        result[name] = authorization.get(name)
+                return result
+            if str(session["attention"]) == Attention.WORKING:
+                raise ConflictError("dispatch invalidation requires quiescence")
+            active = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM commands
+                WHERE session_id = ? AND status IN (
+                    'queued', 'awaiting-xhigh-authorization', 'dispatching'
+                )
+                """,
+                (session_id,),
+            ).fetchone()
+            if active is not None and int(active["count"]) > 0:
+                raise ConflictError("dispatch invalidation has an active command")
+            transition_schema = (
+                "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+            )
+            authorization_schema = str(authorization.get("schema", ""))
+            if authorization_schema == transition_schema and not prior_command_id:
+                raise ConflictError("dispatch transition prior command is required")
+            if authorization_schema != transition_schema:
+                safety = connection.execute(
+                    "SELECT profile FROM session_safety WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if safety is not None and str(safety["profile"]) != "interactive":
+                    raise ConflictError(
+                        "managed dispatch invalidation requires a transition"
+                    )
+            if prior_command_id:
+                if authorization_schema != transition_schema:
+                    raise ConflictError("dispatch transition schema is invalid")
+                if authorization.get("prior_command_id") != prior_command_id:
+                    raise ConflictError("dispatch transition prior command changed")
+                if normalize_turn_ref(authorization.get("next_turn_ref")) != (
+                    normalized_next_turn_ref
+                ):
+                    raise ConflictError("dispatch transition next stage changed")
+                prior = connection.execute(
+                    "SELECT * FROM commands WHERE command_id = ?",
+                    (prior_command_id,),
+                ).fetchone()
+                if prior is None or str(prior["session_id"]) != session_id:
+                    raise ConflictError("dispatch transition prior command is unknown")
+                latest = connection.execute(
+                    """
+                    SELECT command_id FROM commands WHERE session_id = ?
+                    ORDER BY created_at DESC, command_id DESC LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if latest is None or str(latest["command_id"]) != prior_command_id:
+                    raise ConflictError(
+                        "dispatch transition prior command is not latest"
+                    )
+                latest_checkpoint = connection.execute(
+                    """
+                    SELECT * FROM checkpoints WHERE session_id = ?
+                    ORDER BY sequence DESC, created_at DESC, checkpoint_id DESC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if latest_checkpoint is None:
+                    raise ConflictError(
+                        "dispatch transition has no certified checkpoint"
+                    )
+                checkpoint_id = str(latest_checkpoint["checkpoint_id"])
+                prior_material_digest, unused_summary = inspect_workspace(
+                    Path(str(session["worktree"]))
+                )
+                del unused_summary
+                anchor = _dispatch_transition_anchor(
+                    connection,
+                    prior,
+                    checkpoint_id,
+                    prior_material_digest,
+                )
+                for name, expected in anchor.items():
+                    if authorization.get(name) != expected:
+                        raise ConflictError("dispatch transition " + name + " changed")
+                if authorization.get("prior_material_digest") != (
+                    prior_material_digest
+                ):
+                    raise ConflictError("dispatch transition material changed")
+                latest_invalidation = connection.execute(
+                    """
+                    SELECT invalidation_id FROM dispatch_invalidations
+                    WHERE session_id = ?
+                    ORDER BY created_at DESC, invalidation_id DESC LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                latest_invalidation_id = ""
+                if latest_invalidation is not None:
+                    latest_invalidation_id = str(latest_invalidation["invalidation_id"])
+                actual_generation_digest = normalized_digest(
+                    {
+                        "material": {
+                            "base_commit": str(latest_checkpoint["base_commit"]),
+                            "patch_digest": str(latest_checkpoint["patch_digest"]),
+                            "untracked_digest": str(
+                                latest_checkpoint["untracked_digest"]
+                            ),
+                        },
+                        "invalidation_id": latest_invalidation_id,
+                    }
+                )
+                if authorization.get("prior_generation_digest") != (
+                    actual_generation_digest
+                ):
+                    raise ConflictError("dispatch transition generation changed")
+                transition_sequence = authorization.get("transition_sequence")
+                if isinstance(transition_sequence, bool) or not isinstance(
+                    transition_sequence, int
+                ):
+                    raise ConflictError("dispatch transition sequence is invalid")
+                epoch_id = str(authorization.get("epoch_id", ""))
+                goal_id = str(session["goal_id"])
+                if authorization.get("goal_id") != goal_id or not goal_id:
+                    raise ConflictError("dispatch transition goal changed")
+                transition_count_row = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(transition_sequence), 0) AS count
+                    FROM dispatch_transition_ledger
+                    WHERE session_id = ? AND goal_id = ? AND epoch_id = ?
+                    """,
+                    (session_id, goal_id, epoch_id),
+                ).fetchone()
+                transition_count = 0
+                if transition_count_row is not None:
+                    transition_count = int(transition_count_row["count"])
+                expected_sequence = transition_count + 1
+                if transition_sequence != expected_sequence:
+                    raise ConflictError("dispatch transition sequence is out of order")
+                if transition_sequence > 1:
+                    predecessor = connection.execute(
+                        """
+                        SELECT consumed_command_id
+                        FROM dispatch_transition_ledger
+                        WHERE session_id = ? AND goal_id = ? AND epoch_id = ?
+                          AND transition_sequence = ?
+                        """,
+                        (
+                            session_id,
+                            goal_id,
+                            epoch_id,
+                            transition_sequence - 1,
+                        ),
+                    ).fetchone()
+                    if predecessor is None:
+                        raise ConflictError(
+                            "dispatch transition predecessor is missing"
+                        )
+                    consumed_command_id = str(predecessor["consumed_command_id"])
+                    if consumed_command_id != prior_command_id:
+                        if anchor["prior_anchor_kind"] != "control-command":
+                            raise ConflictError(
+                                "dispatch transition predecessor was not consumed "
+                                "by the prior command"
+                            )
+                        consumed_command = connection.execute(
+                            "SELECT * FROM commands WHERE command_id = ?",
+                            (consumed_command_id,),
+                        ).fetchone()
+                        if (
+                            consumed_command is None
+                            or str(consumed_command["session_id"]) != session_id
+                            or str(consumed_command["command_type"]) != "message"
+                            or str(consumed_command["status"])
+                            not in {CommandStatus.CANCELLED, CommandStatus.FAILED}
+                        ):
+                            raise ConflictError(
+                                "dispatch transition control lineage is missing"
+                            )
+                        control_result = _load_object(str(prior["result_json"]))
+                        if (
+                            str(control_result.get("target_command_id", ""))
+                            != consumed_command_id
+                            or str(control_result.get("checkpoint_id", ""))
+                            != (checkpoint_id)
+                            or str(
+                                control_result.get(
+                                    "workspace_material_digest",
+                                    "",
+                                )
+                            )
+                            != prior_material_digest
+                        ):
+                            raise ConflictError(
+                                "dispatch transition control lineage changed"
+                            )
+                        dispatch_rows = connection.execute(
+                            """
+                            SELECT checkpoint_id, state
+                            FROM command_dispatches WHERE command_id = ?
+                            AND crossed_boundary = 1
+                            ORDER BY created_at, attempt_id
+                            """,
+                            (consumed_command_id,),
+                        ).fetchall()
+                        if (
+                            len(dispatch_rows) != 1
+                            or str(dispatch_rows[0]["checkpoint_id"]) != checkpoint_id
+                            or str(dispatch_rows[0]["state"])
+                            not in {"interrupted", "failed", "ambiguous"}
+                        ):
+                            raise ConflictError(
+                                "dispatch transition interrupted boundary changed"
+                            )
+                        interrupt_events = connection.execute(
+                            """
+                            SELECT metadata_json FROM events
+                            WHERE session_id = ?
+                            AND event_type = 'turn.interrupted'
+                            ORDER BY sequence
+                            """,
+                            (session_id,),
+                        ).fetchall()
+                        expected_interrupt = {
+                            "control_command_id": prior_command_id,
+                            "target_command_id": consumed_command_id,
+                            "checkpoint_id": checkpoint_id,
+                            "workspace_material_digest": prior_material_digest,
+                        }
+                        matching_interrupts = [
+                            item
+                            for item in interrupt_events
+                            if _load_object(str(item["metadata_json"]))
+                            == expected_interrupt
+                        ]
+                        if len(matching_interrupts) != 1:
+                            raise ConflictError(
+                                "dispatch transition interrupt receipt changed"
+                            )
+                        command_lineage = connection.execute(
+                            """
+                            SELECT command_id, command_type, status
+                            FROM commands WHERE session_id = ?
+                            ORDER BY created_at, command_id
+                            """,
+                            (session_id,),
+                        ).fetchall()
+                        consumed_position = -1
+                        prior_position = -1
+                        for position, lineage_command in enumerate(command_lineage):
+                            lineage_command_id = str(lineage_command["command_id"])
+                            if lineage_command_id == consumed_command_id:
+                                consumed_position = position
+                            if lineage_command_id == prior_command_id:
+                                prior_position = position
+                        if consumed_position < 0 or prior_position <= consumed_position:
+                            raise ConflictError(
+                                "dispatch transition control lineage is out of order"
+                            )
+                        for lineage_command in command_lineage[
+                            consumed_position + 1 : prior_position + 1
+                        ]:
+                            if str(lineage_command["command_type"]) not in (
+                                TRANSITION_CONTROL_COMMANDS
+                            ) or str(lineage_command["status"]) != (
+                                CommandStatus.COMPLETE
+                            ):
+                                raise ConflictError(
+                                    "dispatch transition control lineage is not exact"
+                                )
+                external_ref = {
+                    "orchestrator": str(session["external_orchestrator"]),
+                    "job_id": str(session["external_job_id"]),
+                }
+                if (
+                    authorization.get("external_orchestrator")
+                    != external_ref["orchestrator"]
+                    or authorization.get("external_job_id") != external_ref["job_id"]
+                ):
+                    raise ConflictError("dispatch transition orchestrator changed")
+                policy = authorization.get("policy")
+                if not isinstance(policy, dict) or not policy:
+                    raise ConflictError("dispatch transition policy is missing")
+                if policy.get("schema") != (
+                    "p13i/agent-harness/dispatch-generation-transition-policy/v1"
+                ):
+                    raise ConflictError("dispatch transition policy schema changed")
+                policy_sha256 = normalized_digest(policy)
+                if authorization.get("policy_sha256") != policy_sha256:
+                    raise ConflictError("dispatch transition policy digest changed")
+                if policy.get("session_id") != session_id:
+                    raise ConflictError("dispatch transition policy session changed")
+                if policy.get("external_ref") != external_ref:
+                    raise ConflictError(
+                        "dispatch transition policy orchestrator changed"
+                    )
+                if policy.get("epoch_id") != epoch_id or not epoch_id:
+                    raise ConflictError("dispatch transition epoch changed")
+                policy_ref = authorization.get("policy_ref")
+                retained_policy = False
+                if transition_sequence == 1:
+                    if policy_ref is not None:
+                        raise ConflictError(
+                            "first dispatch transition has a policy reference"
+                        )
+                else:
+                    expected_policy_ref = {
+                        "policy_sha256": policy_sha256,
+                        "session_id": session_id,
+                        "goal_id": goal_id,
+                        "epoch_id": epoch_id,
+                    }
+                    if policy_ref != expected_policy_ref:
+                        raise ConflictError(
+                            "dispatch transition policy reference changed"
+                        )
+                    retained_policy_row = connection.execute(
+                        """
+                        SELECT payload_json FROM dispatch_transition_policies
+                        WHERE policy_sha256 = ? AND session_id = ?
+                          AND goal_id = ? AND epoch_id = ?
+                        """,
+                        (policy_sha256, session_id, goal_id, epoch_id),
+                    ).fetchone()
+                    if retained_policy_row is None:
+                        raise ConflictError(
+                            "dispatch transition policy reference is unknown"
+                        )
+                    if str(retained_policy_row["payload_json"]) != _dump(policy):
+                        raise ConflictError(
+                            "dispatch transition retained policy changed"
+                        )
+                    retained_policy = True
+                allowed_roles = policy.get("allowed_agent_roles")
+                allowed_prefixes = policy.get("allowed_step_prefixes")
+                max_transitions = policy.get("max_transitions")
+                if (
+                    not isinstance(allowed_roles, list)
+                    or normalized_next_turn_ref.get("agent_role") not in allowed_roles
+                ):
+                    raise ConflictError("dispatch transition role is outside policy")
+                step_id = normalized_next_turn_ref.get("step_id", "")
+                if not isinstance(allowed_prefixes, list) or not any(
+                    isinstance(prefix, str) and prefix and step_id.startswith(prefix)
+                    for prefix in allowed_prefixes
+                ):
+                    raise ConflictError("dispatch transition step is outside policy")
+                if (
+                    isinstance(max_transitions, bool)
+                    or not isinstance(max_transitions, int)
+                    or max_transitions > 1_000
+                    or transition_sequence > max_transitions
+                ):
+                    raise ConflictError("dispatch transition exceeds policy limit")
+                transitions = policy.get("transitions")
+                if not isinstance(transitions, list):
+                    raise ConflictError("dispatch transition policy stages changed")
+                if max_transitions != len(transitions):
+                    raise ConflictError("dispatch transition policy limit changed")
+                if transition_sequence > len(transitions):
+                    raise ConflictError(
+                        "dispatch transition sequence is outside policy"
+                    )
+                matching_transition = transitions[transition_sequence - 1]
+                if not isinstance(matching_transition, dict):
+                    raise ConflictError("dispatch transition policy stage changed")
+                if matching_transition.get("sequence") != transition_sequence:
+                    raise ConflictError("dispatch transition policy order changed")
+                if not retained_policy:
+                    for index, transition in enumerate(transitions, start=1):
+                        if not isinstance(transition, dict):
+                            raise ConflictError(
+                                "dispatch transition policy stage changed"
+                            )
+                        if transition.get("sequence") != index:
+                            raise ConflictError(
+                                "dispatch transition policy order changed"
+                            )
+                        transition_ref = normalize_turn_ref(
+                            transition.get("next_turn_ref")
+                        )
+                        if transition_ref["agent_role"] not in allowed_roles:
+                            raise ConflictError(
+                                "dispatch transition policy stage role changed"
+                            )
+                        transition_step = transition_ref["step_id"]
+                        if not any(
+                            isinstance(prefix, str)
+                            and prefix
+                            and transition_step.startswith(prefix)
+                            for prefix in allowed_prefixes
+                        ):
+                            raise ConflictError(
+                                "dispatch transition policy stage step changed"
+                            )
+                        transition_digest = str(
+                            transition.get("next_command_digest", "")
+                        )
+                        if len(transition_digest) != 64 or any(
+                            character not in "0123456789abcdef"
+                            for character in transition_digest
+                        ):
+                            raise ConflictError(
+                                "dispatch transition policy stage digest changed"
+                            )
+                if (
+                    normalize_turn_ref(matching_transition.get("next_turn_ref"))
+                    != normalized_next_turn_ref
+                ):
+                    raise ConflictError("dispatch transition policy stage changed")
+                next_command_digest = str(authorization.get("next_command_digest", ""))
+                if matching_transition.get("next_command_digest") != (
+                    next_command_digest
+                ):
+                    raise ConflictError("dispatch transition command policy changed")
+                goal = connection.execute(
+                    "SELECT constraints_json FROM goals WHERE goal_id = ?",
+                    (str(session["goal_id"]),),
+                ).fetchone()
+                constraint = (
+                    "dispatch-generation-transition-policy-sha256:" + policy_sha256
+                )
+                epoch_constraint = "dispatch-generation-transition-epoch:" + epoch_id
+                constraints = []
+                if goal is not None:
+                    constraints = json.loads(str(goal["constraints_json"]))
+                if constraint not in constraints or epoch_constraint not in constraints:
+                    raise ConflictError("dispatch transition policy is not authorized")
+                exact_receipt = {
+                    "session_id": session_id,
+                    "external_ref": external_ref,
+                    "goal_id": goal_id,
+                    "prior_command_id": prior_command_id,
+                    "prior_command_type": anchor["prior_command_type"],
+                    "prior_anchor_kind": anchor["prior_anchor_kind"],
+                    "prior_reconciliation_id": anchor["prior_reconciliation_id"],
+                    "prior_reconciliation_resolution": anchor[
+                        "prior_reconciliation_resolution"
+                    ],
+                    "prior_checkpoint_id": checkpoint_id,
+                    "prior_generation_digest": actual_generation_digest,
+                    "prior_material_digest": prior_material_digest,
+                    "next_turn_ref": normalized_next_turn_ref,
+                    "transition_sequence": transition_sequence,
+                    "epoch_id": epoch_id,
+                    "policy_sha256": policy_sha256,
+                    "next_command_digest": next_command_digest,
+                }
+                if authorization.get("receipt") != exact_receipt:
+                    raise ConflictError("dispatch transition source receipt changed")
+                if authorization.get("receipt_sha256") != normalized_digest(
+                    exact_receipt
+                ):
+                    raise ConflictError("dispatch transition receipt digest changed")
+            created_at = utc_now()
+            stored_authorization = authorization
+            if authorization_schema == transition_schema:
+                stored_authorization = self._retain_dispatch_transition_policy(
+                    connection,
+                    session_id=session_id,
+                    authorization=authorization,
+                    created_at=created_at,
+                )
+            invalidation_id = new_uuid()
+            invalidation_metadata = {
+                "invalidation_id": invalidation_id,
+                "reason": reason,
+                "authorization_digest": authorization_digest,
+            }
+            if prior_command_id:
+                invalidation_metadata.update(
+                    {
+                        "prior_command_id": prior_command_id,
+                        "prior_command_type": authorization.get("prior_command_type"),
+                        "prior_anchor_kind": authorization.get("prior_anchor_kind"),
+                        "prior_reconciliation_id": authorization.get(
+                            "prior_reconciliation_id"
+                        ),
+                        "prior_reconciliation_resolution": authorization.get(
+                            "prior_reconciliation_resolution"
+                        ),
+                        "goal_id": authorization.get("goal_id"),
+                        "prior_checkpoint_id": authorization.get("prior_checkpoint_id"),
+                        "prior_generation_digest": authorization.get(
+                            "prior_generation_digest"
+                        ),
+                        "prior_material_digest": authorization.get(
+                            "prior_material_digest"
+                        ),
+                        "next_turn_ref": normalized_next_turn_ref,
+                        "transition_sequence": authorization.get("transition_sequence"),
+                        "epoch_id": authorization.get("epoch_id"),
+                        "policy_sha256": authorization.get("policy_sha256"),
+                        "next_command_digest": authorization.get("next_command_digest"),
+                    }
+                )
+            connection.execute(
+                "INSERT INTO dispatch_invalidations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    invalidation_id,
+                    session_id,
+                    reason,
+                    authorization_digest,
+                    request_digest,
+                    idempotency_key,
+                    created_at,
+                ),
+            )
+            if authorization_schema == transition_schema:
+                connection.execute(
+                    """
+                    INSERT INTO dispatch_transition_ledger(
+                        invalidation_id, session_id, goal_id, epoch_id,
+                        transition_sequence, policy_sha256,
+                        authorization_digest, receipt_sha256,
+                        request_digest, prior_command_id,
+                        prior_command_type, prior_anchor_kind,
+                        prior_reconciliation_id,
+                        prior_reconciliation_resolution,
+                        prior_checkpoint_id, prior_generation_digest,
+                        prior_material_digest, next_turn_ref_json,
+                        next_command_digest, state, reserved_command_id,
+                        consumed_command_id, created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        invalidation_id,
+                        session_id,
+                        str(authorization.get("goal_id", "")),
+                        str(authorization.get("epoch_id", "")),
+                        int(authorization.get("transition_sequence", 0)),
+                        str(authorization.get("policy_sha256", "")),
+                        authorization_digest,
+                        str(authorization.get("receipt_sha256", "")),
+                        request_digest,
+                        prior_command_id,
+                        str(authorization.get("prior_command_type", "")),
+                        str(authorization.get("prior_anchor_kind", "")),
+                        str(authorization.get("prior_reconciliation_id", "")),
+                        str(
+                            authorization.get(
+                                "prior_reconciliation_resolution",
+                                "",
+                            )
+                        ),
+                        str(authorization.get("prior_checkpoint_id", "")),
+                        str(authorization.get("prior_generation_digest", "")),
+                        str(authorization.get("prior_material_digest", "")),
+                        _dump(normalized_next_turn_ref),
+                        str(authorization.get("next_command_digest", "")),
+                        "authorized",
+                        "",
+                        "",
+                        created_at,
+                        created_at,
+                    ),
+                )
+            self._insert_authorization_receipt(
+                connection,
+                session_id=session_id,
+                operation="dispatch-invalidation",
+                operation_id=invalidation_id,
+                authorization=stored_authorization,
+                created_at=created_at,
+                authorization_digest=authorization_digest,
+            )
+            sequence_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS sequence
+                FROM events WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            sequence = 1
+            if sequence_row is not None:
+                sequence = int(sequence_row["sequence"]) + 1
+            connection.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    sequence,
+                    invalidation_id,
+                    "dispatch.invalidation",
+                    "",
+                    "",
+                    "complete",
+                    _dump(invalidation_metadata),
+                    "",
+                    "",
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM dispatch_invalidations WHERE invalidation_id = ?",
+                (invalidation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("dispatch invalidation was not recorded")
+            result = dict(row)
+            result["prior_command_id"] = prior_command_id
+            result["next_turn_ref"] = normalized_next_turn_ref
+            if prior_command_id:
+                for name in (
+                    "goal_id",
+                    "prior_command_type",
+                    "prior_anchor_kind",
+                    "prior_reconciliation_id",
+                    "prior_reconciliation_resolution",
+                    "prior_checkpoint_id",
+                    "prior_generation_digest",
+                    "prior_material_digest",
+                    "transition_sequence",
+                    "epoch_id",
+                    "policy_sha256",
+                    "next_command_digest",
+                ):
+                    result[name] = authorization.get(name)
+            return result
+
+    def dispatch_invalidation_replay(
+        self,
+        session_id: str,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            existing = self._connection.execute(
+                """
+                SELECT * FROM dispatch_invalidations
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing is None:
+                return None
+            if (
+                str(existing["session_id"]) != session_id
+                or str(existing["request_digest"]) != request_digest
+            ):
+                raise ConflictError("dispatch invalidation idempotency key was reused")
+            authorization_row = self._connection.execute(
+                """
+                SELECT schema, payload_json FROM authorization_receipts
+                WHERE operation = 'dispatch-invalidation'
+                  AND operation_id = ?
+                """,
+                (str(existing["invalidation_id"]),),
+            ).fetchone()
+            if authorization_row is None:
+                raise RuntimeError(
+                    "dispatch invalidation authorization receipt is missing"
+                )
+            authorization = _load_object(str(authorization_row["payload_json"]))
+            transition_schema = (
+                "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+            )
+            if str(authorization_row["schema"]) == transition_schema and not (
+                _dispatch_transition_epoch_is_active(
+                    self._connection,
+                    session_id,
+                    authorization,
+                )
+            ):
+                raise ConflictError("dispatch transition epoch is no longer active")
+            result = dict(existing)
+            prior_command_id = str(authorization.get("prior_command_id", ""))
+            result["prior_command_id"] = prior_command_id
+            result["next_turn_ref"] = normalize_turn_ref(
+                authorization.get("next_turn_ref")
+            )
+            if prior_command_id:
+                for name in (
+                    "goal_id",
+                    "prior_command_type",
+                    "prior_anchor_kind",
+                    "prior_reconciliation_id",
+                    "prior_reconciliation_resolution",
+                    "prior_checkpoint_id",
+                    "prior_generation_digest",
+                    "prior_material_digest",
+                    "transition_sequence",
+                    "epoch_id",
+                    "policy_sha256",
+                    "next_command_digest",
+                ):
+                    result[name] = authorization.get(name)
+            return result
+
+    def reserve_dispatch_generation_transition(
+        self,
+        session_id: str,
+        command_id: str,
+        turn_ref: dict[str, Any],
+        live_material_digest: str,
+    ) -> str:
+        normalized_turn_ref = normalize_turn_ref(turn_ref)
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT d.invalidation_id, a.schema, a.payload_json,
+                    l.state, l.reserved_command_id, l.consumed_command_id
+                FROM dispatch_invalidations AS d
+                JOIN authorization_receipts AS a
+                  ON a.operation_id = d.invalidation_id
+                 AND a.operation = 'dispatch-invalidation'
+                LEFT JOIN dispatch_transition_ledger AS l
+                  ON l.invalidation_id = d.invalidation_id
+                WHERE d.session_id = ?
+                ORDER BY d.created_at DESC, d.invalidation_id DESC LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return ""
+            transition_schema = (
+                "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+            )
+            if str(row["schema"]) != transition_schema:
+                return ""
+            invalidation_id = str(row["invalidation_id"])
+            authorization = _load_object(str(row["payload_json"]))
+            if not _dispatch_transition_epoch_is_active(
+                connection,
+                session_id,
+                authorization,
+            ):
+                return "epoch-mismatch"
+            if authorization.get("prior_material_digest") != live_material_digest:
+                return "material-mismatch"
+            expected_turn_ref = normalize_turn_ref(authorization.get("next_turn_ref"))
+            if normalized_turn_ref != expected_turn_ref:
+                return "stage-mismatch"
+            latest_state = str(row["state"] or "")
+            bound_command_id = str(row["reserved_command_id"] or "")
+            if latest_state == "consumed":
+                if str(row["consumed_command_id"] or "") == command_id:
+                    return "consumed"
+                return "already-consumed"
+            command = connection.execute(
+                "SELECT command_type, payload_json FROM commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            envelope = connection.execute(
+                "SELECT profile FROM command_envelopes WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if command is None or envelope is None:
+                return "command-mismatch"
+            actual_command_digest = command_envelope_digest(
+                str(command["command_type"]),
+                _load_object(str(command["payload_json"])),
+                str(envelope["profile"]),
+            )
+            if authorization.get("next_command_digest") != actual_command_digest:
+                return "command-mismatch"
+            if latest_state == "reserved":
+                if bound_command_id == command_id:
+                    return "reserved"
+                bound_command = connection.execute(
+                    "SELECT status FROM commands WHERE command_id = ?",
+                    (bound_command_id,),
+                ).fetchone()
+                crossed = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM command_dispatches
+                    WHERE command_id = ? AND crossed_boundary = 1
+                    """,
+                    (bound_command_id,),
+                ).fetchone()
+                crossed_count = 0
+                if crossed is not None:
+                    crossed_count = int(crossed["count"])
+                releasable = bound_command is not None and str(
+                    bound_command["status"]
+                ) in {CommandStatus.FAILED, CommandStatus.CANCELLED}
+                if not releasable or crossed_count > 0:
+                    return "already-consumed"
+                self._append_dispatch_transition_event(
+                    connection,
+                    session_id,
+                    "released",
+                    {
+                        "invalidation_id": invalidation_id,
+                        "command_id": bound_command_id,
+                        "reason": "terminal-pre-boundary-failure",
+                    },
+                )
+                connection.execute(
+                    """
+                    UPDATE dispatch_transition_ledger
+                    SET state = 'released', reserved_command_id = '',
+                        updated_at = ?
+                    WHERE invalidation_id = ?
+                    """,
+                    (utc_now(), invalidation_id),
+                )
+            self._append_dispatch_transition_event(
+                connection,
+                session_id,
+                "reserved",
+                {
+                    "invalidation_id": invalidation_id,
+                    "command_id": command_id,
+                    "prior_command_id": str(authorization.get("prior_command_id", "")),
+                    "epoch_id": str(authorization.get("epoch_id", "")),
+                    "next_turn_ref": normalized_turn_ref,
+                },
+            )
+            connection.execute(
+                """
+                UPDATE dispatch_transition_ledger
+                SET state = 'reserved', reserved_command_id = ?,
+                    updated_at = ?
+                WHERE invalidation_id = ?
+                """,
+                (command_id, utc_now(), invalidation_id),
+            )
+            return "reserved"
+
+    def _append_dispatch_transition_event(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        state: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        sequence_row = connection.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0) AS sequence
+            FROM events WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        sequence = 1
+        if sequence_row is not None:
+            sequence = int(sequence_row["sequence"]) + 1
+        connection.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                sequence,
+                new_uuid(),
+                "dispatch.generation.transition." + state,
+                "",
+                "",
+                state,
+                _dump(metadata),
+                "",
+                "",
+                utc_now(),
+            ),
+        )
+
+    def _consume_reserved_dispatch_transition(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        command_id: str,
+        workspace: Path,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT d.invalidation_id, a.schema, a.payload_json,
+                l.state, l.reserved_command_id, l.consumed_command_id
+            FROM dispatch_invalidations AS d
+            JOIN authorization_receipts AS a
+              ON a.operation_id = d.invalidation_id
+             AND a.operation = 'dispatch-invalidation'
+            LEFT JOIN dispatch_transition_ledger AS l
+              ON l.invalidation_id = d.invalidation_id
+            WHERE d.session_id = ?
+            ORDER BY d.created_at DESC, d.invalidation_id DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None or str(row["schema"]) != (
+            "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+        ):
+            return
+        invalidation_id = str(row["invalidation_id"])
+        authorization = _load_object(str(row["payload_json"]))
+        if not _dispatch_transition_epoch_is_active(
+            connection,
+            session_id,
+            authorization,
+        ):
+            raise ConflictError("dispatch transition epoch is stale")
+        live_material_digest, unused_summary = inspect_workspace(workspace)
+        del unused_summary
+        if authorization.get("prior_material_digest") != live_material_digest:
+            raise ConflictError("dispatch transition live material changed")
+        command = connection.execute(
+            "SELECT command_type, payload_json FROM commands WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        envelope = connection.execute(
+            "SELECT profile FROM command_envelopes WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        if command is None or envelope is None:
+            raise ConflictError("dispatch transition command is missing")
+        actual_command_digest = command_envelope_digest(
+            str(command["command_type"]),
+            _load_object(str(command["payload_json"])),
+            str(envelope["profile"]),
+        )
+        if authorization.get("next_command_digest") != actual_command_digest:
+            raise ConflictError("dispatch transition command changed")
+        latest_state = str(row["state"] or "")
+        bound_command_id = str(row["reserved_command_id"] or "")
+        consumed_command_id = str(row["consumed_command_id"] or "")
+        if latest_state == "consumed" and consumed_command_id == command_id:
+            return
+        if latest_state != "reserved" or bound_command_id != command_id:
+            raise ConflictError("dispatch transition reservation is stale")
+        self._append_dispatch_transition_event(
+            connection,
+            session_id,
+            "consumed",
+            {
+                "invalidation_id": invalidation_id,
+                "command_id": command_id,
+                "epoch_id": str(authorization.get("epoch_id", "")),
+            },
+        )
+        cursor = connection.execute(
+            """
+            UPDATE dispatch_transition_ledger
+            SET state = 'consumed', consumed_command_id = ?, updated_at = ?
+            WHERE invalidation_id = ? AND state = 'reserved'
+              AND reserved_command_id = ?
+            """,
+            (command_id, utc_now(), invalidation_id, command_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("dispatch transition consumption is stale")
 
     def checkpoints(self, session_id: str) -> list[Checkpoint]:
         with self._lock:
@@ -1586,9 +4222,7 @@ class StateStore:
                 (utc_now(), attempt_id),
             )
             if cursor.rowcount != 1:
-                raise ConflictError(
-                    "provider dispatch boundary is stale"
-                )
+                raise ConflictError("provider dispatch boundary is stale")
 
     def complete_dispatch(self, attempt_id: str, state: str) -> None:
         if state not in {
@@ -1748,6 +4382,40 @@ class StateStore:
         consumption: dict[str, Any] = {}
         if envelope is not None:
             consumption = _load_object(envelope["consumption_json"])
+        lease_rows = connection.execute(
+            """
+            SELECT * FROM process_leases
+            WHERE session_id = ? AND command_id = ? AND attempt_id = ?
+            AND state IN ('reserved', 'active', 'recovery-blocked')
+            ORDER BY created_at, lease_id
+            """,
+            (
+                str(command["session_id"]),
+                str(command["command_id"]),
+                str(dispatch["attempt_id"]),
+            ),
+        ).fetchall()
+        if len(lease_rows) > 1:
+            raise ConflictError("ambiguous dispatch has multiple active process leases")
+        dispatch_identity = {
+            "attempt_id": str(dispatch["attempt_id"]),
+            "turn_id": str(dispatch["turn_id"]),
+            "checkpoint_id": str(dispatch["checkpoint_id"]),
+            "lease_id": "",
+            "worker_incarnation": "",
+            "pid": 0,
+            "pid_start": "",
+        }
+        if lease_rows:
+            lease = lease_rows[0]
+            dispatch_identity.update(
+                {
+                    "lease_id": str(lease["lease_id"]),
+                    "worker_incarnation": str(lease["worker_incarnation"]),
+                    "pid": int(lease["pid"]),
+                    "pid_start": str(lease["pid_start"]),
+                }
+            )
         reconciliation_id = new_uuid()
         connection.execute(
             """
@@ -1766,7 +4434,7 @@ class StateStore:
                 _dump(consumption),
                 ReconciliationStatus.PENDING,
                 "",
-                "{}",
+                _dump({"dispatch_identity": dispatch_identity}),
                 now,
                 "",
             ),
@@ -1838,6 +4506,60 @@ class StateStore:
             raise NotFoundError("reconciliation")
         return _reconciliation(row)
 
+    def record_reconciliation_discovery(
+        self,
+        reconciliation_id: str,
+        checkpoint: Checkpoint,
+        observed_workspace_digest: str,
+    ) -> ReconciliationRecord:
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("reconciliation")
+            if str(row["session_id"]) != checkpoint.session_id:
+                raise ConflictError(
+                    "reconciliation discovery checkpoint belongs to another session"
+                )
+            if str(row["current_workspace_digest"]) != observed_workspace_digest:
+                raise ConflictError(
+                    "reconciliation discovery workspace digest is stale"
+                )
+            audit = _load_object(row["audit_json"])
+            existing_checkpoint_id = str(audit.get("discovery_checkpoint_id", ""))
+            if existing_checkpoint_id:
+                existing = connection.execute(
+                    "SELECT checkpoint_id FROM checkpoints WHERE checkpoint_id = ?",
+                    (existing_checkpoint_id,),
+                ).fetchone()
+                if existing is None:
+                    raise RuntimeError("reconciliation discovery checkpoint is missing")
+                return _reconciliation(row)
+            self.add_checkpoint(checkpoint)
+            audit["discovery_checkpoint_id"] = checkpoint.checkpoint_id
+            connection.execute(
+                """
+                UPDATE reconciliations SET audit_json = ?
+                WHERE reconciliation_id = ?
+                """,
+                (_dump(audit), reconciliation_id),
+            )
+            updated = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("reconciliation discovery was not recorded")
+            return _reconciliation(updated)
+
     def pending_reconciliations(
         self,
         session_id: str,
@@ -1886,18 +4608,11 @@ class StateStore:
                 raise NotFoundError("reconciliation")
             if str(row["status"]) == ReconciliationStatus.RESOLVED:
                 raise ConflictError("reconciliation is already resolved")
-            if (
-                str(row["current_workspace_digest"])
-                != observed_workspace_digest
-            ):
-                raise ConflictError(
-                    "observed workspace digest is stale"
-                )
+            if str(row["current_workspace_digest"]) != observed_workspace_digest:
+                raise ConflictError("observed workspace digest is stale")
             existing_decision = str(row["resolution"])
             if existing_decision and existing_decision != decision:
-                raise ConflictError(
-                    "reconciliation resolution is already in progress"
-                )
+                raise ConflictError("reconciliation resolution is already in progress")
             if str(row["status"]) == ReconciliationStatus.PENDING:
                 connection.execute(
                     """
@@ -1941,32 +4656,25 @@ class StateStore:
             if (
                 str(row["status"]) == ReconciliationStatus.RESOLVED
                 and str(row["resolution"]) == decision
-                and str(row["current_workspace_digest"])
-                == observed_workspace_digest
+                and str(row["current_workspace_digest"]) == observed_workspace_digest
             ):
                 return _reconciliation(row)
             if str(row["status"]) not in {
                 ReconciliationStatus.PENDING,
                 ReconciliationStatus.RESOLVING,
             }:
-                raise ConflictError(
-                    "reconciliation was already resolved differently"
-                )
-            if (
-                str(row["resolution"])
-                and str(row["resolution"]) != decision
-            ):
-                raise ConflictError(
-                    "reconciliation resolution is already in progress"
-                )
-            if (
-                str(row["current_workspace_digest"])
-                != observed_workspace_digest
-            ):
-                raise ConflictError(
-                    "observed workspace digest is stale"
-                )
+                raise ConflictError("reconciliation was already resolved differently")
+            if str(row["resolution"]) and str(row["resolution"]) != decision:
+                raise ConflictError("reconciliation resolution is already in progress")
+            if str(row["current_workspace_digest"]) != observed_workspace_digest:
+                raise ConflictError("observed workspace digest is stale")
             now = utc_now()
+            resolved_audit = self._normalize_reconciled_command_topology(
+                connection,
+                row,
+                audit,
+                now,
+            )
             connection.execute(
                 """
                 UPDATE reconciliations SET status = ?, resolution = ?,
@@ -1976,7 +4684,7 @@ class StateStore:
                 (
                     ReconciliationStatus.RESOLVED,
                     decision,
-                    _dump(audit),
+                    _dump(resolved_audit),
                     now,
                     reconciliation_id,
                     ReconciliationStatus.RESOLVED,
@@ -1990,6 +4698,397 @@ class StateStore:
                 (reconciliation_id,),
             ).fetchone()
         return _reconciliation(resolved)
+
+    def resolve_reconciliation_once(
+        self,
+        reconciliation_id: str,
+        decision: str,
+        observed_workspace_digest: str,
+        audit: dict[str, Any],
+        checkpoint: Checkpoint | None,
+        *,
+        idempotency_key: str,
+        operation: str,
+        request_digest: str,
+    ) -> tuple[ReconciliationRecord, bool]:
+        with self.transaction() as connection:
+            receipt = connection.execute(
+                """
+                SELECT * FROM mutation_receipts
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if receipt is not None:
+                if (
+                    str(receipt["operation"]) != operation
+                    or str(receipt["request_digest"]) != request_digest
+                ):
+                    raise ConflictError(
+                        "idempotency key was already used for another mutation"
+                    )
+                response = _load_object(receipt["response_json"])
+                value = _object_or_empty(response.get("reconciliation"))
+                row = connection.execute(
+                    """
+                    SELECT * FROM reconciliations
+                    WHERE reconciliation_id = ?
+                    """,
+                    (str(value.get("reconciliation_id", "")),),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "reconciliation receipt has no reconciliation row"
+                    )
+                return _reconciliation(row), False
+            row = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("reconciliation")
+            if str(row["status"]) == ReconciliationStatus.RESOLVED and (
+                str(row["resolution"]) != decision
+                or str(row["current_workspace_digest"]) != observed_workspace_digest
+            ):
+                raise ConflictError("reconciliation was already resolved differently")
+            if str(row["status"]) not in {
+                ReconciliationStatus.PENDING,
+                ReconciliationStatus.RESOLVING,
+                ReconciliationStatus.RESOLVED,
+            }:
+                raise ConflictError("reconciliation was already resolved differently")
+            if str(row["resolution"]) and str(row["resolution"]) != decision:
+                raise ConflictError("reconciliation resolution is already in progress")
+            if str(row["current_workspace_digest"]) != observed_workspace_digest:
+                raise ConflictError("observed workspace digest is stale")
+            if str(row["status"]) == ReconciliationStatus.RESOLVED:
+                record = _reconciliation(row)
+                self._insert_mutation_receipt(
+                    connection,
+                    idempotency_key=idempotency_key,
+                    operation=operation,
+                    request_digest=request_digest,
+                    response={"reconciliation": record.as_dict()},
+                    status_code=200,
+                    created_at=utc_now(),
+                )
+                return record, True
+            if checkpoint is not None:
+                existing_checkpoint = connection.execute(
+                    """
+                    SELECT checkpoint_id FROM checkpoints
+                    WHERE checkpoint_id = ?
+                    """,
+                    (checkpoint.checkpoint_id,),
+                ).fetchone()
+                if existing_checkpoint is None:
+                    self.add_checkpoint(checkpoint)
+            now = utc_now()
+            resolved_audit = self._normalize_reconciled_command_topology(
+                connection,
+                row,
+                audit,
+                now,
+            )
+            connection.execute(
+                """
+                UPDATE reconciliations SET status = ?, resolution = ?,
+                    audit_json = ?, resolved_at = ?
+                WHERE reconciliation_id = ?
+                """,
+                (
+                    ReconciliationStatus.RESOLVED,
+                    decision,
+                    _dump(resolved_audit),
+                    now,
+                    reconciliation_id,
+                ),
+            )
+            lifecycle = Lifecycle.RUNNING
+            if decision == ReconciliationDecision.STOP:
+                lifecycle = Lifecycle.STOPPED
+            connection.execute(
+                """
+                UPDATE sessions SET lifecycle = ?, attention = ?,
+                    updated_at = ? WHERE session_id = ?
+                """,
+                (
+                    lifecycle,
+                    Attention.IDLE,
+                    now,
+                    str(row["session_id"]),
+                ),
+            )
+            event = connection.execute(
+                """
+                SELECT sequence FROM events
+                WHERE session_id = ? AND event_id = ?
+                    AND event_type = 'reconciliation.resolved'
+                """,
+                (str(row["session_id"]), reconciliation_id),
+            ).fetchone()
+            if event is None:
+                sequence_row = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) AS sequence
+                    FROM events WHERE session_id = ?
+                    """,
+                    (str(row["session_id"]),),
+                ).fetchone()
+                sequence = 1
+                if sequence_row is not None:
+                    sequence = int(sequence_row["sequence"]) + 1
+                connection.execute(
+                    """
+                    INSERT INTO events VALUES (
+                        ?, ?, ?, 'reconciliation.resolved', '', '',
+                        'resolved', ?, '', '', ?
+                    )
+                    """,
+                    (
+                        str(row["session_id"]),
+                        sequence,
+                        reconciliation_id,
+                        _dump(
+                            {
+                                "reconciliation_id": reconciliation_id,
+                                "command_id": str(row["command_id"]),
+                                "decision": decision,
+                                "workspace_digest": observed_workspace_digest,
+                                "discovery_checkpoint_id": str(
+                                    resolved_audit.get(
+                                        "discovery_checkpoint_id",
+                                        "",
+                                    )
+                                ),
+                                "resolution_checkpoint_id": str(
+                                    resolved_audit.get(
+                                        "resolution_checkpoint_id",
+                                        "",
+                                    )
+                                ),
+                                "resolution_workspace_digest": str(
+                                    resolved_audit.get(
+                                        "resolution_workspace_digest",
+                                        "",
+                                    )
+                                ),
+                                "topology_receipt": _object_or_empty(
+                                    resolved_audit.get("topology_receipt")
+                                ),
+                            }
+                        ),
+                        now,
+                    ),
+                )
+            resolved = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if resolved is None:
+                raise RuntimeError("reconciliation resolution was not recorded")
+            record = _reconciliation(resolved)
+            response = {"reconciliation": record.as_dict()}
+            self._insert_mutation_receipt(
+                connection,
+                idempotency_key=idempotency_key,
+                operation=operation,
+                request_digest=request_digest,
+                response=response,
+                status_code=200,
+                created_at=now,
+            )
+            return record, True
+
+    def _normalize_reconciled_command_topology(
+        self,
+        connection: sqlite3.Connection,
+        reconciliation: sqlite3.Row,
+        audit: dict[str, Any],
+        now: str,
+    ) -> dict[str, Any]:
+        command_id = str(reconciliation["command_id"])
+        session_id = str(reconciliation["session_id"])
+        resolved_audit = dict(audit)
+        identity = _object_or_empty(resolved_audit.get("dispatch_identity"))
+        attempt_id = str(identity.get("attempt_id", ""))
+        dispatches = connection.execute(
+            """
+            SELECT * FROM command_dispatches
+            WHERE session_id = ? AND command_id = ?
+            AND crossed_boundary = 1 AND state = 'ambiguous'
+            ORDER BY created_at, attempt_id
+            """,
+            (session_id, command_id),
+        ).fetchall()
+        if attempt_id:
+            dispatches = [
+                item for item in dispatches if str(item["attempt_id"]) == attempt_id
+            ]
+        if len(dispatches) != 1:
+            raise ConflictError(
+                "reconciliation does not bind one ambiguous provider dispatch"
+            )
+        dispatch = dispatches[0]
+        attempt_id = str(dispatch["attempt_id"])
+        turn_id = str(dispatch["turn_id"])
+        if identity:
+            if str(identity.get("turn_id", "")) != turn_id:
+                raise ConflictError("reconciliation turn identity changed")
+            if str(identity.get("checkpoint_id", "")) != str(dispatch["checkpoint_id"]):
+                raise ConflictError("reconciliation checkpoint identity changed")
+
+        attempt = connection.execute(
+            """
+            SELECT * FROM provider_attempts
+            WHERE attempt_id = ? AND session_id = ?
+            """,
+            (attempt_id, session_id),
+        ).fetchone()
+        if attempt is None:
+            raise ConflictError("reconciliation provider attempt is missing")
+        turn = connection.execute(
+            """
+            SELECT * FROM turns
+            WHERE turn_id = ? AND attempt_id = ? AND session_id = ?
+            """,
+            (turn_id, attempt_id, session_id),
+        ).fetchone()
+        if turn is None:
+            raise ConflictError("reconciliation turn is missing")
+
+        lease_id = str(identity.get("lease_id", ""))
+        lease_rows = connection.execute(
+            """
+            SELECT * FROM process_leases
+            WHERE session_id = ? AND command_id = ? AND attempt_id = ?
+            ORDER BY created_at, lease_id
+            """,
+            (session_id, command_id, attempt_id),
+        ).fetchall()
+        if lease_id:
+            lease_rows = [
+                item for item in lease_rows if str(item["lease_id"]) == lease_id
+            ]
+            if len(lease_rows) != 1:
+                raise ConflictError("reconciliation process lease identity changed")
+        active_lease_rows = [
+            item
+            for item in lease_rows
+            if str(item["state"]) in {"reserved", "active", "recovery-blocked"}
+        ]
+        if len(active_lease_rows) > 1:
+            raise ConflictError("reconciliation has multiple active process leases")
+        lease_receipts: list[dict[str, Any]] = []
+        for lease in lease_rows:
+            prior_state = str(lease["state"])
+            if prior_state in {"reserved", "active", "recovery-blocked"}:
+                connection.execute(
+                    """
+                    UPDATE process_leases SET state = 'released',
+                        expires_at = ?, updated_at = ?
+                    WHERE lease_id = ?
+                    AND state IN ('reserved', 'active', 'recovery-blocked')
+                    """,
+                    (now, now, str(lease["lease_id"])),
+                )
+            lease_receipts.append(
+                {
+                    "lease_id": str(lease["lease_id"]),
+                    "attempt_id": attempt_id,
+                    "worker_incarnation": str(lease["worker_incarnation"]),
+                    "pid": int(lease["pid"]),
+                    "pid_start": str(lease["pid_start"]),
+                    "prior_state": prior_state,
+                    "state": "released",
+                }
+            )
+
+        connection.execute(
+            """
+            UPDATE provider_attempts SET status = 'ambiguous',
+                ended_at = CASE WHEN ended_at = '' THEN ? ELSE ended_at END
+            WHERE attempt_id = ?
+            """,
+            (now, attempt_id),
+        )
+        connection.execute(
+            """
+            UPDATE turns SET status = 'ambiguous',
+                completed_at = CASE
+                    WHEN completed_at = '' THEN ? ELSE completed_at END
+            WHERE turn_id = ?
+            """,
+            (now, turn_id),
+        )
+        connection.execute(
+            """
+            UPDATE command_dispatches SET state = 'ambiguous', updated_at = ?
+            WHERE attempt_id = ?
+            """,
+            (now, attempt_id),
+        )
+        envelope = connection.execute(
+            """
+            SELECT command_id FROM command_envelopes WHERE command_id = ?
+            """,
+            (command_id,),
+        ).fetchone()
+        envelope_state = ""
+        guard_reason = ""
+        if envelope is not None:
+            envelope_state = "paused"
+            guard_reason = "ambiguous-provider-dispatch"
+            connection.execute(
+                """
+                UPDATE command_envelopes SET state = ?, guard_reason = ?,
+                    updated_at = ? WHERE command_id = ?
+                """,
+                (envelope_state, guard_reason, now, command_id),
+            )
+        resolved_audit["dispatch_identity"] = {
+            "attempt_id": attempt_id,
+            "turn_id": turn_id,
+            "checkpoint_id": str(dispatch["checkpoint_id"]),
+            "lease_id": "",
+            "worker_incarnation": "",
+            "pid": 0,
+            "pid_start": "",
+        }
+        if lease_receipts:
+            first_lease = lease_receipts[0]
+            resolved_audit["dispatch_identity"].update(
+                {
+                    "lease_id": str(first_lease["lease_id"]),
+                    "worker_incarnation": str(first_lease["worker_incarnation"]),
+                    "pid": int(first_lease["pid"]),
+                    "pid_start": str(first_lease["pid_start"]),
+                }
+            )
+        resolved_audit["topology_receipt"] = {
+            "schema": "p13i/agent-harness/reconciliation-topology-receipt/v1",
+            "reconciliation_id": str(reconciliation["reconciliation_id"]),
+            "session_id": session_id,
+            "command_id": command_id,
+            "attempt_id": attempt_id,
+            "turn_id": turn_id,
+            "checkpoint_id": str(dispatch["checkpoint_id"]),
+            "attempt_state": "ambiguous",
+            "turn_state": "ambiguous",
+            "dispatch_state": "ambiguous",
+            "envelope_state": envelope_state,
+            "guard_reason": guard_reason,
+            "leases": lease_receipts,
+            "recorded_at": now,
+        }
+        return resolved_audit
 
     def create_approval(
         self,
@@ -2059,9 +5158,7 @@ class StateStore:
             "approval_id": str(row["approval_id"]),
             "session_id": str(row["session_id"]),
             "turn_id": str(row["turn_id"]),
-            "provider_request_id": str(
-                row["provider_request_id"]
-            ),
+            "provider_request_id": str(row["provider_request_id"]),
             "kind": str(row["kind"]),
             "prompt": str(row["prompt"]),
             "choices": json.loads(row["choices_json"]),
@@ -2127,6 +5224,16 @@ class StateStore:
                 "SELECT * FROM session_safety WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
+            authorization_row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM xhigh_authorization_receipts
+                WHERE session_id = ? AND consumed_at = '' AND expires_at > ?
+                """,
+                (session_id, utc_now()),
+            ).fetchone()
+        xhigh_authorizations = 0
+        if authorization_row is not None:
+            xhigh_authorizations = int(authorization_row["count"])
         if row is None:
             return {
                 "session_id": session_id,
@@ -2139,9 +5246,7 @@ class StateStore:
         return {
             "session_id": str(row["session_id"]),
             "profile": str(row["profile"]),
-            "xhigh_authorizations": int(
-                row["xhigh_authorizations"]
-            ),
+            "xhigh_authorizations": xhigh_authorizations,
             "extensions": _load_object(row["extensions_json"]),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
@@ -2157,19 +5262,14 @@ class StateStore:
             raise ConflictError("session execution profile is not claimed")
         extensions = dict(current["extensions"])
         extensions.update(extension)
-        xhigh = int(current["xhigh_authorizations"])
-        if extension.get("allow_xhigh_once") is True:
-            xhigh += 1
+        extensions.pop("allow_xhigh_once", None)
         with self.transaction() as connection:
             connection.execute(
                 """
-                UPDATE session_safety
-                SET xhigh_authorizations = ?, extensions_json = ?,
-                    updated_at = ?
+                UPDATE session_safety SET extensions_json = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
-                    xhigh,
                     _dump(extensions),
                     utc_now(),
                     session_id,
@@ -2177,18 +5277,124 @@ class StateStore:
             )
         return self.session_safety(session_id)
 
-    def consume_xhigh_authorization(self, session_id: str) -> bool:
+    def create_xhigh_authorization(
+        self,
+        session_id: str,
+        command_id: str,
+        provider: str,
+        *,
+        authorization_request_digest: str,
+        idempotency_key: str,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        if provider not in {"claude", "codex"}:
+            raise ValueError("xhigh authorization provider is unsupported")
+        if not idempotency_key:
+            raise ValueError("xhigh authorization idempotency key is required")
+        now = utc_now()
         with self.transaction() as connection:
-            cursor = connection.execute(
+            existing = connection.execute(
                 """
-                UPDATE session_safety
-                SET xhigh_authorizations = xhigh_authorizations - 1,
-                    updated_at = ?
-                WHERE session_id = ? AND xhigh_authorizations > 0
+                SELECT * FROM xhigh_authorization_receipts
+                WHERE idempotency_key = ?
                 """,
-                (utc_now(), session_id),
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["session_id"]) != session_id
+                    or str(existing["command_id"]) != command_id
+                    or str(existing["provider"]) != provider
+                    or str(existing["authorization_request_digest"])
+                    != authorization_request_digest
+                ):
+                    raise ConflictError("xhigh authorization key was reused")
+                return dict(existing)
+            command = connection.execute(
+                "SELECT * FROM commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if command is None:
+                raise NotFoundError("command")
+            if str(command["session_id"]) != session_id:
+                raise ConflictError("xhigh authorization command changed session")
+            if str(command["status"]) not in {
+                CommandStatus.QUEUED,
+                CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                CommandStatus.DISPATCHING,
+            }:
+                raise ConflictError("xhigh authorization command is not active")
+            command_payload = _load_object(str(command["payload_json"]))
+            if str(command_payload.get("effort", "")) != "xhigh":
+                raise ConflictError("xhigh authorization command effort changed")
+            requested_provider = str(command_payload.get("provider", ""))
+            if requested_provider and requested_provider != provider:
+                raise ConflictError("xhigh authorization command provider changed")
+            command_authorization = connection.execute(
+                """
+                SELECT authorization_id FROM xhigh_authorization_receipts
+                WHERE command_id = ?
+                """,
+                (command_id,),
+            ).fetchone()
+            if command_authorization is not None:
+                raise ConflictError("xhigh command already has an authorization")
+            command_request_digest = normalized_digest(command_payload)
+            authorization_id = new_uuid()
+            connection.execute(
+                """
+                INSERT INTO xhigh_authorization_receipts VALUES (
+                    ?, ?, ?, ?, 'xhigh', ?, ?, ?, ?, '', '', ?
+                )
+                """,
+                (
+                    authorization_id,
+                    session_id,
+                    command_id,
+                    provider,
+                    command_request_digest,
+                    authorization_request_digest,
+                    idempotency_key,
+                    expires_at,
+                    now,
+                ),
             )
-        return cursor.rowcount == 1
+            if str(command["status"]) == CommandStatus.AWAITING_XHIGH_AUTHORIZATION:
+                connection.execute(
+                    """
+                    UPDATE commands SET status = ?, updated_at = ?
+                    WHERE command_id = ? AND status = ?
+                    """,
+                    (
+                        CommandStatus.QUEUED,
+                        now,
+                        command_id,
+                        CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                    ),
+                )
+            row = connection.execute(
+                """
+                SELECT * FROM xhigh_authorization_receipts
+                WHERE authorization_id = ?
+                """,
+                (authorization_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("xhigh authorization was not recorded")
+        return dict(row)
+
+    def xhigh_authorization(self, command_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM xhigh_authorization_receipts
+                WHERE command_id = ? AND consumed_at = '' AND expires_at > ?
+                """,
+                (command_id, utc_now()),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
 
     def consume_session_extensions(
         self,
@@ -2203,9 +5409,7 @@ class StateStore:
                 (session_id,),
             ).fetchone()
             if row is None:
-                raise ConflictError(
-                    "session execution profile is not claimed"
-                )
+                raise ConflictError("session execution profile is not claimed")
             extension = _load_object(row["extensions_json"])
             connection.execute(
                 """
@@ -2232,9 +5436,12 @@ class StateStore:
             "output_tokens": 0,
             "total_tokens": 0,
             "tool_calls": 0,
+            "child_agents": 0,
+            "dollars": 0.0,
             "attempts": 0,
             "elapsed_seconds": 0.0,
             "exact_tokens": False,
+            "exact_dollars": False,
         }
         with self.transaction() as connection:
             connection.execute(
@@ -2260,11 +5467,19 @@ class StateStore:
     def command_envelope(self, command_id: str) -> dict[str, Any]:
         with self._lock:
             row = self._connection.execute(
-                "SELECT * FROM command_envelopes WHERE command_id = ?",
+                """
+                SELECT e.*, c.payload_json FROM command_envelopes AS e
+                JOIN commands AS c ON c.command_id = e.command_id
+                WHERE e.command_id = ?
+                """,
                 (command_id,),
             ).fetchone()
         if row is None:
             raise NotFoundError("command envelope")
+        command_payload = _load_object(str(row["payload_json"]))
+        requested_limits = command_payload.get("safety_limits")
+        if not isinstance(requested_limits, dict):
+            requested_limits = {}
         return {
             "command_id": str(row["command_id"]),
             "session_id": str(row["session_id"]),
@@ -2272,9 +5487,59 @@ class StateStore:
             "profile": str(row["profile"]),
             "state": str(row["state"]),
             "limits": _load_object(row["limits_json"]),
+            "requested_limits": requested_limits,
+            "requested_limits_digest": normalized_digest(requested_limits),
             "consumption": _load_object(row["consumption_json"]),
             "guard_reason": str(row["guard_reason"]),
             "recovery_stage": int(row["recovery_stage"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def create_child_launch_gate(
+        self,
+        command_id: str,
+        session_id: str,
+        permit_limit: int,
+    ) -> dict[str, Any]:
+        if permit_limit < 0:
+            raise ValueError("child launch permit limit must not be negative")
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO child_launch_gates(
+                    command_id, session_id, permit_limit, consumed,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 0, ?, ?)
+                """,
+                (command_id, session_id, permit_limit, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM child_launch_gates WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("child launch gate was not created")
+            if str(row["session_id"]) != session_id:
+                raise ConflictError("child launch gate session changed")
+            if int(row["permit_limit"]) != permit_limit:
+                raise ConflictError("child launch gate permit limit changed")
+        return self.child_launch_gate(command_id)
+
+    def child_launch_gate(self, command_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM child_launch_gates WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("child launch gate")
+        return {
+            "command_id": str(row["command_id"]),
+            "session_id": str(row["session_id"]),
+            "permit_limit": int(row["permit_limit"]),
+            "consumed": int(row["consumed"]),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
         }
@@ -2317,15 +5582,214 @@ class StateStore:
                 raise NotFoundError("command envelope")
         return self.command_envelope(command_id)
 
+    def reserve_route_admission(
+        self,
+        command_id: str,
+        provider: str,
+        profile: str,
+        *,
+        effort: str = "",
+        attempt_id: str = "",
+        worker_incarnation: str,
+        goal_id: str,
+        max_concurrency: int,
+        lease_expires_at: str,
+    ) -> dict[str, Any]:
+        if max_concurrency < 1:
+            raise ValueError("route admission concurrency must be positive")
+        now = utc_now()
+        lease_id = ""
+        with self.transaction() as connection:
+            envelope = connection.execute(
+                "SELECT * FROM command_envelopes WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if envelope is None:
+                raise NotFoundError("command envelope")
+            if str(envelope["profile"]) != profile:
+                raise ConflictError("route admission profile changed")
+            if str(envelope["state"]) not in {"reserved", "recovering"}:
+                raise ConflictError("route admission envelope is not reservable")
+            session = connection.execute(
+                "SELECT goal_id, worktree FROM sessions WHERE session_id = ?",
+                (str(envelope["session_id"]),),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session")
+            worker = connection.execute(
+                """
+                SELECT incarnation FROM workers WHERE session_id = ?
+                """,
+                (str(envelope["session_id"]),),
+            ).fetchone()
+            if worker is None or str(worker["incarnation"]) != worker_incarnation:
+                raise WorkerOwnershipLostError(
+                    "worker incarnation lost route-admission ownership"
+                )
+            if goal_id and str(session["goal_id"]) != goal_id:
+                raise ConflictError("route admission goal changed")
+            if profile == "unattended":
+                provider_row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM command_envelopes
+                    WHERE provider = ? AND profile = 'unattended'
+                    AND state IN ('reserved', 'running', 'fault-ready', 'recovering')
+                    AND command_id != ?
+                    """,
+                    (provider, command_id),
+                ).fetchone()
+                if provider_row is not None and int(provider_row["count"]) >= 1:
+                    return {
+                        "admitted": False,
+                        "reason": "provider-concurrency",
+                        "lease_id": "",
+                    }
+            if goal_id:
+                goal_row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM command_envelopes AS active_envelope
+                    JOIN sessions AS active_session
+                        ON active_session.session_id = active_envelope.session_id
+                    WHERE active_session.goal_id = ?
+                    AND active_envelope.state IN (
+                        'reserved', 'running', 'fault-ready', 'recovering'
+                    )
+                    AND active_envelope.provider != ''
+                    AND active_envelope.command_id != ?
+                    """,
+                    (goal_id, command_id),
+                ).fetchone()
+                if goal_row is not None and int(goal_row["count"]) >= max_concurrency:
+                    return {
+                        "admitted": False,
+                        "reason": "goal-concurrency",
+                        "lease_id": "",
+                    }
+            if profile != "interactive" and effort == "xhigh":
+                command = connection.execute(
+                    "SELECT payload_json FROM commands WHERE command_id = ?",
+                    (command_id,),
+                ).fetchone()
+                if command is None:
+                    raise NotFoundError("command")
+                command_payload = _load_object(str(command["payload_json"]))
+                command_request_digest = normalized_digest(command_payload)
+                authorization = connection.execute(
+                    """
+                    SELECT authorization_id
+                    FROM xhigh_authorization_receipts
+                    WHERE command_id = ? AND provider = ? AND effort = 'xhigh'
+                    AND command_request_digest = ? AND consumed_at = ''
+                    AND expires_at > ?
+                    """,
+                    (command_id, provider, command_request_digest, now),
+                ).fetchone()
+                if authorization is None or not attempt_id:
+                    return {
+                        "admitted": False,
+                        "reason": "xhigh-authorization",
+                        "lease_id": "",
+                    }
+                consumed = connection.execute(
+                    """
+                    UPDATE xhigh_authorization_receipts
+                    SET consumed_attempt_id = ?, consumed_at = ?
+                    WHERE authorization_id = ? AND consumed_at = ''
+                    """,
+                    (
+                        attempt_id,
+                        now,
+                        str(authorization["authorization_id"]),
+                    ),
+                )
+                if consumed.rowcount != 1:
+                    return {
+                        "admitted": False,
+                        "reason": "xhigh-authorization",
+                        "lease_id": "",
+                    }
+            self._consume_reserved_dispatch_transition(
+                connection,
+                str(envelope["session_id"]),
+                command_id,
+                Path(str(session["worktree"])),
+            )
+            if attempt_id:
+                boundary = connection.execute(
+                    """
+                    UPDATE command_dispatches SET crossed_boundary = 1,
+                        state = 'dispatched', updated_at = ?
+                    WHERE attempt_id = ? AND crossed_boundary = 0
+                    """,
+                    (now, attempt_id),
+                )
+                if boundary.rowcount != 1:
+                    raise ConflictError("provider dispatch boundary is stale")
+            connection.execute(
+                """
+                UPDATE command_envelopes SET provider = ?, state = 'running',
+                    updated_at = ? WHERE command_id = ?
+                """,
+                (provider, now, command_id),
+            )
+            if profile != "interactive":
+                lease_id = new_uuid()
+                connection.execute(
+                    """
+                    INSERT INTO process_leases(
+                        lease_id, session_id, command_id, attempt_id,
+                        worker_incarnation,
+                        provider, profile, pid, pid_start, state,
+                        expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', 'reserved', ?, ?, ?)
+                    """,
+                    (
+                        lease_id,
+                        str(envelope["session_id"]),
+                        command_id,
+                        attempt_id,
+                        worker_incarnation,
+                        provider,
+                        profile,
+                        lease_expires_at,
+                        now,
+                        now,
+                    ),
+                )
+        return {
+            "admitted": True,
+            "reason": "",
+            "lease_id": lease_id,
+        }
+
     def active_unattended_provider_count(self, provider: str) -> int:
         with self._lock:
             row = self._connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM command_envelopes
                 WHERE provider = ? AND profile = 'unattended'
-                AND state IN ('reserved', 'running', 'recovering')
+                AND state IN ('reserved', 'running', 'fault-ready', 'recovering')
                 """,
                 (provider,),
+            ).fetchone()
+        return int(row["count"])
+
+    def active_goal_command_count(self, goal_id: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM command_envelopes AS envelope
+                JOIN sessions AS session
+                    ON session.session_id = envelope.session_id
+                WHERE session.goal_id = ?
+                AND envelope.state IN (
+                    'reserved', 'running', 'fault-ready', 'recovering'
+                )
+                AND envelope.provider != ''
+                """,
+                (goal_id,),
             ).fetchone()
         return int(row["count"])
 
@@ -2338,9 +5802,7 @@ class StateStore:
                 """,
                 (session_id,),
             ).fetchall()
-        return [
-            self.command_envelope(str(row["command_id"])) for row in rows
-        ]
+        return [self.command_envelope(str(row["command_id"])) for row in rows]
 
     def add_guard_incident(
         self,
@@ -2400,8 +5862,10 @@ class StateStore:
         with self.transaction() as connection:
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO context_deliveries
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO context_deliveries(
+                    session_id, provider, context_digest,
+                    checkpoint_id, delivered_at, state, accepted_at
+                ) VALUES (?, ?, ?, ?, ?, 'delivered', ?)
                 """,
                 (
                     session_id,
@@ -2409,9 +5873,175 @@ class StateStore:
                     context_digest,
                     checkpoint_id,
                     utc_now(),
+                    utc_now(),
                 ),
             )
         return cursor.rowcount == 1
+
+    def prepare_context_delivery(
+        self,
+        session_id: str,
+        provider: str,
+        context_digest: str,
+        checkpoint_id: str,
+        command_id: str,
+        attempt_id: str,
+        payload_digest: str,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            prior_command_rows = connection.execute(
+                """
+                SELECT * FROM context_deliveries
+                WHERE session_id = ? AND provider = ? AND command_id = ?
+                    AND attempt_id != ?
+                """,
+                (session_id, provider, command_id, attempt_id),
+            ).fetchall()
+            for prior in prior_command_rows:
+                dispatch = connection.execute(
+                    """
+                    SELECT crossed_boundary FROM command_dispatches
+                    WHERE attempt_id = ?
+                    """,
+                    (str(prior["attempt_id"]),),
+                ).fetchone()
+                crossed_boundary = False
+                if dispatch is not None:
+                    crossed_boundary = int(dispatch["crossed_boundary"]) > 0
+                if str(prior["state"]) == "delivered" or crossed_boundary:
+                    raise ConflictError(
+                        "prior context delivery for this command is ambiguous"
+                    )
+                connection.execute(
+                    """
+                    DELETE FROM context_deliveries
+                    WHERE session_id = ? AND provider = ? AND context_digest = ?
+                    """,
+                    (
+                        session_id,
+                        provider,
+                        str(prior["context_digest"]),
+                    ),
+                )
+            existing = connection.execute(
+                """
+                SELECT * FROM context_deliveries
+                WHERE session_id = ? AND provider = ? AND context_digest = ?
+                """,
+                (session_id, provider, context_digest),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["attempt_id"]) == attempt_id:
+                    return dict(existing)
+                if str(existing["state"]) == "delivered":
+                    raise ConflictError(
+                        "context package was already delivered without native resume"
+                    )
+                dispatch = connection.execute(
+                    """
+                    SELECT crossed_boundary FROM command_dispatches
+                    WHERE attempt_id = ?
+                    """,
+                    (str(existing["attempt_id"]),),
+                ).fetchone()
+                if dispatch is not None and int(dispatch["crossed_boundary"]) > 0:
+                    raise ConflictError(
+                        "context package delivery is ambiguous; reconcile first"
+                    )
+                connection.execute(
+                    """
+                    UPDATE context_deliveries SET checkpoint_id = ?,
+                        command_id = ?, attempt_id = ?, state = 'prepared',
+                        payload_digest = ?, delivered_at = '', accepted_at = ''
+                    WHERE session_id = ? AND provider = ? AND context_digest = ?
+                    """,
+                    (
+                        checkpoint_id,
+                        command_id,
+                        attempt_id,
+                        payload_digest,
+                        session_id,
+                        provider,
+                        context_digest,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO context_deliveries(
+                        session_id, provider, context_digest, checkpoint_id,
+                        delivered_at, command_id, attempt_id, state,
+                        payload_digest, accepted_at
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, 'prepared', ?, '')
+                    """,
+                    (
+                        session_id,
+                        provider,
+                        context_digest,
+                        checkpoint_id,
+                        command_id,
+                        attempt_id,
+                        payload_digest,
+                    ),
+                )
+            row = connection.execute(
+                """
+                SELECT * FROM context_deliveries
+                WHERE session_id = ? AND provider = ? AND context_digest = ?
+                """,
+                (session_id, provider, context_digest),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("context delivery preparation was not recorded")
+            return dict(row)
+
+    def accept_context_delivery(
+        self,
+        session_id: str,
+        provider: str,
+        context_digest: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE context_deliveries SET state = 'delivered',
+                    delivered_at = ?, accepted_at = ?
+                WHERE session_id = ? AND provider = ? AND context_digest = ?
+                    AND attempt_id = ? AND state = 'prepared'
+                """,
+                (
+                    now,
+                    now,
+                    session_id,
+                    provider,
+                    context_digest,
+                    attempt_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    """
+                    SELECT * FROM context_deliveries
+                    WHERE session_id = ? AND provider = ? AND context_digest = ?
+                    """,
+                    (session_id, provider, context_digest),
+                ).fetchone()
+                if row is None or str(row["attempt_id"]) != attempt_id:
+                    raise ConflictError("context delivery acceptance is stale")
+                if str(row["state"]) != "delivered":
+                    raise ConflictError("context delivery acceptance is invalid")
+            row = connection.execute(
+                """
+                SELECT * FROM context_deliveries
+                WHERE session_id = ? AND provider = ? AND context_digest = ?
+                """,
+                (session_id, provider, context_digest),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("context delivery acceptance was not recorded")
+            return dict(row)
 
     def create_process_lease(
         self,
@@ -2425,8 +6055,12 @@ class StateStore:
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO process_leases
-                VALUES (?, ?, ?, ?, 0, '', 'reserved', ?, ?, ?)
+                INSERT INTO process_leases(
+                    lease_id, session_id, command_id, attempt_id,
+                    worker_incarnation,
+                    provider, profile, pid, pid_start, state,
+                    expires_at, created_at, updated_at
+                ) VALUES (?, ?, '', '', '', ?, ?, 0, '', 'reserved', ?, ?, ?)
                 """,
                 (
                     lease_id,
@@ -2451,6 +6085,9 @@ class StateStore:
         return {
             "lease_id": str(row["lease_id"]),
             "session_id": str(row["session_id"]),
+            "command_id": str(row["command_id"]),
+            "attempt_id": str(row["attempt_id"]),
+            "worker_incarnation": str(row["worker_incarnation"]),
             "provider": str(row["provider"]),
             "profile": str(row["profile"]),
             "pid": int(row["pid"]),
@@ -2499,9 +6136,31 @@ class StateStore:
             rows = self._connection.execute(
                 """
                 SELECT lease_id FROM process_leases
-                WHERE state IN ('reserved', 'active')
+                WHERE state IN ('reserved', 'active', 'recovery-blocked')
                 ORDER BY created_at, lease_id
                 """
+            ).fetchall()
+        return [self.process_lease(str(row["lease_id"])) for row in rows]
+
+    def all_process_leases(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT lease_id FROM process_leases
+                ORDER BY created_at, lease_id
+                """
+            ).fetchall()
+        return [self.process_lease(str(row["lease_id"])) for row in rows]
+
+    def process_leases(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT lease_id FROM process_leases
+                WHERE session_id = ?
+                ORDER BY created_at, lease_id
+                """,
+                (session_id,),
             ).fetchall()
         return [self.process_lease(str(row["lease_id"])) for row in rows]
 
@@ -2525,14 +6184,59 @@ class StateStore:
             str(row["operation"]) != operation
             or str(row["request_digest"]) != request_digest
         ):
-            raise ConflictError(
-                "idempotency key was already used for "
-                "another mutation"
-            )
+            raise ConflictError("idempotency key was already used for another mutation")
         return {
             "response": _load_object(row["response_json"]),
             "status_code": int(row["status_code"]),
         }
+
+    def idempotent_mutation(
+        self,
+        idempotency_key: str,
+        operation: str,
+        request_digest: str,
+        mutate: Callable[[], dict[str, Any]],
+        status_code: int,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM mutation_receipts
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                if (
+                    str(row["operation"]) != operation
+                    or str(row["request_digest"]) != request_digest
+                ):
+                    raise ConflictError(
+                        "idempotency key was already used for another mutation"
+                    )
+                return {
+                    "response": _load_object(row["response_json"]),
+                    "status_code": int(row["status_code"]),
+                }
+            response = mutate()
+            connection.execute(
+                """
+                INSERT INTO mutation_receipts
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    operation,
+                    request_digest,
+                    _dump(response),
+                    status_code,
+                    utc_now(),
+                ),
+            )
+            return {
+                "response": response,
+                "status_code": status_code,
+            }
 
     def record_mutation_receipt(
         self,
@@ -2605,6 +6309,7 @@ class StateStore:
         result: dict[str, dict[str, Any]] = {}
         for row in rows:
             result[str(row["provider"])] = {
+                "sample_id": str(row["sample_id"]),
                 "provider": str(row["provider"]),
                 "observed_at": str(row["observed_at"]),
                 "binding_percent": row["binding_percent"],
@@ -2719,6 +6424,73 @@ class StateStore:
             )
         return decision_id
 
+    def create_proof_snapshot(
+        self,
+        session_id: str,
+        through_sequence: int,
+        payload: dict[str, Any],
+        digest: str,
+    ) -> dict[str, Any]:
+        snapshot_id = new_uuid()
+        created_at = utc_now()
+        cutoff = datetime.datetime.now(datetime.UTC)
+        cutoff -= datetime.timedelta(
+            hours=PROOF_SNAPSHOT_RETENTION_HOURS,
+        )
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM proof_snapshots
+                WHERE session_id = ? AND created_at < ?
+                """,
+                (session_id, cutoff.isoformat()),
+            )
+            retained = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM proof_snapshots
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if int(retained["count"]) >= PROOF_SNAPSHOT_MAX_PER_SESSION:
+                raise ConflictError("proof snapshot retention quota is full")
+            connection.execute(
+                "INSERT INTO proof_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    snapshot_id,
+                    session_id,
+                    through_sequence,
+                    _dump(payload),
+                    digest,
+                    created_at,
+                ),
+            )
+        return {
+            "snapshot_id": snapshot_id,
+            "session_id": session_id,
+            "through_sequence": through_sequence,
+            "payload": payload,
+            "digest": digest,
+            "created_at": created_at,
+        }
+
+    def proof_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM proof_snapshots WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("proof snapshot")
+        return {
+            "snapshot_id": str(row["snapshot_id"]),
+            "session_id": str(row["session_id"]),
+            "through_sequence": int(row["through_sequence"]),
+            "payload": _load_object(row["payload_json"]),
+            "digest": str(row["digest"]),
+            "created_at": str(row["created_at"]),
+        }
+
     def register_worker(
         self,
         session_id: str,
@@ -2747,6 +6519,17 @@ class StateStore:
                 (utc_now(), session_id, incarnation),
             )
         return cursor.rowcount == 1
+
+    def worker_owned(self, session_id: str, incarnation: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM workers
+                WHERE session_id = ? AND incarnation = ?
+                """,
+                (session_id, incarnation),
+            ).fetchone()
+        return row is not None
 
     def remove_worker(self, session_id: str, incarnation: str) -> None:
         with self.transaction() as connection:
@@ -2798,7 +6581,12 @@ class StateStore:
             return {}
         return _load_object(row["value_json"])
 
-    def portable_session(self, session_id: str) -> dict[str, Any]:
+    def portable_session(
+        self,
+        session_id: str,
+        *,
+        include_events: bool = True,
+    ) -> dict[str, Any]:
         self.get_session(session_id)
         with self._lock:
             goals = self._portable_rows(
@@ -2807,6 +6595,12 @@ class StateStore:
                 (session_id,),
             )
             goal_ids = tuple(str(item["goal_id"]) for item in goals)
+            promotions = self._portable_rows(
+                "goal_promotions",
+                "session_id = ?",
+                (session_id,),
+            )
+            promotion_ids = tuple(str(item["promotion_id"]) for item in promotions)
             tables = {
                 "sessions": self._portable_rows(
                     "sessions",
@@ -2823,17 +6617,24 @@ class StateStore:
                     "session_id = ?",
                     (session_id,),
                 ),
-                "events": self._portable_rows(
-                    "events",
-                    "session_id = ?",
-                    (session_id,),
-                ),
+                "events": [],
                 "commands": self._portable_rows(
                     "commands",
                     "session_id = ?",
                     (session_id,),
                 ),
                 "goals": goals,
+                "goal_promotions": promotions,
+                "goal_contract_adoptions": self._portable_rows(
+                    "goal_contract_adoptions",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "goal_milestones": self._portable_rows_for_values(
+                    "goal_milestones",
+                    "goal_id",
+                    goal_ids,
+                ),
                 "milestones": self._portable_rows_for_values(
                     "milestones",
                     "goal_id",
@@ -2843,6 +6644,31 @@ class StateStore:
                     "evidence",
                     "goal_id",
                     goal_ids,
+                ),
+                "goal_promotion_evidence": self._portable_rows_for_values(
+                    "goal_promotion_evidence",
+                    "promotion_id",
+                    promotion_ids,
+                ),
+                "dispatch_transition_policies": self._portable_rows(
+                    "dispatch_transition_policies",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "authorization_receipts": self._portable_rows(
+                    "authorization_receipts",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "dispatch_invalidations": self._portable_rows(
+                    "dispatch_invalidations",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "dispatch_transition_ledger": self._portable_rows(
+                    "dispatch_transition_ledger",
+                    "session_id = ?",
+                    (session_id,),
                 ),
                 "approvals": self._portable_rows(
                     "approvals",
@@ -2859,10 +6685,32 @@ class StateStore:
                     "session_id = ?",
                     (session_id,),
                 ),
+                "xhigh_authorization_receipts": self._portable_rows(
+                    "xhigh_authorization_receipts",
+                    "session_id = ?",
+                    (session_id,),
+                ),
                 "command_envelopes": self._portable_rows(
                     "command_envelopes",
                     "session_id = ?",
                     (session_id,),
+                ),
+                "child_launch_gates": self._portable_rows(
+                    "child_launch_gates",
+                    "session_id = ?",
+                    (session_id,),
+                ),
+                "child_launch_admissions": self._portable_rows_for_values(
+                    "child_launch_admissions",
+                    "command_id",
+                    tuple(
+                        str(row["command_id"])
+                        for row in self._portable_rows(
+                            "commands",
+                            "session_id = ?",
+                            (session_id,),
+                        )
+                    ),
                 ),
                 "guard_incidents": self._portable_rows(
                     "guard_incidents",
@@ -2910,6 +6758,12 @@ class StateStore:
                     (session_id,),
                 ),
             }
+            if include_events:
+                tables["events"] = self._portable_rows(
+                    "events",
+                    "session_id = ?",
+                    (session_id,),
+                )
         return {
             "schema": "p13i/agent-harness/chat-record/v1",
             "database_schema_version": SCHEMA_VERSION,
@@ -2921,9 +6775,7 @@ class StateStore:
         with self._lock:
             tables = {
                 "usage_samples": self._portable_rows("usage_samples"),
-                "mutation_receipts": self._portable_rows(
-                    "mutation_receipts"
-                ),
+                "mutation_receipts": self._portable_rows("mutation_receipts"),
                 "ui_state": self._portable_rows(
                     "ui_state",
                     "key NOT LIKE ?",
@@ -2974,9 +6826,7 @@ class StateStore:
             table: [] for table in PORTABLE_SESSION_TABLES
         }
         for record in records:
-            if record.get("schema") != (
-                "p13i/agent-harness/chat-record/v1"
-            ):
+            if record.get("schema") != ("p13i/agent-harness/chat-record/v1"):
                 raise ValueError("portable chat record schema is unsupported")
             tables = _require_object(record.get("tables"), "tables")
             for table in PORTABLE_SESSION_TABLES:
@@ -2984,12 +6834,8 @@ class StateStore:
                 if not isinstance(rows, list):
                     raise ValueError(table + " must be a list")
                 for row in rows:
-                    table_rows[table].append(
-                        _require_object(row, table + " row")
-                    )
-        if global_record.get("schema") != (
-            "p13i/agent-harness/chat-global/v1"
-        ):
+                    table_rows[table].append(_require_object(row, table + " row"))
+        if global_record.get("schema") != ("p13i/agent-harness/chat-global/v1"):
             raise ValueError("portable global schema is unsupported")
         global_tables = _require_object(
             global_record.get("tables"),
@@ -2999,8 +6845,7 @@ class StateStore:
         if not isinstance(global_ui, list):
             raise ValueError("global ui_state must be a list")
         validated_global_ui = [
-            _require_object(row, "ui_state row")
-            for row in global_ui
+            _require_object(row, "ui_state row") for row in global_ui
         ]
         if not merge_global:
             table_rows["ui_state"].extend(validated_global_ui)
@@ -3022,10 +6867,7 @@ class StateStore:
                 rows = global_tables.get(table, [])
                 if not isinstance(rows, list):
                     raise ValueError(table + " must be a list")
-                validated = [
-                    _require_object(row, table + " row")
-                    for row in rows
-                ]
+                validated = [_require_object(row, table + " row") for row in rows]
                 if merge_global:
                     self._merge_portable_rows(
                         connection,
@@ -3058,22 +6900,15 @@ class StateStore:
             )
             session_id = str(row.get("session_id", ""))
             portable_session_id = portable_refs.get(key)
-            if (
-                portable_session_id is not None
-                and portable_session_id != session_id
-            ):
+            if portable_session_id is not None and portable_session_id != session_id:
                 raise ConflictError(
                     "portable external reference names two session UUIDs"
                 )
             portable_refs[key] = session_id
             existing = self.get_session_by_external_ref(*key)
-            if (
-                existing is not None
-                and existing.session_id != session_id
-            ):
+            if existing is not None and existing.session_id != session_id:
                 raise ConflictError(
-                    "portable external reference conflicts with "
-                    "an existing session"
+                    "portable external reference conflicts with an existing session"
                 )
 
     def _portable_rows(
@@ -3144,21 +6979,15 @@ class StateStore:
         primary_key = [
             str(row["name"])
             for row in sorted(
-                connection.execute(
-                    "PRAGMA table_info(" + table + ")"
-                ).fetchall(),
+                connection.execute("PRAGMA table_info(" + table + ")").fetchall(),
                 key=lambda row: int(row["pk"]),
             )
             if int(row["pk"]) > 0
         ]
         if not primary_key:
-            raise RuntimeError(
-                "portable merge table lacks a primary key: " + table
-            )
+            raise RuntimeError("portable merge table lacks a primary key: " + table)
         for row in rows:
-            condition = " AND ".join(
-                column + " = ?" for column in primary_key
-            )
+            condition = " AND ".join(column + " = ?" for column in primary_key)
             existing = connection.execute(
                 "SELECT * FROM " + table + " WHERE " + condition,
                 tuple(row[column] for column in primary_key),
@@ -3167,34 +6996,36 @@ class StateStore:
                 self._insert_portable_rows(connection, table, [row])
                 continue
             if dict(existing) != row:
-                raise ConflictError(
-                    "portable global row conflicts in " + table
-                )
+                raise ConflictError("portable global row conflicts in " + table)
 
     def export_session(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id)
         goal = self.goal_for_session(session_id)
+        portable = self.portable_session(session_id, include_events=False)
+        tables = _require_object(portable.get("tables"), "portable tables")
         goal_value: dict[str, Any] | None = None
         evidence_value: list[dict[str, Any]] = []
         if goal is not None:
             goal_value = goal.as_dict()
-            evidence_value = [
-                item.as_dict() for item in self.evidence(goal.goal_id)
-            ]
+            evidence_value = [item.as_dict() for item in self.evidence(goal.goal_id)]
         return {
             "schema": "p13i/agent-harness/session-export/v1",
             "session": session.as_dict(),
-            "attempts": [
-                item.as_dict() for item in self.attempts(session_id)
-            ],
-            "events": [
-                item.as_dict() for item in self.all_events(session_id)
-            ],
+            "attempts": [item.as_dict() for item in self.attempts(session_id)],
+            "events": [item.as_dict() for item in self.all_events(session_id)],
             "goal": goal_value,
             "evidence": evidence_value,
-            "checkpoints": [
-                item.as_dict() for item in self.checkpoints(session_id)
-            ],
+            "goals": tables["goals"],
+            "goal_milestones": tables["goal_milestones"],
+            "all_evidence": tables["evidence"],
+            "goal_promotions": tables["goal_promotions"],
+            "goal_contract_adoptions": tables["goal_contract_adoptions"],
+            "goal_promotion_evidence": tables["goal_promotion_evidence"],
+            "dispatch_transition_policies": tables["dispatch_transition_policies"],
+            "authorization_receipts": tables["authorization_receipts"],
+            "dispatch_invalidations": tables["dispatch_invalidations"],
+            "dispatch_transition_ledger": tables["dispatch_transition_ledger"],
+            "checkpoints": [item.as_dict() for item in self.checkpoints(session_id)],
             "safety": self.session_safety(session_id),
         }
 
@@ -3210,9 +7041,7 @@ class StateStore:
         session_id = str(session_value.get("session_id", ""))
         if not session_id:
             raise ValueError("session export has no session identifier")
-        external_ref = normalize_external_ref(
-            session_value.get("external_ref")
-        )
+        external_ref = normalize_external_ref(session_value.get("external_ref"))
         with self.transaction() as connection:
             existing = connection.execute(
                 "SELECT owner_epoch FROM sessions WHERE session_id = ?",
@@ -3269,12 +7098,15 @@ class StateStore:
                     0,
                     external_ref.get("orchestrator", ""),
                     external_ref.get("job_id", ""),
-                    "",
+                    str(session_value.get("creation_digest", "")),
                 ),
             )
             self._import_attempts(connection, payload, session_id)
             self._import_events(connection, payload, session_id)
-            self._import_goal(connection, payload, session_id)
+            if isinstance(payload.get("goals"), list):
+                self._import_goal_history(connection, payload, session_id)
+            else:
+                self._import_goal(connection, payload, session_id)
             self._import_checkpoints(connection, payload, session_id)
             self._import_safety(connection, payload, session_id)
         return self.get_session(session_id)
@@ -3341,7 +7173,11 @@ class StateStore:
             return
         goal_id = str(goal.get("goal_id", new_uuid()))
         connection.execute(
-            "INSERT INTO goals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO goals VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
             (
                 goal_id,
                 session_id,
@@ -3353,8 +7189,26 @@ class StateStore:
                 _dump(_object_or_empty(goal.get("budgets"))),
                 str(goal.get("created_at", utc_now())),
                 str(goal.get("updated_at", utc_now())),
+                _dump(goal.get("permitted_providers", [])),
+                _dump(goal.get("permitted_efforts", [])),
+                int(goal.get("max_concurrency", 1)),
+                str(goal.get("completion_policy", "evidence-all")),
+                str(goal.get("incident_policy", "recover-then-pause")),
             ),
         )
+        for position, value in enumerate(_objects(goal.get("milestones"))):
+            connection.execute(
+                "INSERT INTO goal_milestones VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    goal_id,
+                    str(value.get("milestone_id", new_uuid())),
+                    str(value.get("title", "")),
+                    str(value.get("status", "active")),
+                    _dump(value.get("dependencies", [])),
+                    _dump(value.get("predicates", [])),
+                    int(value.get("position", position)),
+                ),
+            )
         for value in _objects(payload.get("evidence")):
             connection.execute(
                 "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3368,6 +7222,110 @@ class StateStore:
                     str(value.get("created_at", utc_now())),
                 ),
             )
+
+    def _import_goal_history(
+        self,
+        connection: sqlite3.Connection,
+        payload: dict[str, Any],
+        session_id: str,
+    ) -> None:
+        goals = _objects(payload.get("goals"))
+        milestones = _objects(payload.get("goal_milestones"))
+        milestones_by_goal: dict[str, list[dict[str, Any]]] = {}
+        for value in milestones:
+            goal_id = str(value.get("goal_id", ""))
+            milestones_by_goal.setdefault(goal_id, []).append(value)
+        for goal in goals:
+            goal_id = str(goal.get("goal_id", new_uuid()))
+            connection.execute(
+                """
+                INSERT INTO goals VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    goal_id,
+                    session_id,
+                    str(goal.get("kind", "finite")),
+                    str(goal.get("objective", "")),
+                    str(goal.get("status", "active")),
+                    str(goal.get("constraints_json", "[]")),
+                    str(goal.get("predicates_json", "[]")),
+                    str(goal.get("budgets_json", "{}")),
+                    str(goal.get("created_at", utc_now())),
+                    str(goal.get("updated_at", utc_now())),
+                    str(goal.get("permitted_providers_json", "[]")),
+                    str(goal.get("permitted_efforts_json", "[]")),
+                    int(goal.get("max_concurrency", 1)),
+                    str(goal.get("completion_policy", "evidence-all")),
+                    str(goal.get("incident_policy", "recover-then-pause")),
+                ),
+            )
+            for milestone in milestones_by_goal.get(goal_id, []):
+                connection.execute(
+                    "INSERT INTO goal_milestones VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        goal_id,
+                        str(milestone.get("milestone_id", new_uuid())),
+                        str(milestone.get("title", "")),
+                        str(milestone.get("status", "active")),
+                        str(milestone.get("dependencies_json", "[]")),
+                        str(milestone.get("predicates_json", "[]")),
+                        int(milestone.get("position", 0)),
+                    ),
+                )
+        for value in _objects(payload.get("all_evidence")):
+            connection.execute(
+                "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(value.get("evidence_id", new_uuid())),
+                    str(value.get("goal_id", "")),
+                    str(value.get("evidence_type", "")),
+                    str(value.get("subject", "")),
+                    str(value.get("outcome", "")),
+                    str(value.get("value_json", "{}")),
+                    str(value.get("created_at", utc_now())),
+                ),
+            )
+        for value in _objects(payload.get("goal_promotions")):
+            connection.execute(
+                "INSERT INTO goal_promotions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(value.get(name, "") for name in _GOAL_PROMOTION_COLUMNS),
+            )
+        for value in _objects(payload.get("goal_contract_adoptions")):
+            connection.execute(
+                """
+                INSERT INTO goal_contract_adoptions VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                tuple(value.get(name, "") for name in _GOAL_CONTRACT_ADOPTION_COLUMNS),
+            )
+        for value in _objects(payload.get("goal_promotion_evidence")):
+            connection.execute(
+                "INSERT INTO goal_promotion_evidence VALUES (?, ?, ?, ?, ?)",
+                tuple(value.get(name, "") for name in _GOAL_PROMOTION_EVIDENCE_COLUMNS),
+            )
+        self._insert_portable_rows(
+            connection,
+            "dispatch_transition_policies",
+            _objects(payload.get("dispatch_transition_policies")),
+        )
+        self._insert_portable_rows(
+            connection,
+            "authorization_receipts",
+            _objects(payload.get("authorization_receipts")),
+        )
+        self._insert_portable_rows(
+            connection,
+            "dispatch_invalidations",
+            _objects(payload.get("dispatch_invalidations")),
+        )
+        self._insert_portable_rows(
+            connection,
+            "dispatch_transition_ledger",
+            _objects(payload.get("dispatch_transition_ledger")),
+        )
 
     def _import_checkpoints(
         self,
@@ -3468,6 +7426,7 @@ def _session(row: sqlite3.Row | dict[str, Any]) -> Session:
         updated_at=str(row["updated_at"]),
         archived=bool(row["archived"]),
         external_ref=_external_ref(row),
+        creation_digest=str(row["creation_digest"]),
     )
 
 
@@ -3516,7 +7475,10 @@ def _attempt(row: sqlite3.Row) -> ProviderAttempt:
     )
 
 
-def _goal(row: sqlite3.Row) -> Goal:
+def _goal(
+    row: sqlite3.Row,
+    milestone_rows: list[sqlite3.Row] | tuple[sqlite3.Row, ...] = (),
+) -> Goal:
     constraints = json.loads(row["constraints_json"])
     predicates = json.loads(row["predicates_json"])
     budgets = json.loads(row["budgets_json"])
@@ -3531,6 +7493,27 @@ def _goal(row: sqlite3.Row) -> Goal:
         budgets=dict(budgets),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        milestones=tuple(_milestone(item) for item in milestone_rows),
+        permitted_providers=tuple(
+            str(item) for item in json.loads(row["permitted_providers_json"])
+        ),
+        permitted_efforts=tuple(
+            str(item) for item in json.loads(row["permitted_efforts_json"])
+        ),
+        max_concurrency=int(row["max_concurrency"]),
+        completion_policy=str(row["completion_policy"]),
+        incident_policy=str(row["incident_policy"]),
+    )
+
+
+def _milestone(row: sqlite3.Row) -> Milestone:
+    return Milestone(
+        milestone_id=str(row["milestone_id"]),
+        title=str(row["title"]),
+        status=str(row["status"]),
+        dependencies=tuple(str(item) for item in json.loads(row["dependencies_json"])),
+        predicates=tuple(dict(item) for item in json.loads(row["predicates_json"])),
+        position=int(row["position"]),
     )
 
 
@@ -3573,6 +7556,138 @@ def _external_ref(
     }
 
 
+def _dispatch_transition_anchor(
+    connection: sqlite3.Connection,
+    prior: sqlite3.Row,
+    latest_checkpoint_id: str,
+    live_material_digest: str,
+) -> dict[str, str]:
+    command_type = str(prior["command_type"])
+    status = str(prior["status"])
+    result = _load_object(str(prior["result_json"]))
+    anchor_kind = ""
+    reconciliation_id = ""
+    reconciliation_resolution = ""
+    if status == CommandStatus.COMPLETE and command_type == "message":
+        if str(result.get("checkpoint_id", "")) != latest_checkpoint_id:
+            raise ConflictError("dispatch transition provider checkpoint is not latest")
+        result_material = str(result.get("workspace_material_digest", ""))
+        if len(result_material) != 64 or result_material != live_material_digest:
+            raise ConflictError("dispatch transition provider material is not current")
+        anchor_kind = "provider-result"
+    elif status == CommandStatus.COMPLETE and (
+        command_type in TRANSITION_CONTROL_COMMANDS
+    ):
+        anchor_kind = "control-command"
+    elif status == CommandStatus.FAILED and result.get("code") == (
+        "E_NEEDS_RECONCILIATION"
+    ):
+        reconciliations = connection.execute(
+            """
+            SELECT * FROM reconciliations WHERE command_id = ?
+            ORDER BY created_at, reconciliation_id
+            """,
+            (str(prior["command_id"]),),
+        ).fetchall()
+        if len(reconciliations) != 1:
+            raise ConflictError(
+                "dispatch transition requires exactly one reconciliation"
+            )
+        reconciliation = reconciliations[0]
+        if str(reconciliation["status"]) != ReconciliationStatus.RESOLVED:
+            raise ConflictError("dispatch transition reconciliation is unresolved")
+        reconciliation_resolution = str(reconciliation["resolution"])
+        if reconciliation_resolution not in {
+            ReconciliationDecision.ACCEPT_CURRENT,
+            ReconciliationDecision.RESTORE_PRE_TURN,
+        }:
+            raise ConflictError(
+                "dispatch transition reconciliation resolution is unsafe"
+            )
+        audit = _load_object(str(reconciliation["audit_json"]))
+        if str(audit.get("resolution_checkpoint_id", "")) != (latest_checkpoint_id):
+            raise ConflictError(
+                "dispatch transition reconciliation checkpoint is not latest"
+            )
+        resolution_material = str(audit.get("resolution_workspace_digest", ""))
+        if (
+            len(resolution_material) != 64
+            or resolution_material != live_material_digest
+        ):
+            raise ConflictError(
+                "dispatch transition reconciliation material is not current"
+            )
+        anchor_kind = "resolved-reconciliation"
+        reconciliation_id = str(reconciliation["reconciliation_id"])
+    else:
+        raise ConflictError("dispatch transition prior command is not eligible")
+    return {
+        "prior_command_type": command_type,
+        "prior_anchor_kind": anchor_kind,
+        "prior_reconciliation_id": reconciliation_id,
+        "prior_reconciliation_resolution": reconciliation_resolution,
+    }
+
+
+def _dispatch_transition_epoch_is_active(
+    connection: sqlite3.Connection,
+    session_id: str,
+    authorization: dict[str, Any],
+) -> bool:
+    policy_sha256 = str(authorization.get("policy_sha256", ""))
+    epoch_id = str(authorization.get("epoch_id", ""))
+    goal_id = str(authorization.get("goal_id", ""))
+    if not policy_sha256 or not epoch_id or not goal_id:
+        return False
+    policy = authorization.get("policy")
+    if isinstance(policy, dict) and policy:
+        if normalized_digest(policy) != policy_sha256:
+            return False
+    else:
+        policy_ref = authorization.get("policy_ref")
+        if policy_ref != {
+            "policy_sha256": policy_sha256,
+            "session_id": session_id,
+            "goal_id": goal_id,
+            "epoch_id": epoch_id,
+        }:
+            return False
+        policy_row = connection.execute(
+            """
+            SELECT payload_json FROM dispatch_transition_policies
+            WHERE policy_sha256 = ? AND session_id = ?
+              AND goal_id = ? AND epoch_id = ?
+            """,
+            (policy_sha256, session_id, goal_id, epoch_id),
+        ).fetchone()
+        if policy_row is None:
+            return False
+        policy = _load_object(str(policy_row["payload_json"]))
+        if normalized_digest(policy) != policy_sha256:
+            return False
+    if policy.get("session_id") != session_id:
+        return False
+    if policy.get("epoch_id") != epoch_id:
+        return False
+    goal = connection.execute(
+        """
+        SELECT s.goal_id, g.constraints_json FROM sessions AS s
+        JOIN goals AS g ON g.goal_id = s.goal_id
+        WHERE s.session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if goal is None:
+        return False
+    if goal_id != str(goal["goal_id"]):
+        return False
+    constraints = json.loads(str(goal["constraints_json"]))
+    return (
+        "dispatch-generation-transition-policy-sha256:" + policy_sha256 in constraints
+        and "dispatch-generation-transition-epoch:" + epoch_id in constraints
+    )
+
+
 def _turn_ref(
     row: sqlite3.Row | dict[str, Any],
 ) -> dict[str, str]:
@@ -3593,22 +7708,38 @@ def _reconciliation(row: sqlite3.Row) -> ReconciliationRecord:
         reconciliation_id=str(row["reconciliation_id"]),
         session_id=str(row["session_id"]),
         command_id=str(row["command_id"]),
-        pre_dispatch_checkpoint_id=str(
-            row["pre_dispatch_checkpoint_id"]
-        ),
-        current_workspace_digest=str(
-            row["current_workspace_digest"]
-        ),
-        current_workspace_summary=str(
-            row["current_workspace_summary"]
-        ),
+        pre_dispatch_checkpoint_id=str(row["pre_dispatch_checkpoint_id"]),
+        current_workspace_digest=str(row["current_workspace_digest"]),
+        current_workspace_summary=str(row["current_workspace_summary"]),
         provider_attempts=tuple(dict(item) for item in attempts),
-        safety_consumption=_load_object(
-            row["safety_consumption_json"]
-        ),
+        safety_consumption=_load_object(row["safety_consumption_json"]),
         status=str(row["status"]),
         resolution=str(row["resolution"]),
         audit=_load_object(row["audit_json"]),
         created_at=str(row["created_at"]),
         resolved_at=str(row["resolved_at"]),
     )
+
+
+def _bounded_json_value(
+    value: object,
+    *,
+    depth: int = 0,
+) -> object:
+    if depth >= 4:
+        return "[depth limit]"
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, list):
+        return [_bounded_json_value(item, depth=depth + 1) for item in value[:20]]
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for name in sorted(value, key=str)[:20]:
+            result[str(name)] = _bounded_json_value(
+                value[name],
+                depth=depth + 1,
+            )
+        return result
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:1000]

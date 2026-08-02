@@ -3,24 +3,53 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-from pathlib import Path
 import subprocess
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from agent_harness.blobs import BlobStore
-from agent_harness.errors import ConflictError
-from agent_harness.errors import HarnessError
-from agent_harness.models import Attention
-from agent_harness.models import Lifecycle
-from agent_harness.models import ReconciliationDecision
-from agent_harness.models import ReconciliationRecord
-from agent_harness.models import ReconciliationStatus
-from agent_harness.models import RestartRecovery
+from agent_harness.errors import ConflictError, HarnessError
+from agent_harness.models import (
+    Attention,
+    Lifecycle,
+    ReconciliationDecision,
+    ReconciliationRecord,
+    ReconciliationStatus,
+    RestartRecovery,
+)
 from agent_harness.storage import StateStore
-from agent_harness.workspace import checkpoint_workspace
-from agent_harness.workspace import restore_checkpoint
-from agent_harness.workspace import workspace_summary
+from agent_harness.workspace import (
+    checkpoint_workspace,
+    restore_checkpoint,
+)
+from agent_harness.workspace_state import inspect_workspace
+
+SYSTEM_RECONCILIATION_AUDIT_KEYS = frozenset(
+    {
+        "checkpoint_id",
+        "current_workspace_digest",
+        "discovery_checkpoint_id",
+        "discovery_workspace_digest",
+        "dispatch_identity",
+        "observed_workspace_digest",
+        "pre_dispatch_checkpoint_id",
+        "resolution_checkpoint_id",
+        "resolution_workspace_digest",
+        "restored_checkpoint_id",
+        "topology_receipt",
+    }
+)
+
+
+def validate_reconciliation_audit(audit: dict[str, Any] | None) -> None:
+    if audit is None:
+        return
+    protected = sorted(SYSTEM_RECONCILIATION_AUDIT_KEYS.intersection(audit))
+    if protected:
+        raise ValueError(
+            "reconciliation audit contains system-owned fields: " + ", ".join(protected)
+        )
 
 
 class ReconciliationManager:
@@ -46,12 +75,63 @@ class ReconciliationManager:
             digest,
             summary,
         )
+        reconciliations: list[ReconciliationRecord] = []
+        for record in recovery.reconciliations:
+            reconciliations.append(await self._ensure_discovery_checkpoint(record))
+        recovery = replace(
+            recovery,
+            reconciliations=tuple(reconciliations),
+        )
         if recovery.reconciliations:
             self.store.update_session(
                 session_id,
                 attention=Attention.NEEDS_RECONCILIATION,
             )
         return recovery
+
+    async def _ensure_discovery_checkpoint(
+        self,
+        record: ReconciliationRecord,
+    ) -> ReconciliationRecord:
+        checkpoint_id = str(record.audit.get("discovery_checkpoint_id", ""))
+        if checkpoint_id:
+            self.store.checkpoint(checkpoint_id)
+            return record
+        session = self.store.get_session(record.session_id)
+        workspace = Path(session.worktree)
+        before_digest, unused_summary = await asyncio.to_thread(
+            inspect_workspace,
+            workspace,
+        )
+        del unused_summary
+        if before_digest != record.current_workspace_digest:
+            raise ConflictError(
+                "workspace changed before reconciliation discovery checkpoint"
+            )
+        pre_dispatch = self.store.checkpoint(record.pre_dispatch_checkpoint_id)
+        checkpoint = await asyncio.to_thread(
+            checkpoint_workspace,
+            session,
+            self.blobs,
+            sequence=self.store.last_sequence(session.session_id),
+            provider=pre_dispatch.provider,
+            native_session_id=pre_dispatch.native_session_id,
+            context_text="",
+        )
+        after_digest, unused_summary = await asyncio.to_thread(
+            inspect_workspace,
+            workspace,
+        )
+        del unused_summary
+        if after_digest != record.current_workspace_digest:
+            raise ConflictError(
+                "workspace changed during reconciliation discovery checkpoint"
+            )
+        return self.store.record_reconciliation_discovery(
+            record.reconciliation_id,
+            checkpoint,
+            record.current_workspace_digest,
+        )
 
     async def resolve(
         self,
@@ -61,30 +141,45 @@ class ReconciliationManager:
         *,
         audit: dict[str, Any] | None = None,
         approved: bool = False,
+        idempotency_key: str = "",
+        request_digest: str = "",
+        operation: str = "",
     ) -> ReconciliationRecord:
+        validate_reconciliation_audit(audit)
         record = self.store.reconciliation(reconciliation_id)
+        if record.status != ReconciliationStatus.RESOLVED and not str(
+            record.audit.get("discovery_checkpoint_id", "")
+        ):
+            record = await self._ensure_discovery_checkpoint(record)
         selected = _decision(decision)
         if record.status == ReconciliationStatus.RESOLVED:
             if (
                 record.resolution == selected
-                and record.current_workspace_digest
-                == observed_workspace_digest
+                and record.current_workspace_digest == observed_workspace_digest
             ):
+                _require_resolution_workspace_digest(record, selected)
+                if idempotency_key:
+                    resolved, unused_created = self.store.resolve_reconciliation_once(
+                        reconciliation_id,
+                        selected,
+                        observed_workspace_digest,
+                        record.audit,
+                        None,
+                        idempotency_key=idempotency_key,
+                        operation=operation,
+                        request_digest=request_digest,
+                    )
+                    del unused_created
+                    return resolved
                 self._apply_session_resolution(record, selected)
                 return record
-            raise ConflictError(
-                "reconciliation was already resolved differently"
-            )
+            raise ConflictError("reconciliation was already resolved differently")
         if record.current_workspace_digest != observed_workspace_digest:
             raise ConflictError("observed workspace digest is stale")
         session = self.store.get_session(record.session_id)
-        resuming_resolution = (
-            record.status == ReconciliationStatus.RESOLVING
-        )
+        resuming_resolution = record.status == ReconciliationStatus.RESOLVING
         if resuming_resolution and record.resolution != selected:
-            raise ConflictError(
-                "reconciliation resolution is already in progress"
-            )
+            raise ConflictError("reconciliation resolution is already in progress")
         if not resuming_resolution:
             current_digest, unused_summary = await asyncio.to_thread(
                 inspect_workspace,
@@ -110,16 +205,14 @@ class ReconciliationManager:
             )
             del unused_summary
             if current_digest != observed_workspace_digest:
-                raise ConflictError(
-                    "workspace changed during reconciliation"
-                )
-        resolution_audit: dict[str, Any] = {}
+                raise ConflictError("workspace changed during reconciliation")
+        resolution_audit: dict[str, Any] = dict(record.audit)
         if audit is not None:
             resolution_audit.update(audit)
+        resolution_checkpoint = None
+        resolution_workspace_digest = ""
         if selected == ReconciliationDecision.ACCEPT_CURRENT:
-            pre_dispatch = self.store.checkpoint(
-                record.pre_dispatch_checkpoint_id
-            )
+            pre_dispatch = self.store.checkpoint(record.pre_dispatch_checkpoint_id)
             checkpoint = await asyncio.to_thread(
                 checkpoint_workspace,
                 session,
@@ -129,18 +222,31 @@ class ReconciliationManager:
                 native_session_id=pre_dispatch.native_session_id,
                 context_text="",
             )
-            self.store.add_checkpoint(checkpoint)
-            resolution_audit["checkpoint_id"] = checkpoint.checkpoint_id
-        elif selected == ReconciliationDecision.RESTORE_PRE_TURN:
-            checkpoint = self.store.checkpoint(
-                record.pre_dispatch_checkpoint_id
+            resolution_workspace_digest, unused_summary = await asyncio.to_thread(
+                inspect_workspace,
+                Path(session.worktree),
             )
+            del unused_summary
+            if resolution_workspace_digest != observed_workspace_digest:
+                raise ConflictError(
+                    "workspace changed during reconciliation resolution checkpoint"
+                )
+            resolution_audit["checkpoint_id"] = checkpoint.checkpoint_id
+            resolution_audit["resolution_checkpoint_id"] = checkpoint.checkpoint_id
+            resolution_checkpoint = checkpoint
+        elif selected == ReconciliationDecision.RESTORE_PRE_TURN:
+            checkpoint = self.store.checkpoint(record.pre_dispatch_checkpoint_id)
             await asyncio.to_thread(
                 _restore_exact,
                 Path(session.worktree),
                 checkpoint,
                 self.blobs,
             )
+            restored_workspace_digest, unused_summary = await asyncio.to_thread(
+                inspect_workspace,
+                Path(session.worktree),
+            )
+            del unused_summary
             restored = await asyncio.to_thread(
                 checkpoint_workspace,
                 session,
@@ -150,14 +256,39 @@ class ReconciliationManager:
                 native_session_id=checkpoint.native_session_id,
                 context_text="",
             )
-            self.store.add_checkpoint(restored)
-            resolution_audit["checkpoint_id"] = restored.checkpoint_id
-            resolution_audit["restored_checkpoint_id"] = (
-                checkpoint.checkpoint_id
+            resolution_workspace_digest, unused_summary = await asyncio.to_thread(
+                inspect_workspace,
+                Path(session.worktree),
             )
-        resolution_audit["observed_workspace_digest"] = (
-            observed_workspace_digest
-        )
+            del unused_summary
+            if resolution_workspace_digest != restored_workspace_digest:
+                raise ConflictError(
+                    "workspace changed during restored resolution checkpoint"
+                )
+            resolution_audit["checkpoint_id"] = restored.checkpoint_id
+            resolution_audit["resolution_checkpoint_id"] = restored.checkpoint_id
+            resolution_audit["restored_checkpoint_id"] = checkpoint.checkpoint_id
+            resolution_checkpoint = restored
+        resolution_audit["observed_workspace_digest"] = observed_workspace_digest
+        if resolution_workspace_digest:
+            resolution_audit["resolution_workspace_digest"] = (
+                resolution_workspace_digest
+            )
+        if idempotency_key:
+            resolved, unused_created = self.store.resolve_reconciliation_once(
+                reconciliation_id,
+                selected,
+                observed_workspace_digest,
+                resolution_audit,
+                resolution_checkpoint,
+                idempotency_key=idempotency_key,
+                operation=operation,
+                request_digest=request_digest,
+            )
+            del unused_created
+            return resolved
+        if resolution_checkpoint is not None:
+            self.store.add_checkpoint(resolution_checkpoint)
         resolved = self.store.resolve_reconciliation_record(
             reconciliation_id,
             selected,
@@ -184,39 +315,6 @@ class ReconciliationManager:
             lifecycle=Lifecycle.RUNNING,
             attention=Attention.IDLE,
         )
-
-
-def inspect_workspace(workspace: Path) -> tuple[str, str]:
-    root = workspace.resolve()
-    digest = hashlib.sha256()
-    digest.update(_git(root, "rev-parse", "HEAD"))
-    digest.update(b"\0tracked\0")
-    digest.update(_git(root, "diff", "--binary", "--no-ext-diff", "HEAD"))
-    digest.update(b"\0untracked\0")
-    untracked = _git(
-        root,
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-    )
-    for raw_path in sorted(
-        item for item in untracked.split(b"\0") if item
-    ):
-        relative = Path(raw_path.decode("utf-8", errors="surrogateescape"))
-        candidate = root / relative
-        if candidate.is_symlink():
-            continue
-        target = candidate.resolve()
-        if not target.is_relative_to(root):
-            continue
-        if not target.is_file():
-            continue
-        digest.update(raw_path)
-        digest.update(b"\0")
-        digest.update(target.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest(), workspace_summary(root)
 
 
 def _restore_exact(
@@ -249,6 +347,25 @@ def _decision(value: str) -> str:
         return str(ReconciliationDecision(value))
     except ValueError as error:
         raise ValueError("reconciliation decision is unsupported") from error
+
+
+def _require_resolution_workspace_digest(
+    record: ReconciliationRecord,
+    decision: str,
+) -> str:
+    if decision not in {
+        ReconciliationDecision.ACCEPT_CURRENT,
+        ReconciliationDecision.RESTORE_PRE_TURN,
+    }:
+        return ""
+    value = str(record.audit.get("resolution_workspace_digest", ""))
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ConflictError(
+            "resolved reconciliation lacks certified workspace material"
+        )
+    return value
 
 
 def _require_restore_permission(

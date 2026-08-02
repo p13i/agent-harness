@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
-from agent_harness.errors import NotFoundError
+from agent_harness.errors import ConflictError, NotFoundError
 
 
 class BlobStore:
@@ -46,9 +46,12 @@ class BlobStore:
     def get(self, digest: str) -> bytes:
         target = self.path(digest)
         try:
-            return target.read_bytes()
+            content = target.read_bytes()
         except OSError as error:
             raise NotFoundError("blob") from error
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise ConflictError("blob content digest does not match its address")
+        return content
 
     def get_text(self, digest: str) -> str:
         return self.get(digest).decode("utf-8", errors="replace")
@@ -61,4 +64,3 @@ class BlobStore:
         except ValueError as error:
             raise ValueError("blob digest must be hexadecimal") from error
         return self.root / digest[:2] / digest[2:]
-

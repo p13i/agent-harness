@@ -3,20 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import math
 from pathlib import Path
 from typing import Any
 
-from agent_harness.models import RoutingCandidate
-from agent_harness.models import RoutingDecision
-from agent_harness.models import Session
-from agent_harness.providers.base import ProviderAdapter
-from agent_harness.providers.base import ProviderModel
+from agent_harness.models import RoutingCandidate, RoutingDecision, Session
+from agent_harness.providers.base import ProviderAdapter, ProviderModel
 from agent_harness.routing import route
 from agent_harness.safety import INTERACTIVE
 from agent_harness.storage import StateStore
-from agent_harness.usage import UsageSnapshot
-from agent_harness.usage import probe_all
-
+from agent_harness.usage import UsageSnapshot, probe_all
 
 QUALITY = {
     "codex": 100.0,
@@ -34,7 +31,7 @@ class Scheduler:
         self.adapters = adapters
         self._model_cache: dict[str, tuple[ProviderModel, ...]] = {}
         self._usage_cache = _durable_usage(store.latest_usage())
-        self._usage_at = 0.0
+        self._usage_at: float | None = None
         self._status_refresh: asyncio.Task[None] | None = None
 
     async def refresh_usage(self) -> dict[str, UsageSnapshot]:
@@ -55,7 +52,7 @@ class Scheduler:
 
     async def usage(self) -> dict[str, UsageSnapshot]:
         now = asyncio.get_running_loop().time()
-        if not self._usage_cache or now - self._usage_at > 60:
+        if not self._usage_cache or self._usage_at is None or now - self._usage_at > 60:
             return await self.refresh_usage()
         return self._usage_cache
 
@@ -92,13 +89,32 @@ class Scheduler:
         binding_ceiling: float | None = None,
         execution_profile: str = INTERACTIVE,
         enforce_concurrency: bool = False,
+        command_id: str = "",
+        goal_id: str = "",
+        permitted_providers: frozenset[str] = frozenset(),
+        permitted_efforts: frozenset[str] = frozenset(),
+        max_concurrency: int = 1,
     ) -> RoutingDecision:
+        if metered_budget is not None and not math.isfinite(metered_budget):
+            raise ValueError("metered budget must be finite")
+        if binding_ceiling is not None and not math.isfinite(binding_ceiling):
+            raise ValueError("binding ceiling must be finite")
         usage = await self.usage()
+        durable_usage = self.store.latest_usage()
         models = await self.models(Path(session.worktree))
         counts = self.store.active_provider_counts()
+        goal_capacity_available = True
+        if enforce_concurrency and goal_id:
+            active_goal_commands = self._active_other_goal_count(
+                goal_id,
+                command_id,
+            )
+            goal_capacity_available = active_goal_commands < max_concurrency
         candidates: list[RoutingCandidate] = []
         for provider_id, adapter in self.adapters.items():
             if provider_id in excluded:
+                continue
+            if permitted_providers and provider_id not in permitted_providers:
                 continue
             status = adapter.status()
             provider_usage = usage.get(provider_id)
@@ -107,6 +123,10 @@ class Scheduler:
             if provider_usage is not None:
                 binding = provider_usage.binding_percent
                 credits = provider_usage.credits_engaged
+            if binding is not None:
+                if not math.isfinite(binding) or binding < 0:
+                    binding = None
+            usage_sample = durable_usage.get(provider_id, {})
             safety_ready = status.ready
             if binding_ceiling is not None:
                 if binding is None and execution_profile != INTERACTIVE:
@@ -114,15 +134,22 @@ class Scheduler:
                 if binding is not None and binding >= binding_ceiling:
                     safety_ready = False
             if enforce_concurrency and execution_profile == "unattended":
-                active = self.store.active_unattended_provider_count(
-                    provider_id
+                active = self._active_other_unattended_count(
+                    provider_id,
+                    command_id,
                 )
                 if active >= 1:
                     safety_ready = False
+            if not goal_capacity_available:
+                safety_ready = False
             chosen_model = _select_model(models.get(provider_id, ()), model)
             if chosen_model is None:
                 continue
-            chosen_effort = _select_effort(chosen_model, effort)
+            chosen_effort = _select_effort(
+                chosen_model,
+                effort,
+                permitted_efforts,
+            )
             if chosen_effort is None:
                 continue
             candidates.append(
@@ -138,6 +165,8 @@ class Scheduler:
                     queue_count=counts.get(provider_id, 0),
                     affinity=session.active_provider == provider_id,
                     context_transfer_tokens=context_transfer_tokens,
+                    usage_sample_id=str(usage_sample.get("sample_id", "")),
+                    usage_observed_at=str(usage_sample.get("observed_at", "")),
                 )
             )
         return route(
@@ -146,11 +175,42 @@ class Scheduler:
             workload=workload,
             manual_provider=provider,
             metered_budget=metered_budget,
+            binding_ceiling=binding_ceiling,
+            execution_profile=execution_profile,
         )
+
+    def _active_other_unattended_count(
+        self,
+        provider: str,
+        command_id: str,
+    ) -> int:
+        active = self.store.active_unattended_provider_count(provider)
+        if not command_id:
+            return active
+        envelope = self.store.command_envelope(command_id)
+        if envelope["provider"] != provider:
+            return active
+        if envelope["state"] not in {"reserved", "running", "recovering"}:
+            return active
+        return max(0, active - 1)
+
+    def _active_other_goal_count(
+        self,
+        goal_id: str,
+        command_id: str,
+    ) -> int:
+        active = self.store.active_goal_command_count(goal_id)
+        if not command_id:
+            return active
+        envelope = self.store.command_envelope(command_id)
+        if envelope["state"] not in {"reserved", "running", "recovering"}:
+            return active
+        return max(0, active - 1)
 
     async def status(self, workspace: Path) -> dict[str, Any]:
         self._start_status_refresh(workspace)
         usage = dict(self._usage_cache)
+        durable_usage = self.store.latest_usage()
         models = dict(self._model_cache)
         refreshing = self._status_refresh is not None
         if self._status_refresh is not None:
@@ -162,6 +222,23 @@ class Scheduler:
             usage_value: dict[str, Any] = {}
             if snapshot is not None:
                 usage_value = snapshot.as_dict()
+                durable = durable_usage.get(provider, {})
+                observed_at = str(durable.get("observed_at", ""))
+                fresh = _usage_is_fresh(observed_at)
+                binding = snapshot.binding_percent
+                admissible = fresh and not snapshot.credits_engaged
+                if binding is None or binding >= 90.0:
+                    admissible = False
+                if snapshot.error:
+                    admissible = False
+                usage_value.update(
+                    {
+                        "sample_id": str(durable.get("sample_id", "")),
+                        "observed_at": observed_at,
+                        "fresh": fresh,
+                        "admissible": admissible,
+                    }
+                )
             result[provider] = {
                 "ready": provider_status.ready,
                 "detail": provider_status.detail,
@@ -192,14 +269,12 @@ class Scheduler:
         models_complete = all(
             provider in self._model_cache for provider in self.adapters
         )
-        usage_fresh = self._usage_at > 0
-        if usage_fresh:
+        usage_fresh = self._usage_at is not None
+        if usage_fresh and self._usage_at is not None:
             usage_fresh = now - self._usage_at <= 60
         if usage_fresh and models_complete:
             return
-        self._status_refresh = asyncio.create_task(
-            self._refresh_status(workspace)
-        )
+        self._status_refresh = asyncio.create_task(self._refresh_status(workspace))
 
     async def _refresh_status(self, workspace: Path) -> None:
         await asyncio.gather(
@@ -221,9 +296,7 @@ def _durable_usage(
             payload = {}
         snapshots[provider] = UsageSnapshot(
             provider=provider,
-            binding_percent=_optional_number(
-                value.get("binding_percent")
-            ),
+            binding_percent=_optional_number(value.get("binding_percent")),
             credits_engaged=bool(value.get("credits_engaged", False)),
             payload=payload,
             error=str(stored.get("error", "")),
@@ -235,8 +308,21 @@ def _optional_number(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        normalized = float(value)
+        if math.isfinite(normalized) and normalized >= 0:
+            return normalized
     return None
+
+
+def _usage_is_fresh(value: str) -> bool:
+    try:
+        observed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=datetime.UTC)
+    age = datetime.datetime.now(datetime.UTC) - observed.astimezone(datetime.UTC)
+    return datetime.timedelta(0) <= age <= datetime.timedelta(seconds=90)
 
 
 def _select_model(
@@ -256,16 +342,29 @@ def _select_model(
     return ProviderModel("default", "Default", ("high",), None, default=True)
 
 
-def _select_effort(model: ProviderModel, pinned: str) -> str | None:
+def _select_effort(
+    model: ProviderModel,
+    pinned: str,
+    permitted: frozenset[str] = frozenset(),
+) -> str | None:
     if pinned:
+        if permitted and pinned not in permitted:
+            return None
         if not model.efforts or pinned in model.efforts:
             return pinned
         return None
     for candidate in ("xhigh", "high", "medium"):
+        if permitted and candidate not in permitted:
+            continue
         if candidate in model.efforts:
             return candidate
     if model.efforts:
-        return model.efforts[-1]
+        for candidate in reversed(model.efforts):
+            if not permitted or candidate in permitted:
+                return candidate
+        return None
+    if permitted:
+        return None
     return ""
 
 
@@ -273,6 +372,4 @@ def _fallback_models(provider: str) -> tuple[ProviderModel, ...]:
     efforts = ("low", "medium", "high", "xhigh")
     if provider == "claude":
         return (ProviderModel("opus", "Opus", efforts, None, default=True),)
-    return (
-        ProviderModel("default", "Account default", efforts, None, default=True),
-    )
+    return (ProviderModel("default", "Account default", efforts, None, default=True),)

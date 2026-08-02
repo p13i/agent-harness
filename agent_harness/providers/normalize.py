@@ -8,13 +8,49 @@ from typing import Any
 
 from agent_harness.providers.base import ProviderEvent
 
-
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SENSITIVE_NAME = re.compile(
+    r"(?:TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_KEY)",
+    re.IGNORECASE,
+)
+SECRET_ASSIGNMENT = re.compile(
+    r"(?i)([\"']?(?:api[_-]?key|authorization|password|secret|token)[\"']?)"
+    r"(\s*[:=]\s*)"
+    r"(?:bearer\s+[A-Za-z0-9._~+/=-]+|\"(?:\\.|[^\"])*\"|"
+    r"'(?:\\.|[^'])*'|[^\s,;]+)"
+)
+BEARER_VALUE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
+SECRET_TOKEN = re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b")
 
 
 def sanitize(text: str) -> str:
-    return CONTROL.sub("", ANSI.sub("", text))
+    value = CONTROL.sub("", ANSI.sub("", text))
+    value = SECRET_ASSIGNMENT.sub(
+        lambda match: match.group(1) + match.group(2) + "[REDACTED]",
+        value,
+    )
+    value = BEARER_VALUE.sub(
+        lambda match: match.group(1) + "[REDACTED]",
+        value,
+    )
+    return SECRET_TOKEN.sub("[REDACTED]", value)
+
+
+def redact_observable(value: object) -> object:
+    if isinstance(value, str):
+        return sanitize(value)
+    if isinstance(value, list):
+        return [redact_observable(item) for item in value]
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for name, item in value.items():
+            if SENSITIVE_NAME.search(str(name)):
+                result[str(name)] = "[REDACTED]"
+                continue
+            result[str(name)] = redact_observable(item)
+        return result
+    return value
 
 
 def codex_notification(
@@ -93,10 +129,7 @@ def codex_notification(
                 raw=raw,
             )
         ]
-    if method in {
-        "item/reasoning/summaryTextDelta",
-        "item/reasoning/textDelta",
-    }:
+    if method == "item/reasoning/summaryTextDelta":
         return [
             ProviderEvent(
                 "reasoning.summary.delta",
@@ -105,6 +138,8 @@ def codex_notification(
                 raw=raw,
             )
         ]
+    if method == "item/reasoning/textDelta":
+        return []
     if method == "thread/tokenUsage/updated":
         return [
             ProviderEvent(
@@ -127,6 +162,10 @@ def codex_notification(
 
 def claude_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
     event_type = str(payload.get("type", "provider.event"))
+    if event_type == "system":
+        task_events = _claude_task(payload)
+        if task_events:
+            return task_events
     if event_type == "system" and payload.get("subtype") == "init":
         return [
             ProviderEvent(
@@ -175,6 +214,52 @@ def claude_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
     return [ProviderEvent("provider.event", raw=payload)]
 
 
+def _claude_task(payload: dict[str, Any]) -> list[ProviderEvent]:
+    subtype = str(payload.get("subtype", ""))
+    if subtype not in {
+        "task_started",
+        "task_progress",
+        "task_notification",
+        "task_updated",
+    }:
+        return []
+    child_id = str(payload.get("task_id", ""))
+    metadata: dict[str, Any] = {"child_id": child_id}
+    tool_use_id = payload.get("tool_use_id")
+    if isinstance(tool_use_id, str):
+        metadata["tool_use_id"] = tool_use_id
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        metadata["usage"] = usage
+    status = str(payload.get("status", "")).casefold()
+    if subtype == "task_updated":
+        patch = payload.get("patch")
+        if isinstance(patch, dict):
+            status = str(patch.get("status", status)).casefold()
+    suffix = "progress"
+    event_status = status
+    if subtype == "task_started":
+        suffix = "started"
+        event_status = "running"
+    if status == "completed":
+        suffix = "completed"
+        event_status = "complete"
+    if status == "failed":
+        suffix = "failed"
+    if status in {"stopped", "killed", "cancelled", "canceled"}:
+        suffix = "cancelled"
+        event_status = "cancelled"
+    return [
+        ProviderEvent(
+            "agent.child." + suffix,
+            status=event_status,
+            metadata=metadata,
+            raw=payload,
+            native_session_id=_optional_text(payload.get("session_id")),
+        )
+    ]
+
+
 def _codex_item(
     method: str,
     item: dict[str, Any],
@@ -218,15 +303,40 @@ def _codex_item(
                 raw=raw,
             )
         ]
+    if item_type in {
+        "collab_agent_tool_call",
+        "collabAgentToolCall",
+        "subagent",
+    }:
+        child_suffix = suffix
+        status = str(item.get("status", "")).casefold()
+        if status in {"failed", "error"}:
+            child_suffix = "failed"
+        if status in {"cancelled", "canceled"}:
+            child_suffix = "cancelled"
+        return [
+            ProviderEvent(
+                "agent.child." + child_suffix,
+                metadata=_selected(
+                    item,
+                    {
+                        "id",
+                        "receiver_thread_ids",
+                        "receiverThreadIds",
+                        "status",
+                    },
+                ),
+                raw=raw,
+            )
+        ]
     if item_type == "reasoning":
+        summary = payload_text(item.get("summary"))
+        if not summary:
+            return []
         return [
             ProviderEvent(
                 "reasoning.summary." + suffix,
-                text=payload_text(
-                    item.get("summary")
-                    or item.get("content")
-                    or item.get("text")
-                ),
+                text=summary,
                 raw=raw,
             )
         ]
@@ -234,6 +344,10 @@ def _codex_item(
         ProviderEvent(
             "tool." + item_type + "." + suffix,
             text=payload_text(item.get("text")),
+            metadata=_selected_redacted(
+                item,
+                {"arguments", "id", "input", "name", "status"},
+            ),
             raw=raw,
         )
     ]
@@ -265,11 +379,18 @@ def _claude_message(
                     )
                 )
         elif block_type == "tool_use":
+            tool_name = payload_text(block.get("name"))
+            normalized = "tool.started"
+            if tool_name.casefold() in {"agent", "task", "spawn_agent"}:
+                normalized = "agent.child.started"
+            metadata = _selected(block, {"id", "name"})
+            if "input" in block:
+                metadata["input"] = redact_observable(block["input"])
             events.append(
                 ProviderEvent(
-                    "tool.started",
-                    text=payload_text(block.get("name")),
-                    metadata=_selected(block, {"id", "input", "name"}),
+                    normalized,
+                    text=tool_name,
+                    metadata=metadata,
                     raw=raw,
                 )
             )
@@ -297,14 +418,10 @@ def _claude_stream_event(
         delta = event.get("delta")
         if isinstance(delta, dict):
             delta_type = str(delta.get("type", ""))
-            text = payload_text(
-                delta.get("text")
-                or delta.get("thinking")
-                or delta.get("partial_json")
-            )
-            normalized = "agent.message.delta"
             if delta_type == "thinking_delta":
-                normalized = "reasoning.summary.delta"
+                return []
+            text = payload_text(delta.get("text") or delta.get("partial_json"))
+            normalized = "agent.message.delta"
             return [ProviderEvent(normalized, text=text, raw=raw)]
     return [ProviderEvent("provider.event", raw=raw)]
 
@@ -374,3 +491,14 @@ def _selected(
         if field in value:
             result[field] = value[field]
     return result
+
+
+def _selected_redacted(
+    value: dict[str, Any],
+    fields: set[str],
+) -> dict[str, Any]:
+    selected = _selected(value, fields)
+    redacted = redact_observable(selected)
+    if isinstance(redacted, dict):
+        return redacted
+    return {}

@@ -4,44 +4,40 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import asdict
 import datetime
 import json
-from pathlib import Path
 import shutil
 import stat
 import sys
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from agent_harness.api import run_daemon
 from agent_harness.blobs import BlobStore
-from agent_harness.client import HarnessClient
-from agent_harness.client import ensure_daemon
-from agent_harness.client import stop_daemon
-from agent_harness.client import wait_command
-from agent_harness.config import CONTROL_BUILD_ID
-from agent_harness.config import CONTROL_PROTOCOL_VERSION
-from agent_harness.config import paths
-from agent_harness.config import prepare_paths
-from agent_harness.config import public_paths
+from agent_harness.client import HarnessClient, ensure_daemon, stop_daemon, wait_command
+from agent_harness.config import (
+    CONTROL_BUILD_ID,
+    CONTROL_PROTOCOL_VERSION,
+    paths,
+    prepare_paths,
+    public_paths,
+)
 from agent_harness.errors import HarnessError
 from agent_harness.ids import new_uuid
 from agent_harness.migration import migrate_state
+from agent_harness.providers.base import trusted_executable
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
 from agent_harness.scheduler import Scheduler
-from agent_harness.service_manager import SystemdUserService
-from agent_harness.service_manager import UnitConfiguration
+from agent_harness.service_manager import SystemdUserService, UnitConfiguration
 from agent_harness.storage import StateStore
-from agent_harness.sync import publish_all
-from agent_harness.sync import read_sync_status
+from agent_harness.sync import publish_all, read_sync_status
 from agent_harness.tui import run_tui
+from agent_harness.usage import provider_auth_ready
 from agent_harness.worker import SessionWorker
-from tools.bundle import BundleError
-from tools.bundle import verify_bundle
-from tools.install import default_launcher
-from tools.install import InstallError
-from tools.install import read_selection
+from tools.bundle import BundleError, verify_bundle
+from tools.install import InstallError, default_launcher, read_selection
 
 
 def parser() -> argparse.ArgumentParser:
@@ -99,6 +95,7 @@ def parser() -> argparse.ArgumentParser:
 
     status = subcommands.add_parser("status")
     status.add_argument("session_id", nargs="?")
+    subcommands.add_parser("quiescence")
     usage = subcommands.add_parser("usage")
     usage.add_argument("session_id")
     extend = subcommands.add_parser("extend-budget")
@@ -106,6 +103,8 @@ def parser() -> argparse.ArgumentParser:
     extend.add_argument("--seconds", type=int)
     extend.add_argument("--tokens", type=int)
     extend.add_argument("--allow-xhigh-once", action="store_true")
+    extend.add_argument("--command-id", default="")
+    extend.add_argument("--provider", choices=("claude", "codex"), default="")
     extend.add_argument("--reason", required=True)
     subcommands.add_parser("providers")
     subcommands.add_parser("capabilities")
@@ -254,11 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     except HarnessError as error:
         message = error.detail.code + ": " + error.detail.message
         if error.detail.correlation_id:
-            message += (
-                " [correlation "
-                + error.detail.correlation_id
-                + "]"
-            )
+            message += " [correlation " + error.detail.correlation_id + "]"
         print(message, file=sys.stderr)
         return 1
     except ValueError as error:
@@ -307,6 +302,8 @@ async def _run(arguments: argparse.Namespace) -> int:
     if arguments.command == "paths":
         _print_json(public_paths(harness_paths))
         return 0
+    if arguments.command == "quiescence":
+        return await _quiescence(harness_paths)
     if arguments.command == "daemon":
         await run_daemon(
             harness_paths,
@@ -382,9 +379,7 @@ async def _run(arguments: argparse.Namespace) -> int:
                     "installed": False,
                     "detail": "local daemon",
                     "control_build_id": CONTROL_BUILD_ID,
-                    "control_protocol_version": (
-                        CONTROL_PROTOCOL_VERSION
-                    ),
+                    "control_protocol_version": (CONTROL_PROTOCOL_VERSION),
                 }
             )
             if healthy:
@@ -394,9 +389,7 @@ async def _run(arguments: argparse.Namespace) -> int:
             {
                 **asdict(status),
                 "control_build_id": CONTROL_BUILD_ID,
-                "control_protocol_version": (
-                    CONTROL_PROTOCOL_VERSION
-                ),
+                "control_protocol_version": (CONTROL_PROTOCOL_VERSION),
             }
         )
         if status.active:
@@ -437,8 +430,7 @@ async def _run(arguments: argparse.Namespace) -> int:
     client = await ensure_daemon(harness_paths)
     if arguments.command == "new":
         predicates = [
-            _json_object(value, "--predicate")
-            for value in arguments.predicate
+            _json_object(value, "--predicate") for value in arguments.predicate
         ]
         budgets = _json_object(arguments.budgets, "--budgets")
         result = await client.request(
@@ -513,11 +505,13 @@ async def _run(arguments: argparse.Namespace) -> int:
             payload["additional_seconds"] = arguments.seconds
         if arguments.tokens is not None:
             payload["additional_tokens"] = arguments.tokens
+        if arguments.command_id:
+            payload["command_id"] = arguments.command_id
+        if arguments.provider:
+            payload["provider"] = arguments.provider
         result = await client.request(
             "POST",
-            "/v1/sessions/"
-            + arguments.session_id
-            + "/budget-extensions",
+            "/v1/sessions/" + arguments.session_id + "/budget-extensions",
             payload=payload,
             idempotency_key=new_uuid(),
         )
@@ -549,9 +543,7 @@ async def _run(arguments: argparse.Namespace) -> int:
     if arguments.command == "checkpoint":
         result = await client.request(
             "POST",
-            "/v1/sessions/"
-            + arguments.session_id
-            + "/checkpoints",
+            "/v1/sessions/" + arguments.session_id + "/checkpoints",
             payload={},
         )
         _print_json(result)
@@ -559,10 +551,7 @@ async def _run(arguments: argparse.Namespace) -> int:
     if arguments.command in {"archive", "unarchive"}:
         result = await client.request(
             "POST",
-            "/v1/sessions/"
-            + arguments.session_id
-            + "/"
-            + arguments.command,
+            "/v1/sessions/" + arguments.session_id + "/" + arguments.command,
             payload={},
             idempotency_key=new_uuid(),
         )
@@ -572,31 +561,24 @@ async def _run(arguments: argparse.Namespace) -> int:
         if arguments.reconcile_action == "list":
             result = await client.request(
                 "GET",
-                "/v1/sessions/"
-                + arguments.session_id
-                + "/reconciliations",
+                "/v1/sessions/" + arguments.session_id + "/reconciliations",
             )
             _print_json(result)
             return 0
         if arguments.reconcile_action == "inspect":
             result = await client.request(
                 "GET",
-                "/v1/reconciliations/"
-                + arguments.reconciliation_id,
+                "/v1/reconciliations/" + arguments.reconciliation_id,
             )
             _print_json(result)
             return 0
         audit = _json_object(arguments.audit, "--audit")
         result = await client.request(
             "POST",
-            "/v1/reconciliations/"
-            + arguments.reconciliation_id
-            + "/resolution",
+            "/v1/reconciliations/" + arguments.reconciliation_id + "/resolution",
             payload={
                 "decision": arguments.decision,
-                "observed_workspace_digest": (
-                    arguments.observed_workspace_digest
-                ),
+                "observed_workspace_digest": (arguments.observed_workspace_digest),
                 "approval_id": arguments.approval_id,
                 "audit": audit,
             },
@@ -625,10 +607,7 @@ async def _run(arguments: argparse.Namespace) -> int:
     if arguments.command == "action":
         result = await client.request(
             "POST",
-            "/v1/sessions/"
-            + arguments.session_id
-            + "/commands/"
-            + arguments.action,
+            "/v1/sessions/" + arguments.session_id + "/commands/" + arguments.action,
             payload={},
             idempotency_key=new_uuid(),
         )
@@ -662,9 +641,7 @@ async def _run(arguments: argparse.Namespace) -> int:
         if arguments.transfer_action == "create":
             result = await client.request(
                 "POST",
-                "/v1/sessions/"
-                + arguments.session_id
-                + "/transfers",
+                "/v1/sessions/" + arguments.session_id + "/transfers",
                 payload={
                     "destination_host": arguments.destination_host,
                     "destination_encryption_public": (
@@ -675,17 +652,13 @@ async def _run(arguments: argparse.Namespace) -> int:
             _print_json(result)
             return 0
         if arguments.transfer_action == "import":
-            envelope = arguments.envelope_file.read_text(
-                encoding="utf-8"
-            ).strip()
+            envelope = arguments.envelope_file.read_text(encoding="utf-8").strip()
             result = await client.request(
                 "POST",
                 "/v1/transfers/import",
                 payload={
                     "envelope": envelope,
-                    "source_signing_public": (
-                        arguments.source_signing_public
-                    ),
+                    "source_signing_public": (arguments.source_signing_public),
                 },
             )
             _print_json(result)
@@ -693,9 +666,7 @@ async def _run(arguments: argparse.Namespace) -> int:
         if arguments.transfer_action == "finalize":
             result = await client.request(
                 "POST",
-                "/v1/sessions/"
-                + arguments.session_id
-                + "/transfers/finalize",
+                "/v1/sessions/" + arguments.session_id + "/transfers/finalize",
                 payload={
                     "destination_host": arguments.destination_host,
                     "owner_epoch": arguments.owner_epoch,
@@ -729,29 +700,35 @@ async def _worker(harness_paths: Any, session_id: str) -> None:
 
 
 async def _doctor(harness_paths: Any) -> int:
-    state_mode = stat.S_IMODE(
-        harness_paths.state_dir.stat().st_mode
-    )
-    runtime_private = (
-        stat.S_IMODE(harness_paths.runtime.stat().st_mode) == 0o700
-    )
+    state_mode = stat.S_IMODE(harness_paths.state_dir.stat().st_mode)
+    runtime_private = stat.S_IMODE(harness_paths.runtime.stat().st_mode) == 0o700
     socket_mode: int | None = None
     if harness_paths.socket.exists():
         socket_mode = stat.S_IMODE(harness_paths.socket.stat().st_mode)
+    trusted_node_tools = True
+    try:
+        trusted_executable("node")
+        trusted_executable("npx")
+    except (OSError, RuntimeError):
+        trusted_node_tools = False
     checks = {
-        "npx": shutil.which("npx") is not None,
+        "npx": trusted_node_tools,
         "git": shutil.which("git") is not None,
         "state_directory": harness_paths.state_dir.is_dir(),
-        "git_state_repository": (
-            harness_paths.state_dir / ".git"
-        ).exists(),
+        "git_state_repository": (harness_paths.state_dir / ".git").exists(),
         "private_state_mode": state_mode == 0o700,
         "private_runtime_mode": runtime_private,
-        "private_socket_mode": (
-            socket_mode is None or socket_mode == 0o600
-        ),
+        "private_socket_mode": (socket_mode is None or socket_mode == 0o600),
     }
     details: dict[str, Any] = {}
+    creation_intent_root = harness_paths.runtime / "creation-intents"
+    pending_creation_intents = []
+    if creation_intent_root.is_dir():
+        pending_creation_intents = sorted(
+            path.name for path in creation_intent_root.glob("*.json")
+        )
+    checks["pending_creation_intents"] = not pending_creation_intents
+    details["pending_creation_intents"] = pending_creation_intents
     store = StateStore(harness_paths.database)
     try:
         checks["sqlite"] = store.integrity_check() == "ok"
@@ -768,9 +745,7 @@ async def _doctor(harness_paths: Any) -> int:
         stale_leases = [
             lease
             for lease in active_leases
-            if _timestamp_is_expired(
-                str(lease.get("expires_at", ""))
-            )
+            if _timestamp_is_expired(str(lease.get("expires_at", "")))
         ]
         checks["stale_workers"] = not stale_workers
         checks["stale_process_leases"] = not stale_leases
@@ -783,15 +758,13 @@ async def _doctor(harness_paths: Any) -> int:
             socket_mode_detail = oct(socket_mode)
         details["permissions"] = {
             "state_mode": oct(state_mode),
-            "runtime_mode": oct(
-                stat.S_IMODE(harness_paths.runtime.stat().st_mode)
-            ),
+            "runtime_mode": oct(stat.S_IMODE(harness_paths.runtime.stat().st_mode)),
             "socket_mode": socket_mode_detail,
         }
     finally:
         store.close()
     bundle_status: dict[str, Any] = {
-        "status": "warning",
+        "status": "fail",
         "detail": "no installed bundle is selected",
     }
     try:
@@ -805,25 +778,37 @@ async def _doctor(harness_paths: Any) -> int:
         }
     except (BundleError, InstallError, ValueError):
         bundle_status = {
-            "status": "warning",
+            "status": "fail",
             "detail": "installed bundle is absent or invalid",
         }
-    service_probes = [
-        asdict(item) for item in _service_manager().diagnostics()
-    ]
+    service_probes = [asdict(item) for item in _service_manager().diagnostics()]
     daemon = HarnessClient(harness_paths)
     daemon_health = await daemon._health_payload()
     daemon_status = "not-running"
     if daemon_health:
         daemon_status = "incompatible"
         if (
-            daemon_health.get("control_build_id")
-            == CONTROL_BUILD_ID
+            daemon_health.get("control_build_id") == CONTROL_BUILD_ID
             and daemon_health.get("control_protocol_version")
             == CONTROL_PROTOCOL_VERSION
         ):
             daemon_status = "compatible"
+    runtime_build_id = str(daemon_health.get("runtime_build_id", ""))
+    selected_build_id = str(bundle_status.get("build_id", ""))
+    runtime_binding_required = bool(daemon_health and selected_build_id)
+    runtime_build_matches = True
+    if runtime_binding_required:
+        runtime_build_matches = runtime_build_id == selected_build_id
+    checks["installed_bundle"] = bundle_status.get("status") == "pass"
+    checks["daemon_compatible"] = daemon_status == "compatible"
+    checks["runtime_build_matches_selection"] = runtime_build_matches
+    checks["systemd_recovery"] = bool(service_probes) and all(
+        probe.get("status") == "pass" for probe in service_probes
+    )
     disk = shutil.disk_usage(harness_paths.state_dir)
+    checks["disk_headroom"] = disk.free >= 2 * 1024**3
+    checks["claude_auth"] = provider_auth_ready("claude")
+    checks["codex_auth"] = provider_auth_ready("codex")
     details.update(
         {
             "bundle": bundle_status,
@@ -837,21 +822,29 @@ async def _doctor(harness_paths: Any) -> int:
                     "control_protocol_version",
                     0,
                 ),
+                "runtime_build_id": runtime_build_id,
+                "selected_build_id": selected_build_id,
+                "runtime_binding_required": runtime_binding_required,
+                "quiescence": daemon_health.get("quiescence", {}),
             },
             "disk": {
                 "free_bytes": disk.free,
                 "headroom": disk.free >= 2 * 1024**3,
             },
             "provider_launchers": {
-                "claude": (
-                    "npx @anthropic-ai/claude-code@2.1.220"
-                ),
+                "claude": ("npx @anthropic-ai/claude-code@2.1.220"),
                 "codex": "npx -y @openai/codex@0.146.0",
             },
             "service": service_probes,
         }
     )
     sync_status = read_sync_status(harness_paths)
+    sync_state = str(sync_status.get("state", "unknown"))
+    sync_pending = bool(sync_status.get("pending", False))
+    checks["sync_clean"] = not sync_pending and sync_state not in {
+        "conflict",
+        "invalid",
+    }
     details["sync_lag_seconds"] = _sync_lag_seconds(sync_status)
     _print_json(
         {
@@ -871,12 +864,61 @@ def _service_manager() -> SystemdUserService:
     return SystemdUserService()
 
 
+async def _quiescence(harness_paths: Any) -> int:
+    manager_status = _service_manager().status()
+    health = await HarnessClient(harness_paths)._health_payload()
+    remote = health.get("quiescence")
+    if isinstance(remote, dict):
+        restart_safe = remote.get("restart_safe") is True
+        _print_json(
+            {
+                "runtime_build_id": str(health.get("runtime_build_id", "")),
+                "installed_build_id": manager_status.build_id,
+                "service_active": manager_status.active,
+                "daemon_reachable": True,
+                "proof_state_known": True,
+                "quiescence": remote,
+            }
+        )
+        if restart_safe:
+            return 0
+        return 1
+
+    store = StateStore(harness_paths.database)
+    try:
+        commands = store.active_command_summaries()
+    finally:
+        store.close()
+    proof_state_known = not manager_status.active
+    restart_safe = not commands and proof_state_known
+    _print_json(
+        {
+            "runtime_build_id": "",
+            "installed_build_id": manager_status.build_id,
+            "service_active": manager_status.active,
+            "daemon_reachable": False,
+            "proof_state_known": proof_state_known,
+            "quiescence": {
+                "restart_safe": restart_safe,
+                "active_commands": len(commands),
+                "active_command_details": commands,
+                "active_unattended_commands": [
+                    item for item in commands if item.get("profile") == "unattended"
+                ],
+                "active_proofs": 0,
+                "active_proof_sessions": [],
+            },
+        }
+    )
+    if restart_safe:
+        return 0
+    return 1
+
+
 def _installed_selection():
     selection = read_selection(default_launcher())
     if selection is None:
-        raise ValueError(
-            "install a verified bundle before installing the service"
-        )
+        raise ValueError("install a verified bundle before installing the service")
     bundle = verify_bundle(selection.executable.parent.parent)
     if bundle.build_id != selection.build_id:
         raise ValueError("installed bundle selection is inconsistent")

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -52,6 +50,7 @@ class GoalStatus(StrEnum):
 
 class CommandStatus(StrEnum):
     QUEUED = "queued"
+    AWAITING_XHIGH_AUTHORIZATION = "awaiting-xhigh-authorization"
     DISPATCHING = "dispatching"
     COMPLETE = "complete"
     FAILED = "failed"
@@ -89,6 +88,7 @@ class Session:
     updated_at: str
     archived: bool = False
     external_ref: dict[str, str] = field(default_factory=dict)
+    creation_digest: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -146,6 +146,22 @@ class CommandReceipt:
 
 
 @dataclass(frozen=True)
+class Milestone:
+    milestone_id: str
+    title: str
+    status: str
+    dependencies: tuple[str, ...]
+    predicates: tuple[dict[str, Any], ...]
+    position: int
+
+    def as_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["dependencies"] = list(self.dependencies)
+        value["predicates"] = list(self.predicates)
+        return value
+
+
+@dataclass(frozen=True)
 class Goal:
     goal_id: str
     session_id: str
@@ -157,11 +173,20 @@ class Goal:
     budgets: dict[str, Any]
     created_at: str
     updated_at: str
+    milestones: tuple[Milestone, ...] = ()
+    permitted_providers: tuple[str, ...] = ()
+    permitted_efforts: tuple[str, ...] = ()
+    max_concurrency: int = 1
+    completion_policy: str = "evidence-all"
+    incident_policy: str = "recover-then-pause"
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["constraints"] = list(self.constraints)
         value["predicates"] = list(self.predicates)
+        value["milestones"] = [item.as_dict() for item in self.milestones]
+        value["permitted_providers"] = list(self.permitted_providers)
+        value["permitted_efforts"] = list(self.permitted_efforts)
         return value
 
 
@@ -192,6 +217,8 @@ class RoutingCandidate:
     queue_count: int
     affinity: bool
     context_transfer_tokens: int
+    usage_sample_id: str = ""
+    usage_observed_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -202,6 +229,15 @@ class RoutingDecision:
     reason: str
     ranked: tuple[dict[str, Any], ...]
     rejected: tuple[dict[str, str], ...]
+    credits_engaged: bool = False
+    binding_percent: float | None = None
+    usage_sample_id: str = ""
+    usage_observed_at: str = ""
+    required_capabilities: tuple[str, ...] = ()
+    metered_budget: float | None = None
+    binding_ceiling: float | None = None
+    execution_profile: str = ""
+    workload: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -209,6 +245,15 @@ class RoutingDecision:
             "model": self.model,
             "effort": self.effort,
             "reason": self.reason,
+            "credits_engaged": self.credits_engaged,
+            "binding_percent": self.binding_percent,
+            "usage_sample_id": self.usage_sample_id,
+            "usage_observed_at": self.usage_observed_at,
+            "required_capabilities": list(self.required_capabilities),
+            "metered_budget": self.metered_budget,
+            "binding_ceiling": self.binding_ceiling,
+            "execution_profile": self.execution_profile,
+            "workload": self.workload,
             "ranked": list(self.ranked),
             "rejected": list(self.rejected),
         }
@@ -261,7 +306,5 @@ class RestartRecovery:
     def as_dict(self) -> dict[str, Any]:
         return {
             "requeued_command_ids": list(self.requeued_command_ids),
-            "reconciliations": [
-                item.as_dict() for item in self.reconciliations
-            ],
+            "reconciliations": [item.as_dict() for item in self.reconciliations],
         }

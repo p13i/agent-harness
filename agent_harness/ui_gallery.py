@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 from textual.containers import Horizontal
 from textual.widgets import Static
 
 from agent_harness.tui import HarnessApp
-
 
 FIXTURES = (
     "empty",
@@ -271,9 +271,7 @@ class GalleryClient:
                     "turn_id": "turn-gallery",
                     "text": "",
                     "status": "pending",
-                    "metadata": {
-                        "reconciliation_id": "reconciliation-gallery"
-                    },
+                    "metadata": {"reconciliation_id": "reconciliation-gallery"},
                 },
             ]
         if self.fixture == "long-code":
@@ -450,8 +448,7 @@ async def _render_gallery(output: Path) -> dict[str, object]:
         "modes": list(MODES),
         "themes": list(THEMES),
         "breakpoints": [
-            {"width": width, "height": height}
-            for width, height in BREAKPOINTS
+            {"width": width, "height": height} for width, height in BREAKPOINTS
         ],
         "files": files,
     }
@@ -474,6 +471,7 @@ async def _render_mode_theme(
         Path("/workspace/agent-harness"),
         session_id="gallery-session",
     )
+    app.animation_level = "none"
     files: list[str] = []
     async with app.run_test(size=(160, 48)) as pilot:
         await pilot.pause()
@@ -525,9 +523,7 @@ def render_svg(
         raise ValueError("unknown gallery mode")
     if (columns, rows) not in BREAKPOINTS:
         raise ValueError("unknown gallery breakpoint")
-    return asyncio.run(
-        _render_one(fixture, mode, theme, columns, rows)
-    )
+    return asyncio.run(_render_one(fixture, mode, theme, columns, rows))
 
 
 async def _render_one(
@@ -543,6 +539,7 @@ async def _render_one(
         Path("/workspace/agent-harness"),
         session_id="gallery-session",
     )
+    app.animation_level = "none"
     async with app.run_test(size=(columns, rows)) as pilot:
         await pilot.pause()
         if app._poll_timer is not None:
@@ -551,6 +548,7 @@ async def _render_one(
         if fixture == "disconnected":
             app._set_connection_state("reconnecting")
         await pilot.pause()
+        await pilot.wait_for_scheduled_animations()
         _validate_layout(app)
         return _self_contained_svg(app.export_screenshot())
 
@@ -566,10 +564,7 @@ def _validate_layout(app: HarnessApp) -> None:
         raise ValueError("composer is clipped")
     if composer.region.width < 20 or composer.region.height < 3:
         raise ValueError("composer lacks usable geometry")
-    if (
-        notification.display
-        and notification.region.bottom > composer.region.y
-    ):
+    if notification.display and notification.region.bottom > composer.region.y:
         raise ValueError("notification overlaps the composer")
     if app.focused is None:
         raise ValueError("gallery lacks keyboard focus")
@@ -587,9 +582,10 @@ def _self_contained_svg(content: str) -> str:
     value = re.sub(
         r"\s*@font-face\s*\{.*?\}\s*",
         "\n",
-        content,
+        value,
         flags=re.DOTALL,
     )
+    value = _canonicalize_rich_classes(value)
     value = re.sub(
         r"(Generated with Rich)\s+https?://[^ <]+",
         r"\1",
@@ -610,10 +606,39 @@ def _self_contained_svg(content: str) -> str:
     )
     if resources:
         raise ValueError(
-            "gallery contains an outbound resource: "
-            + ", ".join(resources[:3])
+            "gallery contains an outbound resource: " + ", ".join(resources[:3])
         )
     return value
+
+
+def _canonicalize_rich_classes(content: str) -> str:
+    pattern = re.compile(
+        r"\s*\.(terminal-gallery-r\d+)\s*\{([^{}]*)\}",
+    )
+    matches = list(pattern.finditer(content))
+    if not matches:
+        return content
+    mappings: dict[str, str] = {}
+    declarations_by_name: dict[str, str] = {}
+    for match in matches:
+        old_name = match.group(1)
+        declarations = match.group(2).strip()
+        digest = hashlib.sha256(declarations.encode("utf-8")).hexdigest()[:16]
+        new_name = "terminal-gallery-s-" + digest
+        mappings[old_name] = new_name
+        declarations_by_name[new_name] = declarations
+    value = pattern.sub("", content)
+    value = re.sub(
+        r"terminal-gallery-r\d+",
+        lambda match: mappings[match.group(0)],
+        value,
+    )
+    used_names = set(re.findall(r"terminal-gallery-s-[0-9a-f]{16}", value))
+    rules = {
+        "." + name + " { " + declarations_by_name[name] + " }" for name in used_names
+    }
+    canonical_rules = "\n".join(sorted(rules))
+    return value.replace("<style>", "<style>\n" + canonical_rules, 1)
 
 
 def main(arguments: list[str] | None = None) -> int:

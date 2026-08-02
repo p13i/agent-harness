@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from abc import ABC
-from abc import abstractmethod
-from collections.abc import Awaitable
-from collections.abc import Callable
-from dataclasses import dataclass
-from pathlib import Path
 import os
 import re
+import shutil
+import stat
+from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-
 EventHandler = Callable[["ProviderEvent"], Awaitable[None]]
+PrePromptGate = Callable[[], Awaitable[None]]
 ApprovalHandler = Callable[
     [str, dict[str, Any]],
     Awaitable[dict[str, Any]],
@@ -59,6 +59,13 @@ class ProviderStatus:
     capabilities: frozenset[str]
 
 
+@dataclass(frozen=True)
+class ChildLaunchGate:
+    database: Path
+    command_id: str
+    limit: int
+
+
 class ProviderAdapter(ABC):
     provider_id: str
 
@@ -74,6 +81,8 @@ class ProviderAdapter(ABC):
         effort: str,
         event_handler: EventHandler,
         approval_handler: ApprovalHandler,
+        child_launch_gate: ChildLaunchGate | None = None,
+        pre_prompt_gate: PrePromptGate | None = None,
     ) -> ProviderResult:
         raise NotImplementedError
 
@@ -95,26 +104,93 @@ class ProviderAdapter(ABC):
     def process_identity(self) -> tuple[int, str]:
         return (0, "")
 
+    def native_session_available(
+        self,
+        workspace: Path,
+        native_session_id: str,
+    ) -> bool:
+        del workspace
+        del native_session_id
+        return True
+
 
 _SENSITIVE_NAME = re.compile(
     r"(?:TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_KEY)",
     re.IGNORECASE,
 )
+_SAFE_ENVIRONMENT_NAMES = frozenset(
+    {
+        "COLORTERM",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "NO_COLOR",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TERM",
+        "TMPDIR",
+        "USER",
+    }
+)
+_TRUSTED_EXECUTABLE_SEARCH = os.pathsep.join(
+    (
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    )
+)
 
 
-def provider_environment(provider: str, auth_mode: str = "subscription") -> dict[str, str]:
+def trusted_executable(name: str) -> str:
+    candidate = shutil.which(name, path=_TRUSTED_EXECUTABLE_SEARCH)
+    if candidate is None:
+        raise RuntimeError("trusted executable was not found: " + name)
+    path = Path(candidate)
+    resolved = path.resolve()
+    details = resolved.stat()
+    if not resolved.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError("trusted executable is not runnable: " + name)
+    if stat.S_IMODE(details.st_mode) & 0o022:
+        raise RuntimeError("trusted executable is writable by another user: " + name)
+    return str(path)
+
+
+def trusted_provider_path() -> str:
+    directories = []
+    for name in ("node", "npx"):
+        parent = str(Path(trusted_executable(name)).parent)
+        if parent not in directories:
+            directories.append(parent)
+    for parent in ("/usr/bin", "/bin"):
+        if parent not in directories:
+            directories.append(parent)
+    return os.pathsep.join(directories)
+
+
+def provider_environment(
+    provider: str, auth_mode: str = "subscription"
+) -> dict[str, str]:
     environment: dict[str, str] = {}
     for name, value in os.environ.items():
-        if name == "npm_config_package":
-            continue
-        if _SENSITIVE_NAME.search(name):
-            keep = False
-            if auth_mode == "api":
-                if provider == "claude" and name == "ANTHROPIC_API_KEY":
-                    keep = True
-                if provider == "codex" and name == "OPENAI_API_KEY":
-                    keep = True
-            if not keep:
+        if name not in _SAFE_ENVIRONMENT_NAMES and not name.startswith("LC_"):
+            if name != "CLAUDE_CODE_OAUTH_TOKEN":
                 continue
+        if name == "CLAUDE_CODE_OAUTH_TOKEN":
+            if provider != "claude" or auth_mode != "subscription":
+                continue
+        if _SENSITIVE_NAME.search(name) and name != "CLAUDE_CODE_OAUTH_TOKEN":
+            continue
         environment[name] = value
+    if auth_mode == "api":
+        credential_name = ""
+        if provider == "claude":
+            credential_name = "ANTHROPIC_API_KEY"
+        if provider == "codex":
+            credential_name = "OPENAI_API_KEY"
+        credential = os.environ.get(credential_name, "")
+        if credential_name and credential:
+            environment[credential_name] = credential
+    environment["PATH"] = trusted_provider_path()
     return environment

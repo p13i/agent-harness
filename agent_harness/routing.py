@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Iterable
 
 from agent_harness.errors import ProviderUnavailableError
-from agent_harness.models import RoutingCandidate
-from agent_harness.models import RoutingDecision
-
+from agent_harness.models import RoutingCandidate, RoutingDecision
 
 CAPACITY_LIMIT_PERCENT = 90.0
 QUALITY_WINDOW = 10.0
@@ -20,7 +19,13 @@ def route(
     workload: str = "implementation",
     manual_provider: str = "",
     metered_budget: float | None = None,
+    binding_ceiling: float | None = None,
+    execution_profile: str = "",
 ) -> RoutingDecision:
+    if metered_budget is not None and not math.isfinite(metered_budget):
+        raise ValueError("metered budget must be finite")
+    if binding_ceiling is not None and not math.isfinite(binding_ceiling):
+        raise ValueError("binding ceiling must be finite")
     accepted: list[tuple[RoutingCandidate, float]] = []
     rejected: list[dict[str, str]] = []
     selected_candidates = list(candidates)
@@ -101,6 +106,15 @@ def route(
         reason=reason,
         ranked=tuple(ranked),
         rejected=tuple(rejected),
+        credits_engaged=selected.credits_engaged,
+        binding_percent=selected.binding_percent,
+        usage_sample_id=selected.usage_sample_id,
+        usage_observed_at=selected.usage_observed_at,
+        required_capabilities=tuple(sorted(required_capabilities)),
+        metered_budget=metered_budget,
+        binding_ceiling=binding_ceiling,
+        execution_profile=execution_profile,
+        workload=workload,
     )
 
 
@@ -116,9 +130,16 @@ def _rejection_reason(
         return "provider is not ready"
     if not required.issubset(candidate.capabilities):
         return "required capabilities are unavailable"
-    if candidate.credits_engaged and metered_budget is None:
-        return "metered credits require an explicit budget"
+    if candidate.credits_engaged:
+        if metered_budget is None or metered_budget <= 0:
+            return "metered credits require a positive explicit budget"
+        if "cost-reporting" not in candidate.capabilities:
+            return "metered credits require exact cost reporting"
     if candidate.binding_percent is not None:
+        if not math.isfinite(candidate.binding_percent):
+            return "binding usage is not finite"
+        if candidate.binding_percent < 0:
+            return "binding usage is negative"
         if candidate.binding_percent >= CAPACITY_LIMIT_PERCENT:
             return "binding usage is at or above 90 percent"
     return ""
@@ -127,7 +148,8 @@ def _rejection_reason(
 def _fairness_score(candidate: RoutingCandidate, workload: str) -> float:
     headroom = 50.0
     if candidate.binding_percent is not None:
-        headroom = max(1.0, 100.0 - candidate.binding_percent)
+        if math.isfinite(candidate.binding_percent):
+            headroom = max(1.0, 100.0 - candidate.binding_percent)
     role_weight = 1.0
     normalized = workload.casefold()
     if normalized in {"planning", "architecture"}:
@@ -148,4 +170,3 @@ def _fairness_score(candidate: RoutingCandidate, workload: str) -> float:
         fairness -= 0.05
     fairness += candidate.context_transfer_tokens / 10_000_000.0
     return fairness
-

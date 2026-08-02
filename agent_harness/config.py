@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
+import json
 import os
-from pathlib import Path
 import secrets
 import socket
+import sys
+from dataclasses import dataclass
+from pathlib import Path
 
-
-API_VERSION = "1.4.0"
+API_VERSION = "1.10.0"
 CONTROL_PROTOCOL_VERSION = 3
 
 
@@ -26,6 +27,28 @@ def _control_build_id() -> str:
 
 
 CONTROL_BUILD_ID = _control_build_id()
+
+
+def runtime_build_id(executable: Path | None = None) -> str:
+    """Return the selected verified-bundle identifier, if installed."""
+    selected = executable
+    if selected is None:
+        selected = Path(sys.argv[0])
+    try:
+        root = selected.expanduser().resolve().parent.parent
+        payload = json.loads(
+            (root / "bundle-manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("schema") != "p13i/agent-harness/install-bundle/v1":
+        return ""
+    build_id = payload.get("build_id")
+    if not isinstance(build_id, str):
+        return ""
+    return build_id
 
 
 @dataclass(frozen=True)

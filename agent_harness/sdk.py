@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from aiohttp import ClientSession
-from aiohttp import UnixConnector
+from aiohttp import ClientSession, UnixConnector
 
 from agent_harness.client import HarnessClient
 from agent_harness.config import HarnessPaths
@@ -71,9 +70,7 @@ class AgentHarnessClient:
             query["archived"] = "1"
         if external_orchestrator or external_job_id:
             if not external_orchestrator or not external_job_id:
-                raise ValueError(
-                    "external orchestrator and job ID are both required"
-                )
+                raise ValueError("external orchestrator and job ID are both required")
             query["external_orchestrator"] = external_orchestrator
             query["external_job_id"] = external_job_id
         if query:
@@ -106,7 +103,13 @@ class AgentHarnessClient:
         goal_kind: str = "finite",
         constraints: tuple[str, ...] = (),
         predicates: tuple[dict[str, Any], ...] = (),
+        milestones: tuple[dict[str, Any], ...] = (),
         budgets: dict[str, Any] | None = None,
+        permitted_providers: tuple[str, ...] = (),
+        permitted_efforts: tuple[str, ...] = (),
+        max_concurrency: int = 1,
+        completion_policy: str = "",
+        incident_policy: str = "recover-then-pause",
         permission_mode: str = "approval",
         direct: bool = False,
         execution_profile: str = "unattended",
@@ -122,7 +125,13 @@ class AgentHarnessClient:
             "goal_kind": goal_kind,
             "constraints": list(constraints),
             "predicates": list(predicates),
+            "milestones": list(milestones),
             "budgets": budgets,
+            "permitted_providers": list(permitted_providers),
+            "permitted_efforts": list(permitted_efforts),
+            "max_concurrency": max_concurrency,
+            "completion_policy": completion_policy,
+            "incident_policy": incident_policy,
             "permission_mode": permission_mode,
             "direct": direct,
             "execution_profile": execution_profile,
@@ -146,6 +155,16 @@ class AgentHarnessClient:
         idempotency_key: str,
         name: str = "",
         goal: str = "",
+        goal_kind: str = "finite",
+        constraints: tuple[str, ...] = (),
+        predicates: tuple[dict[str, Any], ...] = (),
+        milestones: tuple[dict[str, Any], ...] = (),
+        budgets: dict[str, Any] | None = None,
+        permitted_providers: tuple[str, ...] = (),
+        permitted_efforts: tuple[str, ...] = (),
+        max_concurrency: int = 1,
+        completion_policy: str = "",
+        incident_policy: str = "recover-then-pause",
         permission_mode: str = "approval",
         direct: bool = False,
         execution_profile: str = "unattended",
@@ -155,6 +174,16 @@ class AgentHarnessClient:
             workspace,
             name=name,
             goal=goal,
+            goal_kind=goal_kind,
+            constraints=constraints,
+            predicates=predicates,
+            milestones=milestones,
+            budgets=budgets,
+            permitted_providers=permitted_providers,
+            permitted_efforts=permitted_efforts,
+            max_concurrency=max_concurrency,
+            completion_policy=completion_policy,
+            incident_policy=incident_policy,
             permission_mode=permission_mode,
             direct=direct,
             execution_profile=execution_profile,
@@ -355,6 +384,8 @@ class AgentHarnessClient:
         model: str = "",
         effort: str = "",
         workload: str = "implementation",
+        permission_mode: str = "",
+        safety_limits: dict[str, int | float] | None = None,
         idempotency_key: str = "",
         turn_ref: dict[str, str] | None = None,
     ) -> CommandView:
@@ -366,6 +397,10 @@ class AgentHarnessClient:
         }
         if provider:
             payload["provider"] = provider
+        if permission_mode:
+            payload["permission_mode"] = permission_mode
+        if safety_limits is not None:
+            payload["safety_limits"] = safety_limits
         if turn_ref is not None:
             payload["turn_ref"] = turn_ref
         key = idempotency_key
@@ -391,6 +426,8 @@ class AgentHarnessClient:
         model: str = "",
         effort: str = "",
         workload: str = "implementation",
+        permission_mode: str = "",
+        safety_limits: dict[str, int | float] | None = None,
     ) -> CommandView:
         _require_managed_key(idempotency_key)
         return await self.send_message(
@@ -400,6 +437,8 @@ class AgentHarnessClient:
             model=model,
             effort=effort,
             workload=workload,
+            permission_mode=permission_mode,
+            safety_limits=safety_limits,
             idempotency_key=idempotency_key,
             turn_ref={
                 "step_id": step_id,
@@ -422,10 +461,7 @@ class AgentHarnessClient:
             key = new_uuid()
         result = await self.raw.request(
             "POST",
-            "/v1/sessions/"
-            + session_id
-            + "/commands/"
-            + command_type,
+            "/v1/sessions/" + session_id + "/commands/" + command_type,
             payload=payload,
             idempotency_key=key,
         )
@@ -482,10 +518,7 @@ class AgentHarnessClient:
             key = new_uuid()
         result = await self.raw.request(
             "POST",
-            "/v1/sessions/"
-            + session_id
-            + "/approvals/"
-            + approval_id,
+            "/v1/sessions/" + session_id + "/approvals/" + approval_id,
             payload={"decision": decision},
             idempotency_key=key,
         )
@@ -495,6 +528,54 @@ class AgentHarnessClient:
         return await self.raw.request(
             "GET",
             "/v1/sessions/" + session_id + "/goal",
+        )
+
+    async def promote_goal(
+        self,
+        session_id: str,
+        *,
+        from_goal_id: str,
+        stage: str,
+        objective: str,
+        predicates: list[dict[str, Any]],
+        milestones: list[dict[str, Any]],
+        budgets: dict[str, Any],
+        authorization: dict[str, Any],
+        constraints: list[str] | None = None,
+        permitted_providers: list[str] | None = None,
+        permitted_efforts: list[str] | None = None,
+        max_concurrency: int = 1,
+        completion_policy: str = "evidence-all",
+        incident_policy: str = "recover-then-pause",
+        goal_kind: str = "finite",
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        if constraints is None:
+            constraints = []
+        if permitted_providers is None:
+            permitted_providers = []
+        if permitted_efforts is None:
+            permitted_efforts = []
+        return await self.raw.request(
+            "POST",
+            "/v1/sessions/" + session_id + "/goal/promotions",
+            payload={
+                "from_goal_id": from_goal_id,
+                "stage": stage,
+                "objective": objective,
+                "goal_kind": goal_kind,
+                "constraints": constraints,
+                "predicates": predicates,
+                "milestones": milestones,
+                "budgets": budgets,
+                "permitted_providers": permitted_providers,
+                "permitted_efforts": permitted_efforts,
+                "max_concurrency": max_concurrency,
+                "completion_policy": completion_policy,
+                "incident_policy": incident_policy,
+                "authorization": authorization,
+            },
+            idempotency_key=idempotency_key,
         )
 
     async def add_evidence(
@@ -522,6 +603,60 @@ class AgentHarnessClient:
         )
         return _object(result.get("evidence"))
 
+    async def adopt_session_contract(
+        self,
+        session_id: str,
+        workspace: Path,
+        *,
+        name: str,
+        goal: str,
+        goal_kind: str,
+        constraints: list[str],
+        predicates: list[dict[str, Any]],
+        milestones: list[dict[str, Any]],
+        budgets: dict[str, Any],
+        permitted_providers: list[str],
+        permitted_efforts: list[str],
+        max_concurrency: int,
+        completion_policy: str,
+        incident_policy: str,
+        permission_mode: str,
+        direct: bool,
+        execution_profile: str,
+        external_ref: dict[str, str],
+        authorization: dict[str, Any],
+        idempotency_key: str,
+        model: str = "",
+        effort: str = "",
+    ) -> dict[str, Any]:
+        return await self.raw.request(
+            "POST",
+            "/v1/sessions/" + session_id + "/contract-adoptions",
+            payload={
+                "workspace": str(workspace.expanduser().resolve()),
+                "name": name,
+                "goal": goal,
+                "goal_kind": goal_kind,
+                "constraints": constraints,
+                "predicates": predicates,
+                "milestones": milestones,
+                "budgets": budgets,
+                "permitted_providers": permitted_providers,
+                "permitted_efforts": permitted_efforts,
+                "max_concurrency": max_concurrency,
+                "completion_policy": completion_policy,
+                "incident_policy": incident_policy,
+                "permission_mode": permission_mode,
+                "direct": direct,
+                "execution_profile": execution_profile,
+                "external_ref": external_ref,
+                "authorization": authorization,
+                "model": model,
+                "effort": effort,
+            },
+            idempotency_key=idempotency_key,
+        )
+
     async def checkpoint(
         self,
         session_id: str,
@@ -535,6 +670,65 @@ class AgentHarnessClient:
             idempotency_key=idempotency_key,
         )
         return _object(result.get("checkpoint"))
+
+    async def invalidate_dispatch_generation(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        authorization: dict[str, Any],
+        idempotency_key: str,
+        prior_command_id: str = "",
+        prior_command_type: str = "",
+        prior_anchor_kind: str = "",
+        prior_reconciliation_id: str = "",
+        prior_reconciliation_resolution: str = "",
+        prior_checkpoint_id: str = "",
+        prior_generation_digest: str = "",
+        prior_material_digest: str = "",
+        next_turn_ref: dict[str, str] | None = None,
+        transition_sequence: int | None = None,
+        next_command_digest: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "authorization": authorization,
+        }
+        if prior_command_id:
+            payload["prior_command_id"] = prior_command_id
+            payload["prior_command_type"] = prior_command_type
+            payload["prior_anchor_kind"] = prior_anchor_kind
+            payload["prior_reconciliation_id"] = prior_reconciliation_id
+            payload["prior_reconciliation_resolution"] = prior_reconciliation_resolution
+        if prior_checkpoint_id:
+            payload["prior_checkpoint_id"] = prior_checkpoint_id
+        if prior_generation_digest:
+            payload["prior_generation_digest"] = prior_generation_digest
+        if prior_material_digest:
+            payload["prior_material_digest"] = prior_material_digest
+        if next_turn_ref is not None:
+            payload["next_turn_ref"] = next_turn_ref
+        if transition_sequence is not None:
+            payload["transition_sequence"] = transition_sequence
+        if next_command_digest:
+            payload["next_command_digest"] = next_command_digest
+        result = await self.raw.request(
+            "POST",
+            "/v1/sessions/" + session_id + "/dispatch-invalidations",
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+        return _object(result.get("invalidation"))
+
+    async def dispatch_transition_anchor(
+        self,
+        session_id: str,
+    ) -> dict[str, Any]:
+        result = await self.raw.request(
+            "GET",
+            "/v1/sessions/" + session_id + "/dispatch-transition-anchor",
+        )
+        return _object(result.get("transition_anchor"))
 
     async def fork(
         self,
@@ -592,8 +786,7 @@ class AgentHarnessClient:
     async def providers(self, workspace: Path) -> dict[str, Any]:
         return await self.raw.request(
             "GET",
-            "/v1/providers?workspace="
-            + str(workspace.expanduser().resolve()),
+            "/v1/providers?workspace=" + str(workspace.expanduser().resolve()),
         )
 
     async def usage(self, session_id: str) -> dict[str, Any]:
@@ -644,9 +837,7 @@ class AgentHarnessClient:
             payload["audit"] = audit
         result = await self.raw.request(
             "POST",
-            "/v1/reconciliations/"
-            + reconciliation_id
-            + "/resolution",
+            "/v1/reconciliations/" + reconciliation_id + "/resolution",
             payload=payload,
             idempotency_key=idempotency_key,
         )
@@ -660,6 +851,8 @@ class AgentHarnessClient:
         additional_seconds: int | None = None,
         additional_tokens: int | None = None,
         allow_xhigh_once: bool = False,
+        command_id: str = "",
+        provider: str = "",
         idempotency_key: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -670,6 +863,10 @@ class AgentHarnessClient:
             payload["additional_seconds"] = additional_seconds
         if additional_tokens is not None:
             payload["additional_tokens"] = additional_tokens
+        if command_id:
+            payload["command_id"] = command_id
+        if provider:
+            payload["provider"] = provider
         key = idempotency_key
         if not key:
             key = new_uuid()
@@ -733,6 +930,31 @@ class AgentHarnessClient:
         result = await self.raw.request("GET", "/v1/leases")
         return _object_tuple(result.get("leases"))
 
+    async def proof(
+        self,
+        session_id: str,
+        *,
+        after_sequence: int = 0,
+        event_limit: int = 1_000,
+        through_sequence: int | None = None,
+        snapshot_id: str = "",
+    ) -> dict[str, Any]:
+        query = (
+            "?after_sequence="
+            + str(after_sequence)
+            + "&event_limit="
+            + str(event_limit)
+        )
+        if through_sequence is not None:
+            query += "&through_sequence=" + str(through_sequence)
+        if snapshot_id:
+            query += "&snapshot_id=" + snapshot_id
+        result = await self.raw.request(
+            "GET",
+            "/v1/sessions/" + session_id + "/proof" + query,
+        )
+        return _object(result.get("proof"))
+
     async def sync_status(self) -> dict[str, Any]:
         return await self.raw.request("GET", "/v1/sync")
 
@@ -793,6 +1015,4 @@ def _event_data(lines: list[str]) -> dict[str, Any]:
 
 def _require_managed_key(value: str) -> None:
     if not value:
-        raise ValueError(
-            "managed operations require a caller idempotency key"
-        )
+        raise ValueError("managed operations require a caller idempotency key")

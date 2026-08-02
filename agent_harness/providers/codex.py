@@ -3,26 +3,37 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
-from collections.abc import Callable
 import json
+import shlex
+import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-import shutil
 from typing import Any
 
-from agent_harness.errors import HarnessError
-from agent_harness.errors import ProviderExhaustedError
-from agent_harness.errors import ProviderUnavailableError
-from agent_harness.providers.base import ApprovalHandler
-from agent_harness.providers.base import EventHandler
-from agent_harness.providers.base import ProviderAdapter
-from agent_harness.providers.base import ProviderEvent
-from agent_harness.providers.base import ProviderModel
-from agent_harness.providers.base import ProviderResult
-from agent_harness.providers.base import ProviderStatus
-from agent_harness.providers.base import provider_environment
+from agent_harness.errors import (
+    HarnessError,
+    ProviderExhaustedError,
+    ProviderUnavailableError,
+)
+from agent_harness.process_control import (
+    ProcessGroupIdentity,
+    process_group_identity,
+    terminate_process_group,
+)
+from agent_harness.providers.base import (
+    ApprovalHandler,
+    ChildLaunchGate,
+    EventHandler,
+    PrePromptGate,
+    ProviderAdapter,
+    ProviderEvent,
+    ProviderModel,
+    ProviderResult,
+    ProviderStatus,
+    provider_environment,
+    trusted_executable,
+)
 from agent_harness.providers.normalize import codex_notification
-
 
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 RequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -35,28 +46,33 @@ class CodexAppServer:
         *,
         notification_handler: NotificationHandler,
         request_handler: RequestHandler,
+        child_launch_gate: ChildLaunchGate | None = None,
     ) -> None:
         self.workspace = workspace
         self.notification_handler = notification_handler
         self.request_handler = request_handler
+        self.child_launch_gate = child_launch_gate
         self.process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task[None] | None = None
         self._stderr: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 0
         self.stderr_tail: list[str] = []
+        self._process_group: ProcessGroupIdentity | None = None
 
     async def start(self) -> None:
         if self.process is not None:
             return
         command = [
-            "npx",
+            trusted_executable("npx"),
             "-y",
             "@openai/codex@0.146.0",
-            "app-server",
-            "--listen",
-            "stdio://",
         ]
+        if self.child_launch_gate is not None:
+            command.extend(self._child_gate_arguments())
+        else:
+            command.extend(["-c", "agents.enabled=false"])
+        command.extend(["app-server", "--listen", "stdio://"])
         self.process = await asyncio.create_subprocess_exec(
             *command,
             cwd=self.workspace,
@@ -67,6 +83,7 @@ class CodexAppServer:
             start_new_session=True,
             limit=16 * 1024 * 1024,
         )
+        self._process_group = process_group_identity(self.process.pid)
         self._reader = asyncio.create_task(self._read_messages())
         self._stderr = asyncio.create_task(self._read_stderr())
         await self.request(
@@ -82,21 +99,53 @@ class CodexAppServer:
         )
         await self.notify("initialized", {})
 
+    def _child_gate_arguments(self) -> list[str]:
+        gate = self.child_launch_gate
+        if gate is None:
+            return ["-c", "agents.enabled=false"]
+        limit = max(0, int(gate.limit))
+        script_path = Path(__file__).resolve().parents[1] / "child_gate.py"
+        hook_command = " ".join(
+            (
+                shlex.quote(str(Path(sys.executable).resolve())),
+                shlex.quote(str(script_path)),
+                shlex.quote(str(gate.database)),
+                shlex.quote(gate.command_id),
+                str(limit),
+                "codex",
+            )
+        )
+        hook = (
+            "[{matcher='^(Agent|spawn_agent)$',hooks=[{type='command',command="
+            + json.dumps(hook_command)
+            + ",timeout=5}]}]"
+        )
+        arguments = [
+            "--dangerously-bypass-hook-trust",
+            "-c",
+            "hooks.PreToolUse=" + hook,
+        ]
+        if limit == 0:
+            arguments.extend(["-c", "agents.enabled=false"])
+        else:
+            arguments.extend(
+                [
+                    "-c",
+                    "agents.max_concurrent_threads_per_session=" + str(limit),
+                ]
+            )
+        return arguments
+
     async def close(self) -> None:
         process = self.process
         if process is None:
             return
         if process.stdin is not None:
             process.stdin.close()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2.0)
-        except TimeoutError:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2.0)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
+        identity = self._process_group
+        if identity is None:
+            raise RuntimeError("Codex process group identity is missing")
+        await terminate_process_group(process, identity, grace_timeout=2.0)
         tasks: list[asyncio.Task[None]] = []
         for task in (self._reader, self._stderr):
             if task is None:
@@ -107,6 +156,7 @@ class CodexAppServer:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.process = None
+        self._process_group = None
 
     async def request(
         self,
@@ -120,9 +170,7 @@ class CodexAppServer:
         request_id = self._next_id
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending[request_id] = future
-        await self._send(
-            {"method": method, "id": request_id, "params": params}
-        )
+        await self._send({"method": method, "id": request_id, "params": params})
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError as error:
@@ -169,10 +217,11 @@ class CodexAppServer:
             detail = "Codex app-server connection closed"
             if self.stderr_tail:
                 detail += ": " + self.stderr_tail[-1]
-            failure = ProviderUnavailableError(detail)
+            failure = ProviderUnavailableError("codex", detail=detail)
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(failure)
+        raise failure
 
     async def _route(self, payload: dict[str, Any]) -> None:
         request_id = payload.get("id")
@@ -232,10 +281,14 @@ class CodexAdapter(ProviderAdapter):
         self._active_turn = ""
 
     def status(self) -> ProviderStatus:
-        ready = shutil.which("npx") is not None
-        detail = "npx is available"
-        if not ready:
-            detail = "npx was not found"
+        ready = True
+        detail = "trusted node and npx are available"
+        try:
+            trusted_executable("node")
+            trusted_executable("npx")
+        except (OSError, RuntimeError) as error:
+            ready = False
+            detail = str(error)
         return ProviderStatus(
             provider="codex",
             ready=ready,
@@ -250,6 +303,8 @@ class CodexAdapter(ProviderAdapter):
                     "images",
                     "mcp",
                     "plugins",
+                    "proof-fault-barrier",
+                    "proof-service-fault-barrier",
                     "resume",
                     "skills",
                     "steer",
@@ -299,16 +354,13 @@ class CodexAdapter(ProviderAdapter):
                         continue
                     efforts = _efforts(item)
                     context_window = _optional_int(
-                        item.get("contextWindow")
-                        or item.get("context_window")
+                        item.get("contextWindow") or item.get("context_window")
                     )
                     tiers = _strings(item.get("serviceTiers"))
                     models.append(
                         ProviderModel(
                             model_id=model_id,
-                            display_name=str(
-                                item.get("displayName", model_id)
-                            ),
+                            display_name=str(item.get("displayName", model_id)),
                             efforts=efforts,
                             context_window=context_window,
                             default=bool(item.get("isDefault", False)),
@@ -330,6 +382,8 @@ class CodexAdapter(ProviderAdapter):
         effort: str,
         event_handler: EventHandler,
         approval_handler: ApprovalHandler,
+        child_launch_gate: ChildLaunchGate | None = None,
+        pre_prompt_gate: PrePromptGate | None = None,
     ) -> ProviderResult:
         completed = asyncio.Event()
         terminal_status = {"value": "failed"}
@@ -367,10 +421,13 @@ class CodexAdapter(ProviderAdapter):
             workspace,
             notification_handler=notification,
             request_handler=provider_request,
+            child_launch_gate=child_launch_gate,
         )
         self._active_server = server
         try:
             await server.start()
+            if pre_prompt_gate is not None:
+                await pre_prompt_gate()
             thread_params = {
                 "cwd": str(workspace),
                 "approvalPolicy": _approval_policy(permission_mode),
@@ -404,8 +461,41 @@ class CodexAdapter(ProviderAdapter):
                 turn_params["effort"] = effort
             turn_result = await server.request("turn/start", turn_params)
             turn_id = _nested_id(turn_result, "turn")
+            if not turn_id:
+                raise HarnessError(
+                    "E_PROVIDER_PROTOCOL",
+                    "Codex did not return a turn identifier",
+                    status=502,
+                )
             self._active_turn = turn_id
-            await asyncio.wait_for(completed.wait(), timeout=3600.0)
+            await event_handler(
+                ProviderEvent(
+                    "provider.prompt.accepted",
+                    status="accepted",
+                    native_session_id=native_session_id,
+                    native_turn_id=turn_id,
+                )
+            )
+            completion_task = asyncio.create_task(completed.wait())
+            reader_task = server._reader
+            if reader_task is None:
+                raise RuntimeError("Codex reader task is missing")
+            try:
+                finished, unused_pending = await asyncio.wait(
+                    {completion_task, reader_task},
+                    timeout=3600.0,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                del unused_pending
+                if not finished:
+                    raise TimeoutError("Codex turn timed out")
+                if reader_task in finished:
+                    await reader_task
+                await completion_task
+            finally:
+                if not completion_task.done():
+                    completion_task.cancel()
+                await asyncio.gather(completion_task, return_exceptions=True)
             return ProviderResult(
                 provider="codex",
                 native_session_id=native_session_id,
@@ -450,8 +540,18 @@ class CodexAdapter(ProviderAdapter):
         server = self._active_server
         if server is None or server.process is None:
             return (0, "")
+        if server.process.returncode is not None:
+            return (0, "")
         pid = server.process.pid
         return (pid, _process_start(pid))
+
+    def native_session_available(
+        self,
+        workspace: Path,
+        native_session_id: str,
+    ) -> bool:
+        del workspace
+        return _has_native_session(native_session_id)
 
 
 def _approval_policy(permission_mode: str) -> str:
@@ -496,6 +596,21 @@ def _nested_id(value: dict[str, Any], field: str) -> str:
         if isinstance(identifier, str):
             return identifier
     return ""
+
+
+def _has_native_session(native_session_id: str) -> bool:
+    if not native_session_id:
+        return False
+    if not all(
+        character.isalnum() or character in {"-", "_"}
+        for character in native_session_id
+    ):
+        return False
+    root = Path.home() / ".codex" / "sessions"
+    if not root.is_dir():
+        return False
+    pattern = "*" + native_session_id + "*.jsonl"
+    return next(root.rglob(pattern), None) is not None
 
 
 def _looks_exhausted(message: str) -> bool:

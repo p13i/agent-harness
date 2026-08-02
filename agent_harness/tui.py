@@ -4,60 +4,61 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import re
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from rich.markup import escape
 from textual import events
-from textual.app import App
-from textual.app import ComposeResult
-from textual.app import ScreenStackError
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.containers import VerticalScroll
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.strip import Strip
 from textual.timer import Timer
-from textual.widgets import Button
-from textual.widgets import Input
-from textual.widgets import Label
-from textual.widgets import ListItem
-from textual.widgets import ListView
-from textual.widgets import RichLog
-from textual.widgets import Static
-from textual.widgets import Tab
-from textual.widgets import Tabs
+from textual.widgets import (
+    Button,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+    Tab,
+    Tabs,
+)
 
 from agent_harness.client import HarnessClient
 from agent_harness.errors import HarnessError
 from agent_harness.ids import new_uuid
-from agent_harness.notifications import Notification
-from agent_harness.notifications import NotificationPersistence
-from agent_harness.notifications import NotificationSeverity
-from agent_harness.notifications import NotificationState
-from agent_harness.notifications import project_notifications
-from agent_harness.notifications import push_notification
-from agent_harness.notifications import with_connection
-from agent_harness.presentation import SessionSwitchCoordinator
-from agent_harness.presentation import SessionViewCacheEntry
-from agent_harness.tui_presenter import LayoutDecision
-from agent_harness.tui_presenter import TranscriptBlock
-from agent_harness.tui_presenter import TranscriptBlockKind
-from agent_harness.tui_presenter import TranscriptMutationKind
-from agent_harness.tui_presenter import TranscriptState
-from agent_harness.tui_presenter import decide_layout
-from agent_harness.tui_presenter import project_events
-from agent_harness.tui_widgets import ComposerDraft
-from agent_harness.tui_widgets import DEFAULT_SLASH_COMMANDS
-from agent_harness.tui_widgets import MultilineComposer
-from agent_harness.tui_widgets import complete_slash
-from agent_harness.tui_widgets import validate_slash
-
+from agent_harness.notifications import (
+    Notification,
+    NotificationPersistence,
+    NotificationSeverity,
+    NotificationState,
+    project_notifications,
+    push_notification,
+    with_connection,
+)
+from agent_harness.presentation import SessionSwitchCoordinator, SessionViewCacheEntry
+from agent_harness.tui_presenter import (
+    TranscriptBlock,
+    TranscriptBlockKind,
+    TranscriptMutationKind,
+    TranscriptState,
+    decide_layout,
+    project_events,
+)
+from agent_harness.tui_widgets import (
+    DEFAULT_SLASH_COMMANDS,
+    ComposerDraft,
+    MultilineComposer,
+    complete_slash,
+    validate_slash,
+)
 
 SIDEBAR_DEFAULT_WIDTH = 31
 SIDEBAR_MIN_WIDTH = 24
@@ -155,9 +156,7 @@ class TranscriptView(VerticalScroll):
                 continue
             view.set_block(
                 block,
-                expanded=(
-                    block.block_id in state.expanded_block_ids
-                ),
+                expanded=(block.block_id in state.expanded_block_ids),
             )
         if state.reader_at_bottom:
             self.scroll_end(animate=False)
@@ -193,8 +192,7 @@ class SidebarResizeHandle(Static):
 
     def on_mount(self) -> None:
         self.tooltip = (
-            "Drag to resize sessions. "
-            "Ctrl+Shift+Left/Right also adjusts the width."
+            "Drag to resize sessions. Ctrl+Shift+Left/Right also adjusts the width."
         )
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
@@ -353,9 +351,7 @@ class CommandPaletteScreen(ModalScreen[str]):
             if not value.startswith("/"):
                 value = "/" + value
             completion = complete_slash(value)
-            self._commands = [
-                item.command for item in completion.items
-            ]
+            self._commands = [item.command for item in completion.items]
         if not self._commands:
             self._commands = list(DEFAULT_SLASH_COMMANDS)
         view = self.query_one("#command-results", ListView)
@@ -1056,9 +1052,7 @@ class HarnessApp(App[None]):
             with Vertical(id="sidebar"):
                 yield Label("WORKSPACE", classes="eyebrow")
                 yield Static(
-                    self.workspace.name
-                    + "\n"
-                    + escape(str(self.workspace)),
+                    self.workspace.name + "\n" + escape(str(self.workspace)),
                     id="workspace-summary",
                 )
                 yield Button(
@@ -1134,6 +1128,7 @@ class HarnessApp(App[None]):
                     id="inspector-tabs",
                 )
                 yield Static("", id="inspector-content")
+
     async def on_mount(self) -> None:
         self._apply_responsive_layout(self.size.width)
         self._apply_sidebar_width()
@@ -1196,9 +1191,7 @@ class HarnessApp(App[None]):
             validation = validate_slash(text)
             if not validation.can_execute:
                 self._write_notice(
-                    "[bold red]"
-                    + escape(validation.message)
-                    + "[/bold red]"
+                    "[bold red]" + escape(validation.message) + "[/bold red]"
                 )
                 return
             await self._slash(text)
@@ -1257,9 +1250,7 @@ class HarnessApp(App[None]):
             return
         if index < 0 or index >= len(self._visible_sessions):
             return
-        session_id = str(
-            self._visible_sessions[index].get("session_id", "")
-        )
+        session_id = str(self._visible_sessions[index].get("session_id", ""))
         if session_id:
             await self._open_session(session_id)
 
@@ -1343,44 +1334,33 @@ class HarnessApp(App[None]):
                 await self._apply_cached_session(cached)
         try:
             (
-                patch,
                 state,
                 session_state,
                 events_state,
                 turns_state,
                 recovery_state,
-            ) = (
-                await asyncio.gather(
-                    self.client.request(
-                        "PATCH",
-                        "/v1/sessions/" + session_id,
-                        payload={"execution_profile": "interactive"},
-                    ),
-                    self.client.request(
-                        "GET",
-                        "/v1/sessions/" + session_id + "/ui-state",
-                    ),
-                    self.client.request(
-                        "GET",
-                        "/v1/sessions/" + session_id,
-                    ),
-                    self.client.request(
-                        "GET",
-                        "/v1/sessions/" + session_id + "/events?after=0",
-                    ),
-                    self.client.request(
-                        "GET",
-                        "/v1/sessions/" + session_id + "/turns?limit=200",
-                    ),
-                    self.client.request(
-                        "GET",
-                        "/v1/sessions/"
-                        + session_id
-                        + "/reconciliations",
-                    ),
-                )
+            ) = await asyncio.gather(
+                self.client.request(
+                    "GET",
+                    "/v1/sessions/" + session_id + "/ui-state",
+                ),
+                self.client.request(
+                    "GET",
+                    "/v1/sessions/" + session_id,
+                ),
+                self.client.request(
+                    "GET",
+                    "/v1/sessions/" + session_id + "/events?after=0",
+                ),
+                self.client.request(
+                    "GET",
+                    "/v1/sessions/" + session_id + "/turns?limit=200",
+                ),
+                self.client.request(
+                    "GET",
+                    "/v1/sessions/" + session_id + "/reconciliations",
+                ),
             )
-            del patch
         except (HarnessError, OSError):
             if self._switches.is_current(generation, session_id):
                 self._switching_session_id = ""
@@ -1434,20 +1414,13 @@ class HarnessApp(App[None]):
             self._goal = goal
         self._safety = _object(session_state.get("safety"))
         self._approvals = _object_tuple(session_state.get("approvals"))
-        self._reconciliations = _object_tuple(
-            recovery_state.get("reconciliations")
-        )
+        self._reconciliations = _object_tuple(recovery_state.get("reconciliations"))
         events = events_state.get("events", [])
         if not isinstance(events, list):
             events = []
-        self._transcript_events = [
-            item for item in events if isinstance(item, dict)
-        ]
+        self._transcript_events = [item for item in events if isinstance(item, dict)]
         self.sequence = max(
-            (
-                int(item.get("sequence", 0))
-                for item in self._transcript_events
-            ),
+            (int(item.get("sequence", 0)) for item in self._transcript_events),
             default=0,
         )
         turns = turns_state.get("turns", [])
@@ -1466,19 +1439,13 @@ class HarnessApp(App[None]):
         )
         if sidebar_width is not None:
             self._sidebar_width = sidebar_width
-        session_filter = str(
-            ui_state.get("session_filter", "focused")
-        )
+        session_filter = str(ui_state.get("session_filter", "focused"))
         if session_filter not in {"focused", "all"}:
             session_filter = "focused"
         self._session_filter = session_filter
         self._session_query = str(ui_state.get("session_query", ""))
-        self.query_one("#session-search", Input).value = (
-            self._session_query
-        )
-        inspector_tab = str(
-            ui_state.get("inspector_tab", "context")
-        ).casefold()
+        self.query_one("#session-search", Input).value = self._session_query
+        inspector_tab = str(ui_state.get("inspector_tab", "context")).casefold()
         if inspector_tab not in {
             "context",
             "goal",
@@ -1494,12 +1461,8 @@ class HarnessApp(App[None]):
         if mode not in {"focus", "control"}:
             mode = "focus"
         self._workspace_mode = mode
-        self._selected_turn_id = str(
-            ui_state.get("selected_turn_id", "")
-        )
-        self._control_detail_tab = str(
-            ui_state.get("control_detail_tab", "summary")
-        )
+        self._selected_turn_id = str(ui_state.get("selected_turn_id", ""))
+        self._control_detail_tab = str(ui_state.get("control_detail_tab", "summary"))
         if self._control_detail_tab not in {
             "summary",
             "activity",
@@ -1508,17 +1471,11 @@ class HarnessApp(App[None]):
             "recovery",
         }:
             self._control_detail_tab = "summary"
-        self.query_one("#control-detail-tabs", Tabs).active = (
-            self._control_detail_tab
-        )
+        self.query_one("#control-detail-tabs", Tabs).active = self._control_detail_tab
         self._saved_workspace_mode = self._workspace_mode
         self._saved_selected_turn_id = self._selected_turn_id
-        self._show_events = (
-            str(ui_state.get("events", "off")).casefold() == "on"
-        )
-        self._pending_request_id = str(
-            ui_state.get("request_id", "")
-        )
+        self._show_events = str(ui_state.get("events", "off")).casefold() == "on"
+        self._pending_request_id = str(ui_state.get("request_id", ""))
         self._pending_retry_count = 0
         self._saved_sidebar_width = self._sidebar_width
         self._saved_session_filter = self._session_filter
@@ -1528,9 +1485,7 @@ class HarnessApp(App[None]):
         await self._sync_system_theme(force=True)
         composer = str(ui_state.get("composer", ""))
         self._saved_composer = composer
-        composer_cursor = str(
-            ui_state.get("composer_cursor", "0:0")
-        )
+        composer_cursor = str(ui_state.get("composer_cursor", "0:0"))
         self._saved_composer_cursor = composer_cursor
         self._saved_request_id = self._pending_request_id
         self.query_one("#composer", MultilineComposer).restore_draft(
@@ -1542,9 +1497,7 @@ class HarnessApp(App[None]):
         )
         self._last_approval_id = ""
         self._transcript_notices = []
-        expanded = _expanded_blocks(
-            str(ui_state.get("expanded_blocks", ""))
-        )
+        expanded = _expanded_blocks(str(ui_state.get("expanded_blocks", "")))
         initial = TranscriptState(
             expanded_block_ids=expanded,
         )
@@ -1562,9 +1515,7 @@ class HarnessApp(App[None]):
             NotificationState(),
             self._transcript_events,
         )
-        acknowledged = _positive_integer(
-            ui_state.get("last_notification_sequence")
-        )
+        acknowledged = _positive_integer(ui_state.get("last_notification_sequence"))
         if acknowledged is not None:
             self._notification_state = self._notification_state.acknowledge(
                 acknowledged
@@ -1585,11 +1536,7 @@ class HarnessApp(App[None]):
         await self._render_session_list()
 
     def _remember_current_view(self) -> None:
-        if (
-            not self.session_id
-            or not self._session
-            or not self._screen_is_running()
-        ):
+        if not self.session_id or not self._session or not self._screen_is_running():
             return
         composer = self.query_one("#composer", MultilineComposer)
         draft = composer.capture_draft()
@@ -1603,9 +1550,7 @@ class HarnessApp(App[None]):
             focus_id=focus_id,
             expanded_block_ids=self._transcript_state.expanded_block_ids,
             composer=draft.text,
-            composer_cursor=(
-                str(draft.cursor_row) + ":" + str(draft.cursor_column)
-            ),
+            composer_cursor=(str(draft.cursor_row) + ":" + str(draft.cursor_column)),
             workspace_mode=self._workspace_mode,
             selected_turn_id=self._selected_turn_id,
             detail_tab=self._control_detail_tab,
@@ -1672,21 +1617,15 @@ class HarnessApp(App[None]):
             "workspace_mode": entry.workspace_mode,
             "selected_turn_id": entry.selected_turn_id,
             "control_detail_tab": entry.detail_tab,
-            "expanded_blocks": json.dumps(
-                sorted(entry.expanded_block_ids)
-            ),
+            "expanded_blocks": json.dumps(sorted(entry.expanded_block_ids)),
             "theme": str(payload.get("theme", "system")),
             "provider": str(payload.get("provider", "")),
             "model": str(payload.get("model", "")),
             "effort": str(payload.get("effort", "")),
             "sidebar_width": str(payload.get("sidebar_width", "")),
-            "session_filter": str(
-                payload.get("session_filter", "focused")
-            ),
+            "session_filter": str(payload.get("session_filter", "focused")),
             "session_query": str(payload.get("session_query", "")),
-            "inspector_tab": str(
-                payload.get("inspector_tab", "context")
-            ),
+            "inspector_tab": str(payload.get("inspector_tab", "context")),
             "events": "off",
             "request_id": str(payload.get("request_id", "")),
         }
@@ -1807,9 +1746,7 @@ class HarnessApp(App[None]):
         *,
         detail: str = "",
         severity: NotificationSeverity = NotificationSeverity.INFO,
-        persistence: NotificationPersistence = (
-            NotificationPersistence.TRANSIENT
-        ),
+        persistence: NotificationPersistence = (NotificationPersistence.TRANSIENT),
     ) -> None:
         self._notification_state = push_notification(
             self._notification_state,
@@ -1830,9 +1767,7 @@ class HarnessApp(App[None]):
             selected = self._notification_state.latest_transient
         if selected is None:
             unread = [
-                item
-                for item in self._notification_state.notifications
-                if item.unread
+                item for item in self._notification_state.notifications if item.unread
             ]
             if unread:
                 selected = unread[-1]
@@ -1841,9 +1776,7 @@ class HarnessApp(App[None]):
             self._notification_actions = {}
             return
         shell.display = True
-        shell.set_classes(
-            "notification-" + selected.severity.value
-        )
+        shell.set_classes("notification-" + selected.severity.value)
         glyph = _notification_glyph(selected.severity)
         value = glyph + "  [bold]" + escape(selected.title) + "[/bold]"
         if selected.detail:
@@ -1868,9 +1801,7 @@ class HarnessApp(App[None]):
             button = buttons[0]
             button.label = "Dismiss"
             button.display = True
-            self._notification_actions[button.id or ""] = (
-                "dismiss-notification"
-            )
+            self._notification_actions[button.id or ""] = "dismiss-notification"
         if selected.persistence == NotificationPersistence.TRANSIENT:
             if self._notification_timer is not None:
                 self._notification_timer.stop()
@@ -1903,9 +1834,7 @@ class HarnessApp(App[None]):
         if selected is None:
             selected = self._notification_state.latest_transient
         if selected is None:
-            for item in reversed(
-                self._notification_state.notifications
-            ):
+            for item in reversed(self._notification_state.notifications):
                 if item.unread:
                     selected = item
                     break
@@ -1917,9 +1846,7 @@ class HarnessApp(App[None]):
         elif action == "review-recovery":
             self._set_workspace_mode("control")
             self._control_detail_tab = "recovery"
-            self.query_one("#control-detail-tabs", Tabs).active = (
-                "recovery"
-            )
+            self.query_one("#control-detail-tabs", Tabs).active = "recovery"
             self._render_selected_turn()
         elif action == "stop-session":
             await self._command("stop")
@@ -1952,9 +1879,7 @@ class HarnessApp(App[None]):
             )
         if self._turns and selected_index is None:
             selected_index = len(self._turns) - 1
-            self._selected_turn_id = str(
-                self._turns[selected_index].get("turn_id", "")
-            )
+            self._selected_turn_id = str(self._turns[selected_index].get("turn_id", ""))
         if selected_index is not None:
             view.index = selected_index
 
@@ -1989,13 +1914,10 @@ class HarnessApp(App[None]):
         for turn in self._turns:
             if str(turn.get("turn_id", "")) != self._selected_turn_id:
                 continue
-            detail.update(
-                _turn_detail(turn, tab=self._control_detail_tab)
-            )
+            detail.update(_turn_detail(turn, tab=self._control_detail_tab))
             return
         detail.update(
-            "[bold]No turns yet[/bold]\n"
-            "[dim]The first request will appear here.[/dim]"
+            "[bold]No turns yet[/bold]\n[dim]The first request will appear here.[/dim]"
         )
 
     async def _load_sessions(self) -> None:
@@ -2006,9 +1928,7 @@ class HarnessApp(App[None]):
         sessions = result.get("sessions", [])
         if not isinstance(sessions, list):
             sessions = []
-        self._sessions = [
-            item for item in sessions if isinstance(item, dict)
-        ]
+        self._sessions = [item for item in sessions if isinstance(item, dict)]
         self._session_list_signature = ""
         await self._render_session_list()
 
@@ -2100,9 +2020,7 @@ class HarnessApp(App[None]):
             try:
                 turns_state = await self.client.request(
                     "GET",
-                    "/v1/sessions/"
-                    + poll_session_id
-                    + "/turns?limit=200",
+                    "/v1/sessions/" + poll_session_id + "/turns?limit=200",
                 )
             except (HarnessError, OSError):
                 turns_state = {"turns": self._turns}
@@ -2124,20 +2042,15 @@ class HarnessApp(App[None]):
             self._goal = goal
         self._approvals = _object_tuple(state.get("approvals"))
         if (
-            str(session.get("attention", ""))
-            == "needs-reconciliation"
+            str(session.get("attention", "")) == "needs-reconciliation"
             or self._inspector_tab == "recovery"
         ):
             try:
                 recovery = await self.client.request(
                     "GET",
-                    "/v1/sessions/"
-                    + self.session_id
-                    + "/reconciliations",
+                    "/v1/sessions/" + self.session_id + "/reconciliations",
                 )
-                self._reconciliations = _object_tuple(
-                    recovery.get("reconciliations")
-                )
+                self._reconciliations = _object_tuple(recovery.get("reconciliations"))
             except (HarnessError, OSError):
                 self._reconciliations = ()
         else:
@@ -2182,9 +2095,7 @@ class HarnessApp(App[None]):
             self._render_notifications()
         turns = turns_state.get("turns", [])
         if isinstance(turns, list):
-            next_turns = [
-                item for item in turns if isinstance(item, dict)
-            ]
+            next_turns = [item for item in turns if isinstance(item, dict)]
             if next_turns != self._turns:
                 self._turns = next_turns
                 await self._render_turn_list()
@@ -2232,10 +2143,7 @@ class HarnessApp(App[None]):
             payload = {}
         await self.client.request(
             "POST",
-            "/v1/sessions/"
-            + self.session_id
-            + "/commands/"
-            + command_type,
+            "/v1/sessions/" + self.session_id + "/commands/" + command_type,
             payload=payload,
             idempotency_key=new_uuid(),
         )
@@ -2294,9 +2202,7 @@ class HarnessApp(App[None]):
             self._recovering_send = False
 
     def _render_composer_help(self) -> None:
-        permission = str(
-            self._session.get("permission_mode", self.permission_mode)
-        )
+        permission = str(self._session.get("permission_mode", self.permission_mode))
         safety_session = _object(self._safety.get("session"))
         profile = str(safety_session.get("profile", "interactive"))
         connection = self._connection_status
@@ -2335,9 +2241,7 @@ class HarnessApp(App[None]):
                 "/v1/sessions/" + self.session_id + "/export",
                 payload={},
             )
-            self._write_notice(
-                "[bold]Export[/bold] " + str(result.get("path", ""))
-            )
+            self._write_notice("[bold]Export[/bold] " + str(result.get("path", "")))
             return
         if command == "/checkpoint":
             await self._checkpoint()
@@ -2346,10 +2250,7 @@ class HarnessApp(App[None]):
             action = command[1:]
             await self.client.request(
                 "POST",
-                "/v1/sessions/"
-                + self.session_id
-                + "/"
-                + action,
+                "/v1/sessions/" + self.session_id + "/" + action,
                 payload={},
                 idempotency_key=new_uuid(),
             )
@@ -2373,16 +2274,12 @@ class HarnessApp(App[None]):
             )
             session = _object(result.get("session"))
             await self._load_sessions()
-            await self._open_session(
-                str(session.get("session_id", ""))
-            )
+            await self._open_session(str(session.get("session_id", "")))
             return
         if command == "/sessions" and len(parts) == 2:
             session_filter = parts[1].casefold()
             if session_filter not in {"focused", "all"}:
-                self._write_notice(
-                    "[red]Sessions must be focused or all[/red]"
-                )
+                self._write_notice("[red]Sessions must be focused or all[/red]")
                 return
             self._session_filter = session_filter
             self._session_list_signature = ""
@@ -2406,18 +2303,14 @@ class HarnessApp(App[None]):
         if command == "/mode" and len(parts) == 2:
             mode = parts[1].casefold()
             if mode not in {"focus", "control"}:
-                self._write_notice(
-                    "[red]Mode must be focus or control[/red]"
-                )
+                self._write_notice("[red]Mode must be focus or control[/red]")
                 return
             self._set_workspace_mode(mode)
             await self._save_ui_state(force=True)
             return
         if command in {"/provider", "/model", "/effort", "/theme"}:
             if len(parts) != 2:
-                self._write_notice(
-                    "[red]" + command + " requires one value[/red]"
-                )
+                self._write_notice("[red]" + command + " requires one value[/red]")
                 return
             value = parts[1]
             if value == "auto":
@@ -2488,32 +2381,32 @@ class HarnessApp(App[None]):
                 "reason": " ".join(parts[3:]) or "TUI operator extension",
             }
             if parts[1] == "xhigh":
+                if len(parts) < 5:
+                    self._write_notice(
+                        "[red]Use /budget xhigh COMMAND_ID PROVIDER REASON[/red]"
+                    )
+                    return
                 payload["allow_xhigh_once"] = True
-                payload["reason"] = " ".join(parts[2:])
+                payload["command_id"] = parts[2]
+                payload["provider"] = parts[3]
+                payload["reason"] = " ".join(parts[4:])
             elif parts[1] == "extend":
                 try:
                     payload["additional_seconds"] = int(parts[2])
                     if len(parts) >= 4:
                         payload["additional_tokens"] = int(parts[3])
                         payload["reason"] = (
-                            " ".join(parts[4:])
-                            or "TUI operator extension"
+                            " ".join(parts[4:]) or "TUI operator extension"
                         )
                 except ValueError:
-                    self._write_notice(
-                        "[red]Budget values must be integers[/red]"
-                    )
+                    self._write_notice("[red]Budget values must be integers[/red]")
                     return
             else:
-                self._write_notice(
-                    "[red]Use /budget extend or /budget xhigh[/red]"
-                )
+                self._write_notice("[red]Use /budget extend or /budget xhigh[/red]")
                 return
             await self.client.request(
                 "POST",
-                "/v1/sessions/"
-                + self.session_id
-                + "/budget-extensions",
+                "/v1/sessions/" + self.session_id + "/budget-extensions",
                 payload=payload,
                 idempotency_key=new_uuid(),
             )
@@ -2525,10 +2418,7 @@ class HarnessApp(App[None]):
         if command == "/approve" and len(parts) >= 3:
             await self.client.request(
                 "POST",
-                "/v1/sessions/"
-                + self.session_id
-                + "/approvals/"
-                + parts[1],
+                "/v1/sessions/" + self.session_id + "/approvals/" + parts[1],
                 payload={"decision": parts[2]},
             )
             return
@@ -2542,17 +2432,13 @@ class HarnessApp(App[None]):
                 payload["approval_id"] = parts[4]
             await self.client.request(
                 "POST",
-                "/v1/reconciliations/"
-                + parts[2]
-                + "/resolution",
+                "/v1/reconciliations/" + parts[2] + "/resolution",
                 payload=payload,
                 idempotency_key=new_uuid(),
             )
             await self._poll()
             return
-        self._write_notice(
-            "[red]Unknown action[/red]"
-        )
+        self._write_notice("[red]Unknown action[/red]")
 
     async def _checkpoint(self) -> None:
         result = await self.client.request(
@@ -2577,25 +2463,19 @@ class HarnessApp(App[None]):
             MultilineComposer,
         ).capture_draft()
         composer = draft.text
-        composer_cursor = (
-            str(draft.cursor_row) + ":" + str(draft.cursor_column)
-        )
+        composer_cursor = str(draft.cursor_row) + ":" + str(draft.cursor_column)
         if not force:
             unchanged = (
                 composer == self._saved_composer
                 and composer_cursor == self._saved_composer_cursor
-                and self._pending_request_id
-                == self._saved_request_id
+                and self._pending_request_id == self._saved_request_id
                 and self._sidebar_width == self._saved_sidebar_width
                 and self._session_filter == self._saved_session_filter
                 and self._session_query == self._saved_session_query
                 and self._show_events == self._saved_show_events
-                and self._workspace_mode
-                == self._saved_workspace_mode
-                and self._selected_turn_id
-                == self._saved_selected_turn_id
-                and self._notification_ack_sequence
-                == self._saved_notification_sequence
+                and self._workspace_mode == self._saved_workspace_mode
+                and self._selected_turn_id == self._saved_selected_turn_id
+                and self._notification_ack_sequence == self._saved_notification_sequence
             )
             if unchanged:
                 return
@@ -2620,13 +2500,9 @@ class HarnessApp(App[None]):
                 "workspace_mode": self._workspace_mode,
                 "selected_turn_id": self._selected_turn_id,
                 "control_detail_tab": self._control_detail_tab,
-                "last_notification_sequence": str(
-                    self._notification_ack_sequence
-                ),
+                "last_notification_sequence": str(self._notification_ack_sequence),
                 "expanded_blocks": json.dumps(
-                    sorted(
-                        self._transcript_state.expanded_block_ids
-                    ),
+                    sorted(self._transcript_state.expanded_block_ids),
                     separators=(",", ":"),
                 ),
                 "request_id": self._pending_request_id,
@@ -2641,9 +2517,7 @@ class HarnessApp(App[None]):
         self._saved_show_events = self._show_events
         self._saved_workspace_mode = self._workspace_mode
         self._saved_selected_turn_id = self._selected_turn_id
-        self._saved_notification_sequence = (
-            self._notification_ack_sequence
-        )
+        self._saved_notification_sequence = self._notification_ack_sequence
 
     async def _load_providers(self) -> None:
         try:
@@ -2681,28 +2555,19 @@ class HarnessApp(App[None]):
             return
         lines = [
             "[bold cyan]ROUTING[/bold cyan]",
-            "Provider   "
-            + escape(self._provider_override or "automatic"),
-            "Model      "
-            + escape(self._model_override or "automatic"),
-            "Effort     "
-            + escape(self._effort_override or "automatic"),
-            "Permission "
-            + escape(str(self._session.get("permission_mode", ""))),
+            "Provider   " + escape(self._provider_override or "automatic"),
+            "Model      " + escape(self._model_override or "automatic"),
+            "Effort     " + escape(self._effort_override or "automatic"),
+            "Permission " + escape(str(self._session.get("permission_mode", ""))),
             "Theme      " + escape(self._theme_preference),
             "",
             "[bold cyan]CHAT STORAGE[/bold cyan]",
-            "State      "
-            + escape(str(self._sync.get("state", "unknown"))),
+            "State      " + escape(str(self._sync.get("state", "unknown"))),
             "Root       " + escape(self._state_root or "unknown"),
         ]
         sync_error = str(self._sync.get("error", ""))
         if sync_error:
-            lines.append(
-                "[bold red]Sync       "
-                + escape(sync_error)
-                + "[/bold red]"
-            )
+            lines.append("[bold red]Sync       " + escape(sync_error) + "[/bold red]")
         if self._goal is not None:
             lines.extend(
                 [
@@ -2722,8 +2587,7 @@ class HarnessApp(App[None]):
             [
                 "",
                 "[bold cyan]SAFETY ENVELOPE[/bold cyan]",
-                "Profile    "
-                + escape(str(safety_session.get("profile", "unknown"))),
+                "Profile    " + escape(str(safety_session.get("profile", "unknown"))),
             ]
         )
         if envelopes:
@@ -2733,49 +2597,26 @@ class HarnessApp(App[None]):
             accounting = "estimated"
             if bool(consumption.get("exact_tokens", False)):
                 accounting = "provider-reported"
-            lines.append(
-                "State      "
-                + escape(str(envelope.get("state", "")))
-            )
+            lines.append("State      " + escape(str(envelope.get("state", ""))))
             if "input_tokens" in consumption:
                 lines.append(
-                    "Input      "
-                    + _format_number(consumption.get("input_tokens", 0))
+                    "Input      " + _format_number(consumption.get("input_tokens", 0))
                 )
-                cached_tokens = int(
-                    consumption.get("cached_input_tokens", 0)
-                )
+                cached_tokens = int(consumption.get("cached_input_tokens", 0))
                 if cached_tokens:
-                    lines[-1] += (
-                        " · "
-                        + _format_number(cached_tokens)
-                        + " cached"
-                    )
+                    lines[-1] += " · " + _format_number(cached_tokens) + " cached"
             lines.extend(
                 [
-                    "Output     "
-                    + _format_number(
-                        consumption.get("output_tokens", 0)
-                    ),
+                    "Output     " + _format_number(consumption.get("output_tokens", 0)),
                     "Harness    "
-                    + _format_number(
-                        consumption.get("context_tokens", 0)
-                    )
+                    + _format_number(consumption.get("context_tokens", 0))
                     + " context est.",
                     "Total      "
-                    + _format_number(
-                        consumption.get("total_tokens", 0)
-                    )
+                    + _format_number(consumption.get("total_tokens", 0))
                     + " / "
-                    + _format_number(
-                        limits.get("max_total_tokens", 0)
-                    ),
+                    + _format_number(limits.get("max_total_tokens", 0)),
                     "Time       "
-                    + escape(
-                        str(round(float(
-                            consumption.get("elapsed_seconds", 0)
-                        )))
-                    )
+                    + escape(str(round(float(consumption.get("elapsed_seconds", 0)))))
                     + "s / "
                     + escape(str(limits.get("max_seconds", 0)))
                     + "s",
@@ -2791,13 +2632,9 @@ class HarnessApp(App[None]):
             guard_reason = str(envelope.get("guard_reason", ""))
             if guard_reason:
                 lines.append(
-                    "[bold red]Guard      "
-                    + escape(guard_reason)
-                    + "[/bold red]"
+                    "[bold red]Guard      " + escape(guard_reason) + "[/bold red]"
                 )
-        lines.extend(
-            ["", "[bold cyan]PENDING APPROVALS[/bold cyan]"]
-        )
+        lines.extend(["", "[bold cyan]PENDING APPROVALS[/bold cyan]"])
         if not self._approvals:
             lines.append("[dim]None[/dim]")
         for approval in self._approvals:
@@ -2806,9 +2643,7 @@ class HarnessApp(App[None]):
                 + "\n"
                 + escape(str(approval.get("prompt", "")))
             )
-        lines.extend(
-            ["", "[bold cyan]PROVIDER CAPACITY[/bold cyan]"]
-        )
+        lines.extend(["", "[bold cyan]PROVIDER CAPACITY[/bold cyan]"])
         for provider, value in sorted(self._providers.items()):
             provider_value = _object(value)
             usage = _object(provider_value.get("usage"))
@@ -2820,11 +2655,7 @@ class HarnessApp(App[None]):
                 detail = "[red]●[/red] "
             detail += escape(provider)
             if binding is not None:
-                detail += (
-                    " · "
-                    + escape(str(100 - float(binding)))
-                    + "% headroom"
-                )
+                detail += " · " + escape(str(100 - float(binding))) + "% headroom"
             if not ready:
                 detail += " · unavailable"
             if bool(provider_value.get("usage_refreshing", False)):
@@ -2843,14 +2674,10 @@ class HarnessApp(App[None]):
                 "F1      command help",
             ]
         )
-        self.query_one("#inspector-content", Static).update(
-            "\n".join(lines)
-        )
+        self.query_one("#inspector-content", Static).update("\n".join(lines))
 
     def _render_inspector_lines(self, lines: list[str]) -> None:
-        self.query_one("#inspector-content", Static).update(
-            "\n".join(lines)
-        )
+        self.query_one("#inspector-content", Static).update("\n".join(lines))
 
     def _goal_lines(self) -> list[str]:
         lines = ["[bold cyan]GOAL[/bold cyan]"]
@@ -2872,8 +2699,7 @@ class HarnessApp(App[None]):
         lines = ["[bold cyan]USAGE AND SAFETY[/bold cyan]"]
         safety_session = _object(self._safety.get("session"))
         lines.append(
-            "Profile  "
-            + escape(str(safety_session.get("profile", "unknown")))
+            "Profile  " + escape(str(safety_session.get("profile", "unknown")))
         )
         envelopes = self._safety.get("envelopes", [])
         if not isinstance(envelopes, list) or not envelopes:
@@ -2884,16 +2710,11 @@ class HarnessApp(App[None]):
             limits = _object(envelope.get("limits"))
             lines.extend(
                 [
-                    "State    "
-                    + escape(str(envelope.get("state", ""))),
+                    "State    " + escape(str(envelope.get("state", ""))),
                     "Tokens   "
-                    + _format_number(
-                        consumption.get("total_tokens", 0)
-                    )
+                    + _format_number(consumption.get("total_tokens", 0))
                     + " / "
-                    + _format_number(
-                        limits.get("max_total_tokens", 0)
-                    ),
+                    + _format_number(limits.get("max_total_tokens", 0)),
                     "Tools    "
                     + escape(str(consumption.get("tool_calls", 0)))
                     + " / "
@@ -2921,9 +2742,7 @@ class HarnessApp(App[None]):
                 [
                     escape(str(approval.get("kind", "approval"))),
                     escape(str(approval.get("prompt", ""))),
-                    "[dim]"
-                    + escape(str(approval.get("approval_id", "")))
-                    + "[/dim]",
+                    "[dim]" + escape(str(approval.get("approval_id", ""))) + "[/dim]",
                     "",
                 ]
             )
@@ -2969,8 +2788,7 @@ class HarnessApp(App[None]):
                     "",
                     "[bold]Actions[/bold]",
                     "accept-current · restore-pre-turn · stop",
-                    "[dim]/reconcile <decision> <id> "
-                    "<digest> [approval-id][/dim]",
+                    "[dim]/reconcile <decision> <id> <digest> [approval-id][/dim]",
                 ]
             )
         return lines
@@ -2979,12 +2797,10 @@ class HarnessApp(App[None]):
         external_ref = _object(self._session.get("external_ref"))
         lines = [
             "[bold cyan]STORAGE[/bold cyan]",
-            "Session "
-            + escape(str(self._session.get("session_id", ""))),
+            "Session " + escape(str(self._session.get("session_id", ""))),
             "State   " + escape(str(self._sync.get("state", "unknown"))),
             "Root    " + escape(self._state_root or "unknown"),
-            "Worktree "
-            + escape(str(self._session.get("worktree", ""))),
+            "Worktree " + escape(str(self._session.get("worktree", ""))),
         ]
         if external_ref:
             lines.extend(
@@ -3030,9 +2846,7 @@ class HarnessApp(App[None]):
             self.query_one("#brand", Static).update("P13I")
         else:
             self.screen.remove_class("narrow")
-            self.query_one("#brand", Static).update(
-                "P13I AGENT HARNESS"
-            )
+            self.query_one("#brand", Static).update("P13I AGENT HARNESS")
         if self._layout.mode.value == "overlay":
             self.screen.add_class("overlay")
         else:
@@ -3045,12 +2859,10 @@ class HarnessApp(App[None]):
         inspector = self.query_one("#inspector", Vertical)
         sidebar.display = self._layout.sidebar_visible
         handle.display = (
-            self._layout.sidebar_visible
-            and self._layout.sidebar_mode == "docked"
+            self._layout.sidebar_visible and self._layout.sidebar_mode == "docked"
         )
         inspector.display = (
-            self._layout.inspector_visible
-            and self._workspace_mode == "focus"
+            self._layout.inspector_visible and self._workspace_mode == "focus"
         )
         composer = self.query_one("#composer", MultilineComposer)
         composer.max_lines = self._layout.composer_max_lines
@@ -3061,9 +2873,7 @@ class HarnessApp(App[None]):
 
     def _apply_sidebar_width(self) -> None:
         sidebar = self.query_one("#sidebar", Vertical)
-        sidebar.styles.width = self._bounded_sidebar_width(
-            self._sidebar_width
-        )
+        sidebar.styles.width = self._bounded_sidebar_width(self._sidebar_width)
 
     def _bounded_sidebar_width(self, width: int) -> int:
         reserve = SIDEBAR_MAIN_RESERVE
@@ -3152,10 +2962,7 @@ class HarnessApp(App[None]):
     ) -> None:
         await self.client.request(
             "POST",
-            "/v1/sessions/"
-            + self.session_id
-            + "/approvals/"
-            + approval_id,
+            "/v1/sessions/" + self.session_id + "/approvals/" + approval_id,
             payload={"decision": decision},
         )
         self._last_approval_id = ""
@@ -3169,9 +2976,7 @@ class HarnessApp(App[None]):
             provider,
             str(self._session.get("permission_mode", "approval")),
         )
-        workspace = str(
-            self._session.get("worktree", self.workspace)
-        )
+        workspace = str(self._session.get("worktree", self.workspace))
         with self.suspend():
             await asyncio.to_thread(
                 subprocess.run,
@@ -3187,10 +2992,8 @@ class HarnessApp(App[None]):
     ) -> None:
         transcript = self.query_one("#transcript", TranscriptView)
         reader_at_bottom = transcript.is_vertical_scroll_end
-        self._transcript_state = (
-            self._transcript_state.with_reader_at_bottom(
-                reader_at_bottom
-            )
+        self._transcript_state = self._transcript_state.with_reader_at_bottom(
+            reader_at_bottom
         )
         update = project_events(
             self._transcript_state,
@@ -3238,11 +3041,7 @@ class HarnessApp(App[None]):
 
     def _write_notice(self, value: str) -> None:
         plain = _plain_markup(value)
-        lines = [
-            line.strip()
-            for line in plain.splitlines()
-            if line.strip()
-        ]
+        lines = [line.strip() for line in plain.splitlines() if line.strip()]
         if not lines:
             return
         severity = NotificationSeverity.INFO
@@ -3261,18 +3060,13 @@ class HarnessApp(App[None]):
         self._render_notifications()
 
     def toggle_transcript_block(self, block_id: str) -> None:
-        self._transcript_state = (
-            self._transcript_state.toggle_expanded(block_id)
-        )
+        self._transcript_state = self._transcript_state.toggle_expanded(block_id)
         block = self._transcript_state.block(block_id)
         if block is None:
             return
         self.query_one("#transcript", TranscriptView).refresh_block(
             block,
-            expanded=(
-                block_id
-                in self._transcript_state.expanded_block_ids
-            ),
+            expanded=(block_id in self._transcript_state.expanded_block_ids),
         )
         self.run_worker(
             self._save_ui_state(force=True),
@@ -3296,8 +3090,7 @@ def _render_transcript_events(
     final_turns = {
         str(event.get("turn_id", ""))
         for event in events
-        if event.get("event_type") == "agent.message"
-        and str(event.get("turn_id", ""))
+        if event.get("event_type") == "agent.message" and str(event.get("turn_id", ""))
     }
     live_deltas: dict[str, list[str]] = {}
     for event in events:
@@ -3306,9 +3099,7 @@ def _render_transcript_events(
         turn_id = str(event.get("turn_id", ""))
         if turn_id in final_turns:
             continue
-        live_deltas.setdefault(turn_id, []).append(
-            str(event.get("text", ""))
-        )
+        live_deltas.setdefault(turn_id, []).append(str(event.get("text", "")))
     emitted_deltas: set[str] = set()
     rendered: list[str] = []
     for event in events:
@@ -3357,13 +3148,7 @@ def _render_transcript_block(
     elif block.kind == TranscriptBlockKind.WARNING:
         accent = "red"
     value = (
-        "[bold "
-        + accent
-        + "]"
-        + escape(block.title.upper())
-        + "[/bold "
-        + accent
-        + "]"
+        "[bold " + accent + "]" + escape(block.title.upper()) + "[/bold " + accent + "]"
     )
     if block.status.value not in {"complete", "waiting"}:
         value += "  [dim]" + escape(block.status.value) + "[/dim]"
@@ -3399,9 +3184,7 @@ def _expanded_blocks(value: str) -> frozenset[str]:
         return frozenset()
     if not isinstance(parsed, list):
         return frozenset()
-    return frozenset(
-        str(item) for item in parsed if isinstance(item, str)
-    )
+    return frozenset(str(item) for item in parsed if isinstance(item, str))
 
 
 def _render_event(
@@ -3427,24 +3210,17 @@ def _render_event(
         if not text and not show_events:
             return ""
         return (
-            "\n[bold yellow]TOOL · "
-            + escape(label)
-            + "[/bold yellow]\n"
-            + text
-            + "\n"
+            "\n[bold yellow]TOOL · " + escape(label) + "[/bold yellow]\n" + text + "\n"
         )
     if event_type.startswith("reasoning.summary"):
         return "[dim]" + text + "[/dim]"
     if event_type == "approval.requested":
         metadata = _object(event.get("metadata"))
-        return (
-            "[bold magenta]Approval required[/bold magenta] "
-            + escape(str(metadata.get("approval_id", "")))
+        return "[bold magenta]Approval required[/bold magenta] " + escape(
+            str(metadata.get("approval_id", ""))
         )
     if event_type == "guard.warning":
-        return (
-            "[bold yellow]Safety envelope is above 80%[/bold yellow]"
-        )
+        return "[bold yellow]Safety envelope is above 80%[/bold yellow]"
     if event_type == "guard.tripped":
         metadata = _object(event.get("metadata"))
         return (
@@ -3459,13 +3235,7 @@ def _render_event(
     if event_type == "routing.selected":
         provider = str(metadata.get("provider", "provider"))
         model = str(metadata.get("model", "default"))
-        return (
-            "[dim]Routed to "
-            + escape(provider)
-            + " · "
-            + escape(model)
-            + "[/dim]"
-        )
+        return "[dim]Routed to " + escape(provider) + " · " + escape(model) + "[/dim]"
     if event_type == "routing.failover":
         provider = str(metadata.get("excluded_provider", "provider"))
         return "[dim]Failing over from " + escape(provider) + "[/dim]"
@@ -3640,9 +3410,7 @@ def _turn_changes_detail(turn: dict[str, Any]) -> str:
     if isinstance(files, list) and files:
         lines.extend(
             [
-                "[dim]"
-                + str(len(files))
-                + " changed file(s)[/dim]",
+                "[dim]" + str(len(files)) + " changed file(s)[/dim]",
                 "",
             ]
         )
@@ -3658,11 +3426,7 @@ def _turn_changes_detail(turn: dict[str, Any]) -> str:
         lines.append("[dim]Diff continues[/dim]")
     redactions = int(diff.get("redactions", 0))
     if redactions:
-        lines.append(
-            "[dim]"
-            + str(redactions)
-            + " sensitive values hidden[/dim]"
-        )
+        lines.append("[dim]" + str(redactions) + " sensitive values hidden[/dim]")
     return "\n".join(lines)
 
 
@@ -3679,10 +3443,7 @@ def _turn_evidence_detail(turn: dict[str, Any]) -> str:
         lines.extend(
             [
                 "",
-                escape(event_type)
-                + "  [dim]"
-                + escape(status)
-                + "[/dim]",
+                escape(event_type) + "  [dim]" + escape(status) + "[/dim]",
             ]
         )
         text = str(item.get("text", "")).strip()
@@ -3699,14 +3460,10 @@ def _turn_recovery_detail(turn: dict[str, Any]) -> str:
         return "\n".join(lines)
     status = str(reconciliation.get("status", "pending"))
     lines.extend(["", escape(status)])
-    summary = str(
-        reconciliation.get("current_workspace_summary", "")
-    ).strip()
+    summary = str(reconciliation.get("current_workspace_summary", "")).strip()
     if summary:
         lines.append(escape(summary))
-    reconciliation_id = str(
-        reconciliation.get("reconciliation_id", "")
-    )
+    reconciliation_id = str(reconciliation.get("reconciliation_id", ""))
     if reconciliation_id:
         lines.extend(
             [
@@ -3919,15 +3676,9 @@ def _object_tuple(value: object) -> tuple[dict[str, Any], ...]:
 
 
 def _native_command(provider: str, permission_mode: str) -> list[str]:
-    if provider == "codex":
-        command = ["npx", "-y", "@openai/codex@0.146.0"]
-        if permission_mode == "full":
-            command.append("--yolo")
-        return command
-    command = ["npx", "@anthropic-ai/claude-code@2.1.220"]
-    if permission_mode == "full":
-        command.append("--dangerously-skip-permissions")
-    return command
+    from agent_harness.terminal import native_provider_command
+
+    return native_provider_command(provider, permission_mode, [])
 
 
 def run_tui(

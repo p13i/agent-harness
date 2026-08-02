@@ -50,11 +50,19 @@ class ConflictError(HarnessError):
         super().__init__("E_CONFLICT", message, status=409)
 
 
+class WorkerOwnershipLostError(RuntimeError):
+    """The worker incarnation no longer owns session mutation rights."""
+
+
 class ProviderUnavailableError(HarnessError):
-    def __init__(self, provider: str) -> None:
+    def __init__(self, provider: str, *, detail: str = "") -> None:
+        self.provider = provider
+        message = provider + " is unavailable"
+        if detail:
+            message = message + ": " + detail
         super().__init__(
             "E_PROVIDER_UNAVAILABLE",
-            provider + " is unavailable",
+            message,
             retryable=True,
             status=503,
         )
@@ -62,11 +70,22 @@ class ProviderUnavailableError(HarnessError):
 
 class ProviderExhaustedError(HarnessError):
     def __init__(self, provider: str) -> None:
+        self.provider = provider
         super().__init__(
             "E_PROVIDER_EXHAUSTED",
             provider + " has no eligible capacity",
             retryable=True,
             status=429,
+        )
+
+
+class ReconciliationRequiredError(HarnessError):
+    def __init__(self, reconciliation_id: str) -> None:
+        self.reconciliation_id = reconciliation_id
+        super().__init__(
+            "E_NEEDS_RECONCILIATION",
+            "provider dispatch effect is ambiguous; reconciliation is required",
+            status=409,
         )
 
 
