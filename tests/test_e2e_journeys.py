@@ -1684,9 +1684,15 @@ async def test_stagnation_downgrades_then_fails_over(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StagnationGuard:
-        def __init__(self, limits: object) -> None:
+        def __init__(
+            self,
+            limits: object,
+            consumption: SafetyConsumption | None = None,
+        ) -> None:
             self.limits = limits
-            self.consumption = SafetyConsumption()
+            if consumption is None:
+                consumption = SafetyConsumption()
+            self.consumption = consumption
 
         def begin_attempt(self, context_tokens: int) -> str:
             self.consumption.attempts += 1

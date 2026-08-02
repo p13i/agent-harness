@@ -3339,9 +3339,11 @@ def _worker_attempt(
         created.session_id,
     )
     service.store.register_worker(created.session_id, 123, worker.incarnation)
-    worker._compile_context = lambda unused_session, unused_limits: SimpleNamespace(
-        text="canonical context",
-        estimated_tokens=10,
+    worker._compile_context = (
+        lambda unused_session, unused_limits, unused_command_id: SimpleNamespace(
+            text="canonical context",
+            estimated_tokens=10,
+        )
     )
     worker._guard_repeated_dispatch = lambda *unused, **values: None
     return service, worker, command, TurnGuard(limits)
@@ -3491,7 +3493,11 @@ def test_worker_context_repetition_goal_and_reconciliation_boundaries(
         created_at=utc_now(),
         updated_at=utc_now(),
     )
-    worker._compile_context(created, limits_for("interactive", "implementation"))
+    worker._compile_context(
+        created,
+        limits_for("interactive", "implementation"),
+        "command",
+    )
     assert captured["inherited_context_digest"] == "inherited"
     assert captured["inherited_context"] == "text:inherited"
 
