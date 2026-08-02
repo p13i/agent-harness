@@ -7420,6 +7420,11 @@ class StateStore:
         ]
         if not merge_global:
             table_rows["ui_state"].extend(validated_global_ui)
+        table_rows["context_deliveries"] = (
+            _normalize_portable_context_deliveries(
+                table_rows["context_deliveries"]
+            )
+        )
         self._validate_portable_external_refs(table_rows["sessions"])
         with self.transaction() as connection:
             for table in PORTABLE_SESSION_TABLES:
@@ -7956,6 +7961,51 @@ def _dump(value: Any) -> str:
 def _require_object(value: object, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(field + " must be an object")
+    return value
+
+
+def _normalize_portable_context_deliveries(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    attempt_counts: dict[str, int] = {}
+    for row in rows:
+        attempt_id = _portable_attempt_id(row)
+        if attempt_id:
+            attempt_counts[attempt_id] = attempt_counts.get(attempt_id, 0) + 1
+    assigned_attempt_ids = {
+        attempt_id
+        for attempt_id, count in attempt_counts.items()
+        if count == 1
+    }
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        normalized = dict(row)
+        attempt_id = _portable_attempt_id(normalized)
+        duplicate_attempt = attempt_counts.get(attempt_id, 0) > 1
+        if not attempt_id or duplicate_attempt:
+            legacy_identity: dict[str, Any] = {
+                "attempt_id": attempt_id,
+                "row": normalized,
+            }
+            legacy_prefix = "legacy-"
+            if duplicate_attempt:
+                legacy_prefix = "legacy-duplicate-"
+            attempt_id = legacy_prefix + normalized_digest(legacy_identity)
+            collision = 0
+            while attempt_id in assigned_attempt_ids:
+                collision += 1
+                legacy_identity["collision"] = collision
+                attempt_id = legacy_prefix + normalized_digest(legacy_identity)
+            normalized["attempt_id"] = attempt_id
+        assigned_attempt_ids.add(attempt_id)
+        normalized_rows.append(normalized)
+    return normalized_rows
+
+
+def _portable_attempt_id(row: dict[str, Any]) -> str:
+    value = row.get("attempt_id", "")
+    if not isinstance(value, str):
+        return ""
     return value
 
 
