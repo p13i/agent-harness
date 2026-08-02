@@ -28,6 +28,8 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/JsonResponse"
+        "503":
+          $ref: "#/components/responses/JsonResponse"
   /v1/capabilities:
     get:
       operationId: getCapabilities

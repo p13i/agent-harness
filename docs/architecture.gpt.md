@@ -243,10 +243,10 @@ Eligible soft failures may lower effort once on the same
 provider and then use one alternate provider. Neither step
 creates a new envelope. Hard limits interrupt the active
 process, checkpoint observable work, and pause. Unattended
-xhigh requires one explicit authorization, which one command
-consumes.
+effort at or above xhigh requires one explicit authorization,
+which one command consumes.
 
-All harness-managed background Claude and Codex processes
+All harness-managed background Claude, Codex, and Kimi processes
 hold a durable lease containing provider, profile, PID, PID
 start identity, heartbeat expiry, and session. Machines
 launchers use the same lease contract, and a host watchdog
