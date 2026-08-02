@@ -125,18 +125,26 @@ class KimiAdapter(ProviderAdapter):
         )
 
     async def models(self, workspace: Path) -> tuple[ProviderModel, ...]:
+        # These ids go straight into `--model`, which resolves an alias
+        # key in ~/.kimi-code/config.toml -- the [models."<alias>"]
+        # table name -- not the upstream API model id. Kimi's managed
+        # OAuth provider namespaces its aliases, so a bare "k3" matched
+        # nothing and every turn failed with:
+        #   config.invalid: Model "k3" is not configured in config.toml
+        # Ids, display names, and context windows below are the values
+        # `kimi provider list --json` reports for those aliases.
         del workspace
         return (
             ProviderModel(
-                model_id="k3",
-                display_name="Kimi K3",
+                model_id="kimi-code/k3",
+                display_name="K3",
                 efforts=(),
-                context_window=1_048_576,
+                context_window=262_144,
                 default=True,
             ),
             ProviderModel(
-                model_id="kimi-for-coding",
-                display_name="Kimi for Coding",
+                model_id="kimi-code/kimi-for-coding",
+                display_name="K2.7 Coding",
                 efforts=(),
                 context_window=262_144,
             ),
