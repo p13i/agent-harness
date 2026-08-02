@@ -825,6 +825,18 @@ def test_cli_dispatches_every_session_control(
         ],
         [
             *base,
+            "extend-budget",
+            "session-1",
+            "--allow-xhigh-once",
+            "--command-id",
+            "command-1",
+            "--provider",
+            "codex",
+            "--reason",
+            "one authorized xhigh turn",
+        ],
+        [
+            *base,
             "events",
             "session-1",
             "--after",
@@ -1515,6 +1527,19 @@ def test_doctor_reports_bundle_service_daemon_and_storage(
     unsafe_output = capsys.readouterr().out
     assert '"private_socket_mode": false' in unsafe_output
     assert '"private_state_mode": false' in unsafe_output
+
+    def untrusted(name: str) -> str:
+        raise RuntimeError("trusted executable is not runnable: " + name)
+
+    creation_intents = harness_paths.runtime / "creation-intents"
+    creation_intents.mkdir(parents=True, exist_ok=True)
+    (creation_intents / "pending.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "trusted_executable", untrusted)
+    assert asyncio.run(cli._doctor(harness_paths)) == 1
+    untrusted_output = capsys.readouterr().out
+    assert '"npx": false' in untrusted_output
+    assert '"pending.json"' in untrusted_output
+    assert '"pending_creation_intents": false' in untrusted_output
 
 
 def test_doctor_stale_timestamp_classification() -> None:

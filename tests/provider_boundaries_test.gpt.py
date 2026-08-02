@@ -189,6 +189,7 @@ def test_provider_base_contract_and_environment(
             "PATH": "/bin",
             "npm_config_package": "ignored",
             "OTHER_SECRET": "ignored",
+            "LC_ACCESS_KEY": "ignored",
             "CLAUDE_CODE_OAUTH_TOKEN": "claude-oauth",
             "ANTHROPIC_API_KEY": "anthropic",
             "OPENAI_API_KEY": "openai",
@@ -231,6 +232,10 @@ def test_trusted_provider_executable_ignores_hostile_path_and_fails_closed(
 
     executable.chmod(0o775)
     with pytest.raises(RuntimeError, match="writable"):
+        base.trusted_executable("npx")
+
+    executable.chmod(0o644)
+    with pytest.raises(RuntimeError, match="not runnable"):
         base.trusted_executable("npx")
 
     monkeypatch.setattr(base.shutil, "which", lambda *args, **kwargs: None)
@@ -479,6 +484,82 @@ def test_codex_server_start_and_close(
     asyncio.run(scenario())
 
 
+def test_codex_server_disables_child_agents_without_a_durable_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        process = Process(stdout=Stream([]), stderr=Stream([]))
+        identity = SimpleNamespace(pid=42, pgid=42, pid_start="start")
+        argv: list[str] = []
+
+        async def create(*args: Any, **kwargs: Any) -> Process:
+            del kwargs
+            argv.extend(str(item) for item in args)
+            return process
+
+        async def terminate(*unused: object, **options: object) -> None:
+            del options
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+        monkeypatch.setattr(
+            codex,
+            "process_group_identity",
+            lambda unused: identity,
+        )
+        monkeypatch.setattr(codex, "terminate_process_group", terminate)
+        server = _server(tmp_path)
+
+        async def request(
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float = 30.0,
+        ) -> dict[str, Any]:
+            del method
+            del params
+            del timeout
+            return {}
+
+        async def notify(method: str, params: dict[str, Any]) -> None:
+            del method
+            del params
+
+        server.request = request  # type: ignore[method-assign]
+        server.notify = notify  # type: ignore[method-assign]
+        await server.start()
+
+        assert argv[3:5] == ["-c", "agents.enabled=false"]
+        assert server._child_gate_arguments() == ["-c", "agents.enabled=false"]
+
+        server._process_group = None
+        with pytest.raises(RuntimeError, match="process group identity is missing"):
+            await server.close()
+        server._process_group = identity
+        await server.close()
+
+    asyncio.run(scenario())
+
+
+def test_codex_native_sessions_are_recognized_by_their_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex.Path, "home", lambda: tmp_path)
+
+    assert not codex._has_native_session("")
+    assert not codex._has_native_session("thread 1")
+    assert not codex._has_native_session("thread-1")
+
+    sessions = tmp_path / ".codex" / "sessions" / "2026" / "08"
+    sessions.mkdir(parents=True)
+    assert not codex._has_native_session("thread-1")
+
+    (sessions / "rollout-thread-1-2026.jsonl").write_text("{}\n", encoding="utf-8")
+    assert codex._has_native_session("thread-1")
+    assert codex.CodexAdapter().native_session_available(tmp_path, "thread-1")
+
+
 def test_codex_child_gate_argv_is_durable(tmp_path: Path) -> None:
     durable_gate = _durable_child_gate(tmp_path, 2)
     server = codex.CodexAppServer(
@@ -593,6 +674,15 @@ def test_child_gate_is_atomic_and_fails_closed(
         io.StringIO('{"tool_name":"Agent"}'),
     )
     assert child_gate.main([str(unwritable), gate.command_id, "2", "codex"]) == 0
+
+    # An unopenable database has to deny rather than propagate, so the
+    # payload here carries a tool id and reaches the durable gate.
+    monkeypatch.setattr(
+        child_gate.sys,
+        "stdin",
+        io.StringIO('{"tool_name":"Agent","tool_use_id":"call-1"}'),
+    )
+    assert child_gate.main([str(unwritable), gate.command_id, "2", "codex"]) == 0
     assert '"permissionDecision":"deny"' in capsys.readouterr().out
 
     gate = _durable_child_gate(tmp_path, 2)
@@ -640,6 +730,60 @@ def test_child_gate_is_atomic_and_fails_closed(
     with pytest.raises(SystemExit) as exited:
         runpy.run_path(str(Path(child_gate.__file__)), run_name="__main__")
     assert exited.value.code == 0
+
+
+# A permit update that matches no row means the durable gate moved under
+# the transaction, so the launch must be denied rather than admitted on
+# the strength of the earlier read.
+def test_child_gate_denies_when_the_permit_update_matches_no_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _durable_child_gate(tmp_path, 2)
+    real_connect = child_gate.sqlite3.connect
+
+    class LosingUpdate:
+        def __init__(self, inner: sqlite3.Connection) -> None:
+            self._inner = inner
+
+        @property
+        def in_transaction(self) -> bool:
+            return self._inner.in_transaction
+
+        def execute(self, statement: str, *arguments: object) -> object:
+            cursor = self._inner.execute(statement, *arguments)
+            if "UPDATE child_launch_gates" in statement:
+                return SimpleNamespace(rowcount=0)
+            return cursor
+
+        def close(self) -> None:
+            self._inner.close()
+
+    monkeypatch.setattr(
+        child_gate.sqlite3,
+        "connect",
+        lambda *arguments, **options: LosingUpdate(
+            real_connect(*arguments, **options)
+        ),
+    )
+
+    assert not child_gate.admit(
+        gate.database,
+        gate.command_id,
+        2,
+        "claude:Agent:lost",
+    )
+
+    monkeypatch.undo()
+    connection = real_connect(gate.database)
+    try:
+        consumed = connection.execute(
+            "SELECT consumed FROM child_launch_gates WHERE command_id = ?",
+            (gate.command_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert int(consumed[0]) == 0
 
 
 def test_claude_child_gate_denies_third_before_start(tmp_path: Path) -> None:
@@ -868,6 +1012,130 @@ def test_codex_adapter_models_and_turn(
         assert adapter.process_identity()[0] == 44
 
     asyncio.run(scenario())
+
+
+class _StubCodexServer:
+    """Codex app server double whose turn never reports completion."""
+
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        notification_handler: Any,
+        request_handler: Any,
+        child_launch_gate: ChildLaunchGate | None = None,
+    ) -> None:
+        del notification_handler
+        del request_handler
+        del child_launch_gate
+        self.workspace = workspace
+        self.process = SimpleNamespace(pid=44, returncode=None)
+        self._reader: asyncio.Task[None] | None = None
+        self.turn_id = "turn-1"
+        self.reader_factory: Any = None
+
+    async def start(self) -> None:
+        if self.reader_factory is not None:
+            self._reader = asyncio.create_task(self.reader_factory())
+            return
+        self._reader = asyncio.create_task(asyncio.sleep(3600))
+
+    async def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        del params
+        if method in {"thread/start", "thread/resume"}:
+            return {"thread": {"id": "thread-1"}}
+        if method == "turn/start":
+            if not self.turn_id:
+                return {}
+            return {"turn": {"id": self.turn_id}}
+        return {}
+
+    async def close(self) -> None:
+        if self._reader is not None and not self._reader.done():
+            self._reader.cancel()
+            await asyncio.gather(self._reader, return_exceptions=True)
+
+
+def test_codex_turn_fails_closed_without_a_turn_or_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    servers: list[_StubCodexServer] = []
+
+    def build(*args: Any, **kwargs: Any) -> _StubCodexServer:
+        server = _StubCodexServer(*args, **kwargs)
+        servers.append(server)
+        return server
+
+    monkeypatch.setattr(codex, "CodexAppServer", build)
+    monkeypatch.setattr(codex, "codex_notification", lambda method, params: [])
+
+    async def collect(event: ProviderEvent) -> None:
+        del event
+
+    async def turn(**overrides: Any) -> Any:
+        adapter = codex.CodexAdapter()
+        return await adapter.run_turn(
+            workspace=tmp_path,
+            prompt="work",
+            native_session_id="",
+            permission_mode="approval",
+            model="",
+            effort="",
+            event_handler=collect,
+            approval_handler=_decline,
+            **overrides,
+        )
+
+    async def scenario() -> None:
+        opened: list[str] = []
+
+        async def gate() -> None:
+            opened.append("opened")
+            servers[-1].turn_id = ""
+
+        with pytest.raises(HarnessError, match="turn identifier"):
+            await turn(pre_prompt_gate=gate)
+        assert opened == ["opened"]
+
+        async def missing_reader() -> None:
+            servers[-1]._reader = None
+
+        with pytest.raises(RuntimeError, match="reader task is missing"):
+            await turn(pre_prompt_gate=missing_reader)
+
+        async def failing_reader() -> None:
+            raise ProviderUnavailableError("codex", detail="transport closed")
+
+        async def use_failing_reader() -> None:
+            servers[-1]._reader = asyncio.create_task(failing_reader())
+
+        with pytest.raises(ProviderUnavailableError):
+            await turn(pre_prompt_gate=use_failing_reader)
+
+        async def never_finishes(*unused: object, **options: object) -> Any:
+            del options
+            return set(), set()
+
+        monkeypatch.setattr(codex.asyncio, "wait", never_finishes)
+        with pytest.raises(TimeoutError, match="turn timed out"):
+            await turn()
+
+    asyncio.run(scenario())
+
+
+def test_codex_process_identity_ignores_an_exited_server(tmp_path: Path) -> None:
+    adapter = codex.CodexAdapter()
+    adapter._active_server = SimpleNamespace(  # type: ignore[assignment]
+        process=SimpleNamespace(pid=44, returncode=0)
+    )
+    del tmp_path
+
+    assert adapter.process_identity() == (0, "")
 
 
 def test_codex_adapter_status_resume_failure_and_interrupt_guard(
@@ -1491,6 +1759,125 @@ def test_claude_adapter_status_models_and_active_control(
         _process=SimpleNamespace(pid=55, returncode=None)
     )
     assert adapter.process_identity() == (55, "started")
+    adapter._transport = SimpleNamespace(
+        _process=SimpleNamespace(pid=55, returncode=0)
+    )
+    assert adapter.process_identity() == (0, "")
+    monkeypatch.setattr(claude, "_has_native_session", lambda *unused: True)
+    assert adapter.native_session_available(tmp_path, "native")
+
+
+# Without a durable gate there is no way to bound child launches, so the
+# hook denies instead of falling through to the provider default.
+def test_claude_child_gate_denies_without_a_durable_gate() -> None:
+    async def scenario() -> None:
+        gate = claude._child_gate(None)
+        decision = await gate(
+            {"tool_name": "Agent", "tool_use_id": "tool-1"},
+            "tool-1",
+            {},
+        )
+        assert decision["hookSpecificOutput"]["permissionDecisionReason"] == (
+            "The harness child-agent launch gate is unavailable."
+        )
+
+    asyncio.run(scenario())
+
+
+def test_claude_transport_isolates_and_reaps_its_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_calls: list[str] = []
+
+    async def base_connect(unused_self: object) -> None:
+        base_calls.append("connect")
+
+    async def base_close(unused_self: object) -> None:
+        base_calls.append("close")
+
+    monkeypatch.setattr(
+        claude.SubprocessCLITransport,
+        "connect",
+        base_connect,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        claude.SubprocessCLITransport,
+        "close",
+        base_close,
+        raising=False,
+    )
+    transport = object.__new__(claude.NpxClaudeTransport)
+    transport._process_group = None
+
+    async def missing_process() -> None:
+        with pytest.raises(RuntimeError, match="process is missing"):
+            await transport.connect()
+
+    asyncio.run(missing_process())
+
+    transport._process = SimpleNamespace(pid=4242)
+    attempts = {"count": 0}
+
+    def slow_identity(pid: int) -> str:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RuntimeError("process group is not isolated yet")
+        return "group-" + str(pid)
+
+    monkeypatch.setattr(claude, "process_group_identity", slow_identity)
+    asyncio.run(transport.connect())
+    assert transport._process_group == "group-4242"
+    assert attempts["count"] == 3
+
+    def never_isolated(unused_pid: int) -> str:
+        raise RuntimeError("process group is not isolated")
+
+    monkeypatch.setattr(claude, "process_group_identity", never_isolated)
+
+    async def never_ready() -> None:
+        with pytest.raises(RuntimeError, match="did not isolate"):
+            await transport.connect()
+
+    asyncio.run(never_ready())
+
+    terminated: list[object] = []
+
+    async def terminate(process: object, identity: object, **options: object) -> None:
+        del options
+        terminated.append((process, identity))
+
+    monkeypatch.setattr(claude, "terminate_process_group", terminate)
+    transport._process_group = "group-4242"
+    asyncio.run(transport.close())
+    assert terminated == [(transport._process, "group-4242")]
+    assert transport._process_group is None
+
+    asyncio.run(transport.close())
+    assert len(terminated) == 1
+    assert base_calls == ["connect", "connect", "connect", "close", "close"]
+
+
+def test_claude_prompt_stream_awaits_its_pre_prompt_gate() -> None:
+    opened: list[str] = []
+
+    async def gate() -> None:
+        opened.append("opened")
+
+    async def scenario() -> None:
+        values = [
+            value
+            async for value in claude._prompt_stream(
+                "hello",
+                "session",
+                pre_prompt_gate=gate,
+            )
+        ]
+        assert values[0]["message"]["content"][0]["text"] == "hello"
+
+    asyncio.run(scenario())
+
+    assert opened == ["opened"]
 
 
 def test_terminal_command_text_and_pty_boundaries(
@@ -1538,6 +1925,9 @@ def test_terminal_command_text_and_pty_boundaries(
     ):
         with pytest.raises(ValueError, match="override"):
             terminal._command("codex", "approval", [protected])
+    for provider in ("codex", "claude"):
+        with pytest.raises(ValueError, match="permission mode"):
+            terminal._command(provider, "unsupported", [])
     with pytest.raises(ValueError):
         terminal._command("other", "approval", [])
 
@@ -1849,3 +2239,65 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
     asyncio.run(scenario())
 
     assert [e.event_type for e in seen] == ["agent.message", "turn.completed"]
+
+
+# A nonzero exit is the only failure signal a one-shot run emits, so the
+# adapter has to turn it into a terminal event instead of a silent
+# "complete".
+def test_kimi_run_turn_reports_a_nonzero_exit_as_a_failed_turn(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lines = [b"\n", b"[1, 2]\n"]
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                for line in lines:
+                    yield line
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b"kimi: config.invalid\n"
+
+    class Process:
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 2
+
+    async def fake_exec(*_argv, **_kwargs):
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    seen: list[ProviderEvent] = []
+
+    async def handler(event: ProviderEvent) -> None:
+        seen.append(event)
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        result = await kimi.KimiAdapter().run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="session_prior",
+            permission_mode="auto",
+            model="kimi-code/k3",
+            effort="",
+            event_handler=handler,
+            approval_handler=approvals,
+        )
+        assert result.status == "failed"
+        assert result.native_session_id == "session_prior"
+
+    asyncio.run(scenario())
+
+    assert [(item.event_type, item.text) for item in seen] == [
+        ("turn.failed", "kimi: config.invalid")
+    ]

@@ -1,7 +1,9 @@
 from agent_harness.providers.normalize import (
     claude_payload,
     codex_notification,
+    kimi_payload,
     payload_text,
+    redact_observable,
     sanitize,
 )
 
@@ -396,3 +398,23 @@ def test_payload_text_handles_every_supported_shape() -> None:
     assert payload_text({"unknown": 1}) == '{"unknown": 1}'
     assert payload_text(None) == ""
     assert payload_text(42) == "42"
+
+
+def test_redact_observable_walks_every_container_shape() -> None:
+    assert redact_observable(["safe", {"api_key": "leaked"}]) == [
+        "safe",
+        {"api_key": "[REDACTED]"},
+    ]
+    assert redact_observable(7) == 7
+
+
+def test_kimi_payload_falls_back_to_a_neutral_provider_event() -> None:
+    empty = kimi_payload({"role": "assistant", "content": ""})
+    assert [(item.event_type, item.text) for item in empty] == [
+        ("provider.event", "")
+    ]
+
+    unknown_role = kimi_payload({"role": "system", "content": "note"})
+    assert [(item.event_type, item.text) for item in unknown_role] == [
+        ("provider.event", "note")
+    ]

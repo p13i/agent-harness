@@ -293,6 +293,52 @@ def test_claude_linux_credentials_are_read_without_projecting_secrets(
     assert usage._claude_token() == "environment-token"
 
 
+def test_claude_credential_files_fail_closed_on_unsafe_material(
+    tmp_path: Path,
+) -> None:
+    linked = tmp_path / "linked.json"
+    linked.symlink_to(tmp_path / "absent.json")
+    assert usage._claude_file_token(linked) is None
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_text("{}" + " " * (1024 * 1024), encoding="utf-8")
+    oversized.chmod(0o600)
+    assert usage._claude_file_token(oversized) is None
+
+    assert usage._claude_file_token(tmp_path / "absent.json") is None
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{not json", encoding="utf-8")
+    malformed.chmod(0o600)
+    assert usage._claude_file_token(malformed) is None
+
+    blank = tmp_path / "blank.json"
+    blank.write_text('{"claudeAiOauth":{"accessToken":"  "}}', encoding="utf-8")
+    blank.chmod(0o600)
+    assert usage._claude_file_token(blank) is None
+
+
+def test_provider_auth_readiness_reports_each_launch_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(usage, "_claude_token", lambda: "token")
+    assert usage.provider_auth_ready("claude") is True
+    monkeypatch.setattr(usage, "_claude_token", lambda: None)
+    assert usage.provider_auth_ready("claude") is False
+
+    monkeypatch.setattr(
+        usage,
+        "_codex_credentials",
+        lambda: ("token", "account"),
+    )
+    assert usage.provider_auth_ready("codex") is True
+    monkeypatch.setattr(usage, "_codex_credentials", lambda: ("token", None))
+    assert usage.provider_auth_ready("codex") is False
+
+    with pytest.raises(ValueError, match="unknown provider: kimi"):
+        usage.provider_auth_ready("kimi")
+
+
 def test_usage_normalization_omits_private_payloads() -> None:
     codex = normalize_usage(
         "codex",

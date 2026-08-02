@@ -4,6 +4,8 @@ import hashlib
 import json
 import subprocess
 import threading
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +19,7 @@ from agent_harness import api as api_module
 from agent_harness import service as service_module
 from agent_harness.api import create_app
 from agent_harness.config import CONTROL_BUILD_ID, CONTROL_PROTOCOL_VERSION, paths
-from agent_harness.errors import SafetyGuardError
+from agent_harness.errors import ConflictError, NotFoundError, SafetyGuardError
 from agent_harness.goals import create_goal, goal_contract_digest, make_evidence
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import ProviderAttempt
@@ -2439,6 +2441,1064 @@ async def test_daemon_runtime_starts_sites_recovers_and_cleans_up(
     assert calls[-2:] == ["service-closed", "pid-removed"]
 
 
+def _ambiguous_service_reconciliation(
+    tmp_path: Path,
+) -> tuple[HarnessService, object, object, str]:
+    workspace = tmp_path / "reconcile-repo"
+    repository(workspace)
+    service = HarnessService(
+        paths(tmp_path / "reconcile-state"),
+        worker_manager=Workers(),
+    )
+    session = service.create_session(
+        {
+            "workspace": str(workspace),
+            "direct": True,
+            "permission_mode": "full",
+        }
+    )
+    command = service.store.enqueue_command(
+        session.session_id,
+        "message",
+        {"text": "Make one bounded change."},
+        "ambiguous-message",
+    )
+    assert service.store.claim_command(session.session_id) is not None
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=session.session_id,
+        provider="codex",
+        native_session_id="codex-native-session",
+        model="default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    service.store.create_attempt(attempt)
+    turn_id = service.store.start_turn(session.session_id, attempt.attempt_id)
+    checkpoint = checkpoint_workspace(
+        session,
+        service.blobs,
+        sequence=service.store.last_sequence(session.session_id),
+        provider="codex",
+        native_session_id="",
+        context_text="",
+    )
+    service.store.add_checkpoint(checkpoint)
+    service.store.record_dispatch_checkpoint(
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        checkpoint.checkpoint_id,
+    )
+    service.store.mark_provider_boundary(attempt.attempt_id)
+    digest, summary = inspect_workspace(workspace)
+    recovery = service.store.recover_interrupted_commands(
+        session.session_id,
+        digest,
+        summary,
+    )
+    return service, session, recovery.reconciliations[0], digest
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_resolution_without_a_key_records_its_event(
+    tmp_path: Path,
+) -> None:
+    service, session, record, digest = _ambiguous_service_reconciliation(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="requires key and digest"):
+            await service.resolve_reconciliation(
+                record.reconciliation_id,
+                {"decision": "accept-current", "observed_workspace_digest": digest},
+                idempotency_key="resolve",
+            )
+
+        resolved = await service.resolve_reconciliation(
+            record.reconciliation_id,
+            {
+                "decision": "accept-current",
+                "observed_workspace_digest": digest,
+            },
+        )
+
+        assert resolved["status"] == "resolved"
+        assert service.workers.started == [session.session_id]
+        events = [
+            item
+            for item in service.store.events(session.session_id)
+            if item.event_type == "reconciliation.resolved"
+        ]
+        assert len(events) == 1
+        assert events[0].metadata["decision"] == "accept-current"
+    finally:
+        service.close()
+
+
+def _promotion_fixture(tmp_path: Path) -> tuple[HarnessService, object, object]:
+    workspace = tmp_path / "promotion-repo"
+    repository(workspace)
+    service = HarnessService(
+        paths(tmp_path / "promotion-state"),
+        worker_manager=Workers(),
+    )
+    first_predicate = {
+        "type": "report",
+        "subject": "tier-8h",
+        "outcome": "passed",
+    }
+    session = service.create_session(
+        {
+            "workspace": str(workspace),
+            "direct": True,
+            "goal": "Prove the first tier.",
+            "goal_kind": "finite",
+            "constraints": ["Use retained evidence."],
+            "predicates": [first_predicate],
+            "milestones": [
+                {
+                    "milestone_id": "tier-8h",
+                    "title": "Prove tier 8h",
+                    "dependencies": [],
+                    "predicates": [first_predicate],
+                }
+            ],
+            "budgets": {"turns": 2},
+            "permitted_providers": ["claude", "codex"],
+            "permitted_efforts": ["low", "medium"],
+        }
+    )
+    goal = service.store.goal_for_session(session.session_id)
+    assert goal is not None
+    return service, session, goal
+
+
+def test_goal_promotion_rejects_widened_or_malformed_contracts(
+    tmp_path: Path,
+) -> None:
+    service, session, goal = _promotion_fixture(tmp_path)
+    first_predicate = dict(goal.predicates[0])
+    later_predicate = {
+        "type": "report",
+        "subject": "tier-24h",
+        "outcome": "passed",
+    }
+    base = {
+        "from_goal_id": goal.goal_id,
+        "stage": "tier-24h",
+        "objective": "Prove the promoted run.",
+        "goal_kind": "finite",
+        "constraints": ["Use retained evidence."],
+        "predicates": [first_predicate, later_predicate],
+        "milestones": [
+            {
+                "milestone_id": "tier-8h",
+                "title": "Prove tier 8h",
+                "dependencies": [],
+                "predicates": [first_predicate],
+            },
+            {
+                "milestone_id": "tier-24h",
+                "title": "Prove tier 24h",
+                "dependencies": [],
+                "predicates": [later_predicate],
+            },
+        ],
+        "budgets": {"turns": 3},
+        "permitted_providers": ["claude", "codex"],
+        "permitted_efforts": ["low", "medium"],
+        "max_concurrency": 1,
+        "authorization": {"schema": "unverified-placeholder"},
+    }
+
+    def rejected(
+        message: str,
+        error: type[Exception] = ValueError,
+        *,
+        key: str = "promote",
+        **overrides: object,
+    ) -> None:
+        payload = copy.deepcopy(base)
+        payload.update(overrides)
+        with pytest.raises(error, match=message):
+            service.promote_goal(
+                session.session_id,
+                payload,
+                idempotency_key=key,
+            )
+
+    try:
+        with pytest.raises(ValueError, match="requires an idempotency key"):
+            service.promote_goal(
+                session.session_id,
+                copy.deepcopy(base),
+                idempotency_key="",
+            )
+        rejected("stage must contain 1 to 128 characters", stage="  ")
+        rejected("requires explicit authorization", authorization={})
+        rejected("goal constraints must be a list", constraints="one")
+        rejected("goal predicates must be a list", predicates="one")
+        rejected("goal milestones must be a list", milestones="one")
+        rejected("goal budgets must be an object", budgets=[])
+        rejected("permitted providers must be a list", permitted_providers="claude")
+        rejected("permitted efforts must be a list", permitted_efforts="low")
+        rejected("cannot remove constraints", constraints=["Other."])
+        rejected(
+            "requires finite goals",
+            goal_kind="invariant",
+            completion_policy="never",
+        )
+        rejected(
+            "cannot widen permitted providers",
+            permitted_providers=["claude", "codex", "kimi"],
+        )
+        rejected(
+            "cannot widen permitted efforts",
+            permitted_efforts=["low", "medium", "high"],
+        )
+        rejected("cannot increase concurrency", max_concurrency=2)
+        rejected("cannot remove a budget", budgets={"attempts": 3})
+        rejected("cannot reduce a budget", budgets={"turns": 1})
+        rejected("requires an additive budget", budgets={"turns": 2})
+
+        foreign = service.create_session(
+            {
+                "workspace": str(Path(session.workspace)),
+                "direct": True,
+                "goal": "Prove another run.",
+                "predicates": [first_predicate],
+            }
+        )
+        foreign_goal = service.store.goal_for_session(foreign.session_id)
+        assert foreign_goal is not None
+        rejected(
+            "source belongs to another session",
+            ConflictError,
+            from_goal_id=foreign_goal.goal_id,
+        )
+    finally:
+        service.close()
+
+
+def test_goal_promotion_rejects_drifted_stored_policies(tmp_path: Path) -> None:
+    service, session, goal = _promotion_fixture(tmp_path)
+    first_predicate = dict(goal.predicates[0])
+    later_predicate = {
+        "type": "report",
+        "subject": "tier-24h",
+        "outcome": "passed",
+    }
+
+    def promotion(previous_goal_id: str) -> dict[str, object]:
+        return {
+            "from_goal_id": previous_goal_id,
+            "stage": "tier-24h",
+            "objective": "Prove the promoted run.",
+            "goal_kind": "finite",
+            "constraints": ["Use retained evidence."],
+            "predicates": [first_predicate, later_predicate],
+            "milestones": [],
+            "budgets": {"turns": 3},
+            "permitted_providers": ["claude", "codex"],
+            "permitted_efforts": ["low", "medium"],
+            "max_concurrency": 1,
+            "completion_policy": "evidence-all",
+            "incident_policy": "recover-then-pause",
+            "authorization": {"schema": "unverified-placeholder"},
+        }
+
+    try:
+        for field, value, message in (
+            ("completion_policy", "drifted", "cannot change completion policy"),
+            ("incident_policy", "drifted", "cannot change incident policy"),
+        ):
+            drifted = service.store.create_goal(
+                replace(
+                    goal,
+                    goal_id=new_uuid(),
+                    **{field: value},
+                )
+            )
+            with pytest.raises(ValueError, match=message):
+                service.promote_goal(
+                    session.session_id,
+                    promotion(drifted.goal_id),
+                    idempotency_key="promote-" + field,
+                )
+    finally:
+        service.close()
+
+
+def _transition_fixture(
+    tmp_path: Path,
+) -> tuple[HarnessService, object, dict[str, object], dict[str, str], str]:
+    workspace = tmp_path / "invalidation-repo"
+    repository(workspace)
+    service = HarnessService(
+        paths(tmp_path / "invalidation-state"),
+        worker_manager=Workers(),
+    )
+    external_ref = {"orchestrator": "machines", "job_id": "builder-stage"}
+    session = service.create_session(
+        {
+            "workspace": str(workspace),
+            "direct": True,
+            "execution_profile": "unattended",
+            "external_ref": external_ref,
+        }
+    )
+    next_turn_ref = {"step_id": "verify", "agent_role": "verifier"}
+    next_command_digest = command_envelope_digest(
+        "message",
+        {
+            "text": "Verify the implementation.",
+            "provider": "codex",
+            "turn_ref": next_turn_ref,
+        },
+        "unattended",
+    )
+    policy = _single_transition_policy(
+        session.session_id,
+        external_ref,
+        "invalidation-epoch-1",
+        next_turn_ref,
+        next_command_digest,
+    )
+    service.store.create_goal(
+        create_goal(
+            session.session_id,
+            "Run one exact reviewed stage.",
+            constraints=(
+                "dispatch-generation-transition-policy-sha256:"
+                + normalized_digest(policy),
+                "dispatch-generation-transition-epoch:" + str(policy["epoch_id"]),
+            ),
+        )
+    )
+    prior = service.store.enqueue_command(
+        session.session_id,
+        "message",
+        {
+            "text": "Review without changes.",
+            "turn_ref": {"step_id": "review", "agent_role": "reviewer"},
+        },
+        "prior-review",
+    )
+    checkpoint = checkpoint_workspace(
+        session,
+        service.blobs,
+        sequence=service.store.last_sequence(session.session_id),
+        provider="claude",
+        native_session_id="claude-review",
+        context_text="reviewed",
+    )
+    service.store.add_checkpoint(checkpoint)
+    service.store.resolve_command(
+        prior.command_id,
+        "complete",
+        {
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "workspace_material_digest": inspect_workspace(workspace)[0],
+        },
+    )
+    return service, session, policy, next_turn_ref, next_command_digest
+
+
+def test_dispatch_invalidation_binds_every_transition_field(
+    tmp_path: Path,
+) -> None:
+    service, session, policy, next_turn_ref, next_command_digest = (
+        _transition_fixture(tmp_path)
+    )
+    base = _managed_transition_payload(
+        service,
+        session.session_id,
+        policy,
+        next_turn_ref,
+        next_command_digest,
+    )
+    reason = str(base["reason"])
+
+    def rejected(
+        message: str,
+        mutate: Callable[[dict[str, object]], None],
+        error: type[Exception] = ValueError,
+    ) -> None:
+        payload = copy.deepcopy(base)
+        mutate(payload)
+        with pytest.raises(error, match=message):
+            service.invalidate_dispatch_generation(
+                session.session_id,
+                payload,
+                idempotency_key="invalidate-" + str(len(message)),
+            )
+
+    def authorization(payload: dict[str, object]) -> dict[str, object]:
+        value = payload["authorization"]
+        assert isinstance(value, dict)
+        return value
+
+    def reseal(payload: dict[str, object], **receipt_overrides: object) -> None:
+        current = authorization(payload)
+        receipt = current["receipt"]
+        assert isinstance(receipt, dict)
+        receipt.update(receipt_overrides)
+        current["receipt_sha256"] = normalized_digest(receipt)
+
+    try:
+        with pytest.raises(ValueError, match="requires an idempotency key"):
+            service.invalidate_dispatch_generation(
+                session.session_id,
+                copy.deepcopy(base),
+                idempotency_key="",
+            )
+        rejected(
+            "reason must contain 1 to 500 characters",
+            lambda item: item.__setitem__("reason", "  "),
+        )
+        rejected(
+            "requires typed authorization",
+            lambda item: item.__setitem__("authorization", "signed"),
+        )
+        rejected(
+            "authorization is unsupported",
+            lambda item: authorization(item).__setitem__("schema", "other"),
+        )
+        rejected(
+            "reason does not match",
+            lambda item: authorization(item).__setitem__("reason", "other"),
+        )
+        rejected(
+            "receipt is invalid",
+            lambda item: authorization(item).__setitem__(
+                "receipt_sha256",
+                "short",
+            ),
+        )
+        rejected(
+            "requires a next step identifier",
+            lambda item: item.__setitem__("next_turn_ref", None),
+        )
+        rejected(
+            "prior command does not match",
+            lambda item: authorization(item).__setitem__(
+                "prior_command_id",
+                new_uuid(),
+            ),
+        )
+        rejected(
+            "prior command type is invalid",
+            lambda item: item.__setitem__("prior_command_type", ""),
+        )
+        rejected(
+            "anchor kind is invalid",
+            lambda item: item.__setitem__("prior_anchor_kind", "guess"),
+        )
+        rejected(
+            "reconciliation resolution is invalid",
+            lambda item: item.update(
+                prior_anchor_kind="resolved-reconciliation",
+                prior_reconciliation_id=new_uuid(),
+                prior_reconciliation_resolution="ignore",
+            ),
+        )
+        rejected(
+            "reconciliation binding is unexpected",
+            lambda item: item.__setitem__("prior_reconciliation_id", new_uuid()),
+        )
+        rejected(
+            "orchestrator does not match",
+            lambda item: authorization(item).__setitem__(
+                "external_orchestrator",
+                "other",
+            ),
+        )
+        rejected(
+            "sequence is invalid",
+            lambda item: item.__setitem__("transition_sequence", 0),
+        )
+        rejected(
+            "generation digest is invalid",
+            lambda item: item.__setitem__("prior_generation_digest", "short"),
+        )
+        rejected(
+            "material digest is invalid",
+            lambda item: item.__setitem__("prior_material_digest", "short"),
+        )
+        rejected(
+            "goal does not match",
+            lambda item: authorization(item).__setitem__("goal_id", new_uuid()),
+        )
+        rejected(
+            "epoch is invalid",
+            lambda item: authorization(item).__setitem__("epoch_id", ""),
+        )
+        rejected(
+            "requires the full policy",
+            lambda item: authorization(item).pop("policy"),
+        )
+        rejected(
+            "must not carry a policy reference",
+            lambda item: authorization(item).__setitem__("policy_ref", {}),
+        )
+        rejected(
+            "command digest is invalid",
+            lambda item: item.__setitem__("next_command_digest", "short"),
+        )
+        rejected(
+            "prior_checkpoint_id does not match",
+            lambda item: authorization(item).__setitem__(
+                "prior_checkpoint_id",
+                new_uuid(),
+            ),
+        )
+        rejected(
+            "command digest does not match",
+            lambda item: authorization(item).__setitem__(
+                "next_command_digest",
+                "b" * 64,
+            ),
+        )
+        rejected(
+            "source receipt does not match",
+            lambda item: reseal(item, session_id=new_uuid()),
+        )
+
+        operator_receipt = {"scope": "operator"}
+        operator_payload = {
+            "reason": reason,
+            "authorization": {
+                "schema": ("p13i/agent-harness/dispatch-invalidation-authorization/v1"),
+                "session_id": session.session_id,
+                "reason": reason,
+                "receipt": operator_receipt,
+                "receipt_sha256": normalized_digest(operator_receipt),
+            },
+        }
+        with pytest.raises(ValueError, match="requires a transition"):
+            service.invalidate_dispatch_generation(
+                session.session_id,
+                operator_payload,
+                idempotency_key="invalidate-operator",
+            )
+    finally:
+        service.close()
+
+
+def test_dispatch_invalidation_requires_a_retained_policy_reference(
+    tmp_path: Path,
+) -> None:
+    service, session, policy, next_turn_ref, next_command_digest = (
+        _transition_fixture(tmp_path)
+    )
+    anchor = service.store.dispatch_transition_anchor(session.session_id)
+    follow_up = _managed_transition_payload_from_anchor(
+        service,
+        session.session_id,
+        policy,
+        next_turn_ref,
+        next_command_digest,
+        anchor,
+        transition_sequence=2,
+    )
+
+    try:
+        missing_reference = copy.deepcopy(follow_up)
+        missing_authorization = missing_reference["authorization"]
+        assert isinstance(missing_authorization, dict)
+        missing_authorization.pop("policy_ref")
+        with pytest.raises(ValueError, match="policy reference is required"):
+            service.invalidate_dispatch_generation(
+                session.session_id,
+                missing_reference,
+                idempotency_key="invalidate-missing-reference",
+            )
+
+        mismatched = copy.deepcopy(follow_up)
+        mismatched_authorization = mismatched["authorization"]
+        assert isinstance(mismatched_authorization, dict)
+        mismatched_authorization["policy_ref"] = {"policy_sha256": "a" * 64}
+        with pytest.raises(ValueError, match="policy reference does not match"):
+            service.invalidate_dispatch_generation(
+                session.session_id,
+                mismatched,
+                idempotency_key="invalidate-mismatched-reference",
+            )
+    finally:
+        service.close()
+
+
+def test_durable_dispatch_invalidations_bind_every_transition_field(
+    tmp_path: Path,
+) -> None:
+    service, current, policy, next_turn_ref, next_command_digest = (
+        _transition_fixture(tmp_path)
+    )
+    base = _managed_transition_payload(
+        service,
+        current.session_id,
+        policy,
+        next_turn_ref,
+        next_command_digest,
+    )
+
+    def invalidate(payload: dict[str, object], key: str) -> dict[str, object]:
+        authorization = payload["authorization"]
+        assert isinstance(authorization, dict)
+        return service.store.create_dispatch_invalidation(
+            current.session_id,
+            reason=str(payload["reason"]),
+            authorization=authorization,
+            request_digest=normalized_digest(payload),
+            idempotency_key=key,
+            prior_command_id=str(payload["prior_command_id"]),
+            next_turn_ref=payload["next_turn_ref"],
+            authorization_digest=normalized_digest(authorization),
+        )
+
+    counter = {"value": 0}
+
+    def rejected(
+        message: str,
+        mutate: Callable[[dict[str, object]], None],
+    ) -> None:
+        counter["value"] += 1
+        payload = copy.deepcopy(base)
+        mutate(payload)
+        with pytest.raises(ConflictError, match=message):
+            invalidate(payload, "durable-" + str(counter["value"]))
+
+    def authorization(payload: dict[str, object]) -> dict[str, object]:
+        value = payload["authorization"]
+        assert isinstance(value, dict)
+        return value
+
+    def reseal_policy(payload: dict[str, object], **changes: object) -> None:
+        current_authorization = authorization(payload)
+        current_policy = current_authorization["policy"]
+        assert isinstance(current_policy, dict)
+        current_policy.update(changes)
+        current_authorization["policy_sha256"] = normalized_digest(current_policy)
+
+    try:
+        with pytest.raises(NotFoundError):
+            service.store.create_dispatch_invalidation(
+                new_uuid(),
+                reason="absent",
+                authorization={"schema": "other"},
+                request_digest="a" * 64,
+                idempotency_key="absent-session",
+                prior_command_id="",
+                next_turn_ref={},
+                authorization_digest="a" * 64,
+            )
+
+        rejected(
+            "prior command is required",
+            lambda item: item.__setitem__("prior_command_id", ""),
+        )
+        rejected(
+            "requires a transition",
+            lambda item: authorization(item).__setitem__("schema", "operator"),
+        )
+        rejected(
+            "prior command changed",
+            lambda item: authorization(item).__setitem__(
+                "prior_command_id",
+                new_uuid(),
+            ),
+        )
+        rejected(
+            "next stage changed",
+            lambda item: item.__setitem__(
+                "next_turn_ref",
+                {"step_id": "publish", "agent_role": "publisher"},
+            ),
+        )
+        rejected(
+            "prior command is unknown",
+            lambda item: (
+                item.__setitem__("prior_command_id", new_uuid()),
+                authorization(item).__setitem__(
+                    "prior_command_id",
+                    item["prior_command_id"],
+                ),
+            ),
+        )
+        rejected(
+            "prior_command_type changed",
+            lambda item: authorization(item).__setitem__(
+                "prior_command_type",
+                "control",
+            ),
+        )
+        rejected(
+            "material changed",
+            lambda item: authorization(item).__setitem__(
+                "prior_material_digest",
+                "a" * 64,
+            ),
+        )
+        rejected(
+            "generation changed",
+            lambda item: authorization(item).__setitem__(
+                "prior_generation_digest",
+                "a" * 64,
+            ),
+        )
+        rejected(
+            "sequence is invalid",
+            lambda item: authorization(item).__setitem__(
+                "transition_sequence",
+                True,
+            ),
+        )
+        rejected(
+            "goal changed",
+            lambda item: authorization(item).__setitem__("goal_id", new_uuid()),
+        )
+        rejected(
+            "sequence is out of order",
+            lambda item: authorization(item).__setitem__("transition_sequence", 3),
+        )
+        rejected(
+            "predecessor is missing",
+            lambda item: authorization(item).__setitem__("transition_sequence", 2),
+        )
+        rejected(
+            "orchestrator changed",
+            lambda item: authorization(item).__setitem__(
+                "external_orchestrator",
+                "other",
+            ),
+        )
+        rejected(
+            "policy is missing",
+            lambda item: authorization(item).pop("policy"),
+        )
+        rejected(
+            "policy schema changed",
+            lambda item: reseal_policy(item, schema="other"),
+        )
+        rejected(
+            "policy digest changed",
+            lambda item: authorization(item).__setitem__(
+                "policy_sha256",
+                "a" * 64,
+            ),
+        )
+        rejected(
+            "policy session changed",
+            lambda item: reseal_policy(item, session_id=new_uuid()),
+        )
+        rejected(
+            "policy orchestrator changed",
+            lambda item: reseal_policy(item, external_ref={}),
+        )
+        rejected(
+            "epoch changed",
+            lambda item: reseal_policy(item, epoch_id="other-epoch"),
+        )
+        rejected(
+            "has a policy reference",
+            lambda item: authorization(item).__setitem__("policy_ref", {}),
+        )
+        rejected(
+            "role is outside policy",
+            lambda item: reseal_policy(item, allowed_agent_roles=["publisher"]),
+        )
+        rejected(
+            "step is outside policy",
+            lambda item: reseal_policy(item, allowed_step_prefixes=["publish"]),
+        )
+        rejected(
+            "exceeds policy limit",
+            lambda item: reseal_policy(item, max_transitions=0),
+        )
+        rejected(
+            "policy stages changed",
+            lambda item: reseal_policy(item, transitions="none"),
+        )
+        rejected(
+            "policy limit changed",
+            lambda item: reseal_policy(item, max_transitions=2),
+        )
+        rejected(
+            "policy stage changed",
+            lambda item: reseal_policy(item, transitions=["bare"]),
+        )
+        rejected(
+            "policy order changed",
+            lambda item: reseal_policy(
+                item,
+                transitions=[
+                    {
+                        "sequence": 2,
+                        "next_turn_ref": next_turn_ref,
+                        "next_command_digest": next_command_digest,
+                    }
+                ],
+            ),
+        )
+        rejected(
+            "policy stage changed",
+            lambda item: reseal_policy(
+                item,
+                allowed_agent_roles=["verifier", "publisher"],
+                allowed_step_prefixes=["verify", "publish"],
+                transitions=[
+                    {
+                        "sequence": 1,
+                        "next_turn_ref": {
+                            "step_id": "publish",
+                            "agent_role": "publisher",
+                        },
+                        "next_command_digest": next_command_digest,
+                    }
+                ],
+            ),
+        )
+        rejected(
+            "command policy changed",
+            lambda item: reseal_policy(
+                item,
+                transitions=[
+                    {
+                        "sequence": 1,
+                        "next_turn_ref": next_turn_ref,
+                        "next_command_digest": "b" * 64,
+                    }
+                ],
+            ),
+        )
+        rejected(
+            "policy is not authorized",
+            lambda item: reseal_policy(item, note="unauthorized"),
+        )
+        rejected(
+            "source receipt changed",
+            lambda item: authorization(item)["receipt"].__setitem__(
+                "session_id",
+                new_uuid(),
+            ),
+        )
+        rejected(
+            "receipt digest changed",
+            lambda item: authorization(item).__setitem__(
+                "receipt_sha256",
+                "a" * 64,
+            ),
+        )
+
+        receipt = invalidate(copy.deepcopy(base), "durable-accepted")
+        assert receipt["prior_command_id"] == base["prior_command_id"]
+        replayed = invalidate(copy.deepcopy(base), "durable-accepted")
+        assert replayed["invalidation_id"] == receipt["invalidation_id"]
+        assert (
+            service.store.dispatch_invalidation_by_key("durable-accepted")[
+                "invalidation_id"
+            ]
+            == receipt["invalidation_id"]
+        )
+        with pytest.raises(ConflictError, match="idempotency key was reused"):
+            invalidate(
+                {**copy.deepcopy(base), "reason": "another reason"},
+                "durable-accepted",
+            )
+        with pytest.raises(ConflictError, match="idempotency key was reused"):
+            service.store.dispatch_invalidation_by_key_and_digest(
+                "durable-accepted",
+                current.session_id,
+                "b" * 64,
+            )
+    finally:
+        service.close()
+
+
+def test_durable_dispatch_invalidations_require_a_quiescent_anchor(
+    tmp_path: Path,
+) -> None:
+    service, current, policy, next_turn_ref, next_command_digest = (
+        _transition_fixture(tmp_path)
+    )
+    base = _managed_transition_payload(
+        service,
+        current.session_id,
+        policy,
+        next_turn_ref,
+        next_command_digest,
+    )
+
+    def invalidate(key: str) -> dict[str, object]:
+        authorization = base["authorization"]
+        assert isinstance(authorization, dict)
+        return service.store.create_dispatch_invalidation(
+            current.session_id,
+            reason=str(base["reason"]),
+            authorization=authorization,
+            request_digest=normalized_digest(base),
+            idempotency_key=key,
+            prior_command_id=str(base["prior_command_id"]),
+            next_turn_ref=base["next_turn_ref"],
+            authorization_digest=normalized_digest(authorization),
+        )
+
+    try:
+        service.store.update_session(current.session_id, attention="working")
+        with pytest.raises(ConflictError, match="requires quiescence"):
+            invalidate("quiescence-working")
+        service.store.update_session(current.session_id, attention="idle")
+
+        queued = service.store.enqueue_command(
+            current.session_id,
+            "message",
+            {"text": "Queued after the anchor."},
+            "queued-after-anchor",
+        )
+        with pytest.raises(ConflictError, match="has an active command"):
+            invalidate("quiescence-active")
+
+        service.store.resolve_command(queued.command_id, "cancelled", {})
+        with pytest.raises(ConflictError, match="is not latest"):
+            invalidate("quiescence-latest")
+    finally:
+        service.close()
+
+
+def test_contract_adoption_rejects_untyped_or_retargeted_envelopes(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "adoption-repo"
+    repository(workspace)
+    service = HarnessService(
+        paths(tmp_path / "adoption-state"),
+        worker_manager=Workers(),
+    )
+    external_ref = {"orchestrator": "p13i/machines/proof", "job_id": "job-7"}
+    try:
+        session = service.create_session(
+            {
+                "workspace": str(workspace),
+                "direct": True,
+                "execution_profile": "unattended",
+            }
+        )
+        base = machines_session_payload(workspace, external_ref)
+        base.update(
+            {
+                "permission_mode": "approval",
+                "authorization": {"schema": "unverified-placeholder"},
+            }
+        )
+
+        def rejected(message: str, **overrides: object) -> None:
+            payload = copy.deepcopy(base)
+            payload.update(overrides)
+            with pytest.raises(ValueError, match=message):
+                service.adopt_session_contract(
+                    session.session_id,
+                    payload,
+                    idempotency_key="adopt",
+                )
+
+        with pytest.raises(ValueError, match="requires an idempotency key"):
+            service.adopt_session_contract(
+                session.session_id,
+                copy.deepcopy(base),
+                idempotency_key="",
+            )
+        rejected("workspace does not match", workspace=str(tmp_path))
+        rejected("direct must be boolean", direct="yes")
+        rejected("cannot change worktree mode", direct=False)
+        rejected(
+            "reserved for p13i/machines",
+            external_ref={"orchestrator": "operator", "job_id": "job-7"},
+        )
+        rejected("constraints must be an array", constraints="one")
+        rejected("predicates must be an array", predicates="one")
+        rejected("milestones must be an array", milestones="one")
+        rejected("budgets must be an object", budgets=[])
+        rejected("permitted_providers must be an array", permitted_providers="claude")
+        rejected("permitted_efforts must be an array", permitted_efforts="low")
+        rejected("unsupported permission mode", permission_mode="root")
+        rejected("requires typed authorization", authorization=[])
+    finally:
+        service.close()
+
+
+def test_session_creation_requires_typed_goal_collections(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "typed-repo"
+    repository(workspace)
+    service = HarnessService(
+        paths(tmp_path / "typed-state"),
+        worker_manager=Workers(),
+    )
+    try:
+        for field, message in (
+            ("milestones", "milestones must be an array"),
+            ("permitted_providers", "permitted_providers must be an array"),
+            ("permitted_efforts", "permitted_efforts must be an array"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                service.create_session(
+                    {
+                        "workspace": str(workspace),
+                        "direct": True,
+                        "goal": "Prove the run.",
+                        field: "not-an-array",
+                    }
+                )
+    finally:
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_daemon_background_loops_absorb_faults_between_intervals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[BaseException] = []
+
+    class FaultyService:
+        def __init__(self) -> None:
+            self.paths = paths(tmp_path / "state")
+            self.store = object()
+
+        def supervise_workers(self) -> None:
+            raise RuntimeError("supervision failed")
+
+        def record_worker_supervision_failure(
+            self,
+            error: BaseException,
+        ) -> None:
+            recorded.append(error)
+
+    def failing_publish(*unused_args: object) -> None:
+        raise OSError("publish failed")
+
+    intervals: list[float] = []
+
+    async def interrupted_sleep(seconds: float) -> None:
+        intervals.append(seconds)
+        raise asyncio.CancelledError
+
+    service = FaultyService()
+    monkeypatch.setattr(api_module, "publish_all", failing_publish)
+    monkeypatch.setattr(api_module.asyncio, "sleep", interrupted_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await api_module._sync_loop(service)
+    with pytest.raises(asyncio.CancelledError):
+        await api_module._supervision_loop(service)
+
+    assert intervals == [30, 1]
+    assert [str(item) for item in recorded] == ["supervision failed"]
+
+
 @pytest.mark.asyncio
 async def test_api_stream_emits_existing_events_and_heartbeat(
     monkeypatch: pytest.MonkeyPatch,
@@ -3049,6 +4109,13 @@ async def test_managed_contract_adoption_preserves_creation_replay_and_exact_uui
             json=adoption_payload,
         )
         assert (await replay.json())["adoption"] == adopted["adoption"]
+        reused_key = await client.post(
+            "/v1/sessions/" + session_id + "/contract-adoptions",
+            headers=adoption_headers,
+            json={**adoption_payload, "name": "Retargeted SRE"},
+        )
+        assert reused_key.status == 409
+        assert "idempotency key was reused" in await reused_key.text()
         first_epoch_goal = service.store.goal_for_session(session_id)
         assert first_epoch_goal is not None
 

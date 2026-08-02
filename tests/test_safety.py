@@ -97,6 +97,18 @@ def test_per_command_limits_only_tighten_the_effective_envelope() -> None:
     for value in (math.nan, math.inf, -math.inf):
         with pytest.raises(ValueError, match="must be finite"):
             tighten_limits(base, {"binding_ceiling": value})
+    with pytest.raises(ValueError, match="max_seconds must be an integer"):
+        tighten_limits(base, {"max_seconds": 300.5})
+    with pytest.raises(ValueError, match="max_attempts must be an integer"):
+        tighten_limits(base, {"max_attempts": True})
+    with pytest.raises(ValueError, match="max_seconds is below its minimum"):
+        tighten_limits(base, {"max_seconds": 0})
+    with pytest.raises(ValueError, match="binding_ceiling must be numeric"):
+        tighten_limits(base, {"binding_ceiling": "90"})
+    with pytest.raises(ValueError, match="max_dollars must be numeric"):
+        tighten_limits(base, {"max_dollars": True})
+    with pytest.raises(ValueError, match="must not be negative"):
+        tighten_limits(base, {"binding_ceiling": -1})
 
 
 def test_invalid_provider_cost_is_not_exact_or_chargeable() -> None:
@@ -355,6 +367,7 @@ def test_invalid_provider_usage_retains_conservative_estimates() -> None:
                 "input_tokens": -1,
                 "output_tokens": 1,
                 "total_tokens": math.nan,
+                "unrelated_metric": math.inf,
             },
         )
     )

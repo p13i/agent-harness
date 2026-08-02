@@ -406,6 +406,30 @@ def test_typed_sdk_covers_the_complete_control_plane(
             idempotency_key="promote-24h",
         )
         assert promotion["promotion"]["promotion_id"] == "promotion-1"
+        unconstrained = await client.promote_goal(
+            "session-1",
+            from_goal_id="goal-1",
+            stage="tier-48h",
+            objective="Prove the 48-hour tier.",
+            predicates=[{"type": "report", "subject": "tier-48h"}],
+            milestones=[
+                {
+                    "milestone_id": "tier-48h",
+                    "title": "Prove tier 48h",
+                    "dependencies": [],
+                    "predicates": [{"type": "report", "subject": "tier-48h"}],
+                }
+            ],
+            budgets={"seconds": 172_800},
+            authorization={
+                "schema": ("p13i/agent-harness/goal-promotion-authorization/v1"),
+                "receipt": {"scope": "test"},
+                "receipt_sha256": "a" * 64,
+                "next_goal_contract_digest": "c" * 64,
+            },
+            idempotency_key="promote-48h",
+        )
+        assert unconstrained["promotion"]["promotion_id"] == "promotion-1"
         adoption = await client.adopt_session_contract(
             "session-1",
             tmp_path,

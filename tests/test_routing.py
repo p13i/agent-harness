@@ -82,12 +82,32 @@ def test_routing_rejects_malformed_binding_usage(binding: float) -> None:
         route([candidate("codex", binding=binding)])
 
 
+def test_routing_prefers_an_independent_reviewer() -> None:
+    decision = route(
+        [
+            candidate("claude", binding=50),
+            candidate("kimi", binding=50),
+        ],
+        workload="code review",
+    )
+    assert decision.provider == "kimi"
+
+
 @pytest.mark.parametrize("budget", [math.nan, math.inf, -math.inf])
 def test_routing_rejects_nonfinite_metered_budget(budget: float) -> None:
     with pytest.raises(ValueError, match="must be finite"):
         route(
             [candidate("codex", binding=10, credits=True, cost_reporting=True)],
             metered_budget=budget,
+        )
+
+
+@pytest.mark.parametrize("ceiling", [math.nan, math.inf, -math.inf])
+def test_routing_rejects_a_nonfinite_binding_ceiling(ceiling: float) -> None:
+    with pytest.raises(ValueError, match="binding ceiling must be finite"):
+        route(
+            [candidate("codex", binding=10)],
+            binding_ceiling=ceiling,
         )
 
 
@@ -455,6 +475,61 @@ def test_scheduler_enforces_capacity_concurrency_model_and_effort(
     asyncio.run(scenario())
 
 
+def test_scheduler_fails_closed_on_unusable_budgets_and_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        scheduler._usage_cache = {
+            "codex": UsageSnapshot(
+                provider="codex",
+                binding_percent=math.nan,
+                credits_engaged=False,
+                payload={},
+            )
+        }
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        current = session(tmp_path)
+        with pytest.raises(ValueError, match="metered budget must be finite"):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                metered_budget=math.nan,
+            )
+        with pytest.raises(ValueError, match="binding ceiling must be finite"):
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                binding_ceiling=math.inf,
+            )
+        unbound = await scheduler.choose(
+            current,
+            workload="implementation",
+            required_capabilities=frozenset(),
+        )
+        assert unbound.provider == "codex"
+        assert unbound.binding_percent is None
+
+        monkeypatch.setattr(store, "active_goal_command_count", lambda goal_id: 3)
+        monkeypatch.setattr(
+            store,
+            "command_envelope",
+            lambda command_id: {
+                "command_id": command_id,
+                "provider": "codex",
+                "state": "complete",
+            },
+        )
+        assert scheduler._active_other_goal_count("goal-1", "command-1") == 3
+        store.close()
+
+    asyncio.run(scenario())
+
+
 def test_scheduler_reuses_active_status_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -522,6 +597,7 @@ def test_scheduler_helpers_normalize_fallback_values() -> None:
     assert _select_effort(medium, "") == "medium"
     no_efforts = ProviderModel("none", "None", (), None)
     assert _select_effort(no_efforts, "") == ""
+    assert _select_effort(no_efforts, "", frozenset({"high"})) is None
     assert _fallback_models("codex")[0].model_id == "default"
 
     stale = datetime.datetime.now(datetime.UTC)

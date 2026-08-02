@@ -3000,3 +3000,164 @@ def _run(command: list[str]) -> None:
         text=True,
         check=True,
     )
+
+
+TRANSITION_AUTHORIZATION_SCHEMA = (
+    "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+)
+
+
+def test_proof_snapshot_flags_each_truncated_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    original_rows = proof_module._rows
+
+    def padded_rows(tables: dict, name: str) -> list[dict]:
+        if name == "dispatch_transition_ledger":
+            return [{"invalidation_id": "invalidation-1"}]
+        if name == "authorization_receipts":
+            return [
+                {
+                    "schema": TRANSITION_AUTHORIZATION_SCHEMA,
+                    "operation_id": "invalidation-2",
+                },
+                {"schema": "p13i/agent-harness/goal-promotion-authorization/v1"},
+            ]
+        if name == "dispatch_invalidations":
+            return [{"invalidation_id": "invalidation-3"}]
+        return original_rows(tables, name)
+
+    monkeypatch.setattr(proof_module, "_rows", padded_rows)
+    monkeypatch.setattr(proof_module, "MAX_TRANSITION_LEDGER_RECORDS", 0)
+    monkeypatch.setattr(proof_module, "MAX_PROOF_RECORDS", 0)
+
+    snapshot = proof_snapshot(store, created.session_id)
+
+    assert "dispatch_transition_ledger" in snapshot["truncated"]
+    assert "authorization_receipts" in snapshot["truncated"]
+    assert "dispatch_invalidations" in snapshot["truncated"]
+    assert snapshot["complete"] is False
+    store.close()
+
+
+def test_proof_authorization_receipts_tolerate_an_absent_receipt() -> None:
+    projected = proof_module._proof_authorization_receipt(
+        {
+            "payload_json": json.dumps({"schema": "other", "receipt": "opaque"}),
+            "authorization_digest": "a" * 64,
+            "receipt_sha256": "b" * 64,
+        },
+        {},
+    )
+
+    assert projected["receipt_digest"] == proof_module._digest({})
+    assert projected["receipt_digest_valid"] is False
+
+
+def test_proof_transition_policy_projection_rejects_malformed_stages() -> None:
+    def policy(transitions: object) -> dict:
+        return {
+            "policy_sha256": "c" * 64,
+            "schema": "p13i/agent-harness/dispatch-generation-transition-policy/v1",
+            "session_id": "session-1",
+            "epoch_id": "epoch-1",
+            "payload_json": json.dumps(
+                {
+                    "schema": (
+                        "p13i/agent-harness/"
+                        "dispatch-generation-transition-policy/v1"
+                    ),
+                    "session_id": "session-1",
+                    "epoch_id": "epoch-1",
+                    "external_ref": {"orchestrator": "machines"},
+                    "allowed_agent_roles": ["verifier"],
+                    "allowed_step_prefixes": ["verify"],
+                    "max_transitions": 1,
+                    "transitions": transitions,
+                }
+            ),
+        }
+
+    valid_stage = {
+        "sequence": 1,
+        "next_turn_ref": {"step_id": "verify", "agent_role": "verifier"},
+        "next_command_digest": "d" * 64,
+    }
+
+    assert proof_module._proof_dispatch_transition_policy(policy([valid_stage]))[
+        "policy_contract_valid"
+    ]
+    assert not proof_module._proof_dispatch_transition_policy(policy(["bare"]))[
+        "policy_contract_valid"
+    ]
+    assert not proof_module._proof_dispatch_transition_policy(
+        policy([{**valid_stage, "sequence": 2}])
+    )["policy_contract_valid"]
+    assert not proof_module._proof_dispatch_transition_policy(
+        policy([{**valid_stage, "next_turn_ref": {"agent_role": "verifier"}}])
+    )["policy_contract_valid"]
+
+
+def test_proof_transition_ledger_tracks_reservation_and_sequence_gaps() -> None:
+    def ledger_row(sequence: int, state: str) -> dict:
+        return {
+            "invalidation_id": "invalidation-" + str(sequence),
+            "session_id": "session-1",
+            "goal_id": "goal-1",
+            "epoch_id": "epoch-1",
+            "policy_sha256": "c" * 64,
+            "transition_sequence": sequence,
+            "state": state,
+            "reserved_command_id": "command-" + str(sequence),
+            "consumed_command_id": "",
+            "next_turn_ref_json": json.dumps(
+                {"step_id": "verify", "agent_role": "verifier"}
+            ),
+            "created_at": "2026-08-02T00:0" + str(sequence) + ":00+00:00",
+        }
+
+    ledger = proof_module._proof_dispatch_transition_ledger(
+        [ledger_row(1, "reserved"), ledger_row(3, "reserved")],
+        [],
+        [],
+    )
+
+    assert ledger["complete"] is False
+    assert [item["state"] for item in ledger["receipts"]] == [
+        "reserved",
+        "reserved",
+    ]
+
+
+def test_proof_route_admissibility_requires_bounded_binding_usage() -> None:
+    bound = {"provider": "codex", "error_present": False}
+
+    assert not proof_module._usage_admissible_at_route({}, bound, False, True)
+    assert not proof_module._usage_admissible_at_route(
+        {},
+        {"error_present": True},
+        True,
+        True,
+    )
+    assert not proof_module._usage_admissible_at_route(
+        {"binding_percent": True},
+        bound,
+        True,
+        True,
+    )
+    assert not proof_module._usage_admissible_at_route(
+        {"binding_percent": 95.0},
+        bound,
+        True,
+        True,
+    )
+    assert proof_module._usage_admissible_at_route(
+        {"binding_percent": 10.0, "credits_engaged": False},
+        bound,
+        True,
+        True,
+    )

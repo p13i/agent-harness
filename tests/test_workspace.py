@@ -1,9 +1,11 @@
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 from test_support import session
 
+import agent_harness.workspace as workspace_module
 from agent_harness.blobs import BlobStore
 from agent_harness.errors import HarnessError
 from agent_harness.workspace import (
@@ -12,7 +14,9 @@ from agent_harness.workspace import (
     _git_input,
     checkpoint_workspace,
     create_worktree,
+    remove_worktree,
     restore_checkpoint,
+    workspace_summary,
 )
 
 
@@ -103,3 +107,120 @@ def test_workspace_rejects_collisions_mismatches_and_git_failures(
         _git_bytes(outside, "diff")
     with pytest.raises(HarnessError):
         _git_input(source, b"not a patch", "apply", "-")
+
+
+def test_create_worktree_removes_its_worktree_when_the_ref_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    repository(source)
+    current = session(source)
+    original_git = workspace_module._git
+
+    def failing_update_ref(
+        workspace: Path,
+        *arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
+        if arguments[0] == "update-ref":
+            raise HarnessError("E_GIT", "update-ref failed", status=409)
+        return original_git(workspace, *arguments)
+
+    monkeypatch.setattr(workspace_module, "_git", failing_update_ref)
+    with pytest.raises(HarnessError, match="update-ref failed"):
+        create_worktree(source, tmp_path / "worktrees", current.session_id)
+
+    monkeypatch.undo()
+    assert not (tmp_path / "worktrees" / current.session_id).exists()
+    worktrees = _git(source, "worktree", "list").stdout
+    assert current.session_id not in worktrees
+
+
+def test_worktree_recovery_binds_its_reference_to_the_recovered_head(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    repository(source)
+    current = session(source)
+    destination_root = tmp_path / "worktrees"
+    destination = create_worktree(source, destination_root, current.session_id)
+    reference = "refs/agent-harness/" + current.session_id
+    head = _git(source, "rev-parse", "HEAD").stdout.strip()
+    _git(source, "update-ref", "-d", reference)
+
+    recovered = create_worktree(source, destination_root, current.session_id)
+
+    assert recovered == destination
+    assert _git(source, "rev-parse", "--verify", reference).stdout.strip() == head
+
+    (source / "tracked.txt").write_text("second\n", encoding="utf-8")
+    git(source, "add", "tracked.txt")
+    git(source, "commit", "-qm", "second")
+    _git(
+        source,
+        "update-ref",
+        reference,
+        _git(source, "rev-parse", "HEAD").stdout.strip(),
+    )
+    with pytest.raises(HarnessError, match="does not match its worktree"):
+        create_worktree(source, destination_root, current.session_id)
+
+    remove_worktree(source, destination, current.session_id)
+
+    assert not destination.exists()
+    with pytest.raises(HarnessError):
+        _git(source, "rev-parse", "--verify", reference)
+    with pytest.raises(ValueError, match="direct workspace"):
+        remove_worktree(source, source, current.session_id)
+
+
+def test_worktree_recovery_rejects_a_foreign_workspace_root(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    repository(source)
+    current = session(source)
+    nested_root = source / "nested"
+    (nested_root / current.session_id).mkdir(parents=True)
+
+    with pytest.raises(HarnessError, match="belongs to another workspace"):
+        create_worktree(source, nested_root, current.session_id)
+
+
+def test_workspace_summary_truncates_an_oversized_diff(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    repository(source)
+    (source / "tracked.txt").write_text(
+        "".join("line " + str(index) + "\n" for index in range(20_000)),
+        encoding="utf-8",
+    )
+
+    summary = workspace_summary(source)
+    payload = json.loads(summary.removeprefix("```json\n").removesuffix("\n```"))
+
+    assert payload["diff_truncated"] is True
+    assert len(payload["diff"]) == 100_000
+
+
+def test_untracked_checkpoint_rejects_links_that_resolve_outside(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    repository(source)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_text("outside\n", encoding="utf-8")
+    (source / "inner").symlink_to("../outside")
+    git(source, "add", "inner")
+    git(source, "commit", "-qm", "inner link")
+    (source / "link").symlink_to("inner/file")
+
+    with pytest.raises(HarnessError, match="link escapes the workspace"):
+        checkpoint_workspace(
+            session(source),
+            BlobStore(tmp_path / "blobs"),
+            sequence=1,
+            provider="codex",
+            native_session_id="native",
+            context_text="context",
+        )

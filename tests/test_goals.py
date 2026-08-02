@@ -146,6 +146,95 @@ def test_goal_policy_and_promoted_milestones_fail_closed() -> None:
         create_goal(session_id, "invalid", budgets={"seconds": float("inf")})
     with pytest.raises(ValueError, match="finite"):
         create_goal(session_id, "invalid", budgets={"seconds": float("nan")})
+    with pytest.raises(ValueError, match="max_concurrency must be an integer"):
+        create_goal(session_id, "invalid", max_concurrency=True)
+    with pytest.raises(ValueError, match="completion policy does not match"):
+        create_goal(session_id, "invalid", completion_policy="never")
+    with pytest.raises(ValueError, match="unsupported goal incident policy"):
+        create_goal(session_id, "invalid", incident_policy="ignore")
+    with pytest.raises(ValueError, match="cannot contain whitespace"):
+        create_goal(session_id, "invalid", permitted_providers=("cla ude",))
+
+
+def test_promoted_milestones_reject_rewritten_or_removed_stages() -> None:
+    session_id = new_uuid()
+    first_stage = {
+        "milestone_id": "first",
+        "title": "First",
+        "dependencies": [],
+        "predicates": [{"type": "first", "outcome": "passed"}],
+    }
+    later_stage = {
+        "milestone_id": "later",
+        "title": "Later",
+        "dependencies": ["first"],
+        "predicates": [{"type": "later", "outcome": "passed"}],
+    }
+    prior = create_goal(session_id, "first", milestones=(first_stage,))
+
+    rewritten = create_goal(
+        session_id,
+        "later",
+        milestones=({**first_stage, "title": "Rewritten"}, later_stage),
+    )
+    with pytest.raises(ValueError, match="cannot rewrite a milestone"):
+        promoted_milestones(prior, rewritten)
+
+    replaced = create_goal(
+        session_id,
+        "later",
+        milestones=({**later_stage, "dependencies": []},),
+    )
+    with pytest.raises(ValueError, match="cannot remove a milestone"):
+        promoted_milestones(prior, replaced)
+
+    unchanged = create_goal(session_id, "later", milestones=(first_stage,))
+    with pytest.raises(ValueError, match="requires a later milestone"):
+        promoted_milestones(prior, unchanged)
+
+
+def test_milestone_definitions_fail_closed_on_malformed_input() -> None:
+    session_id = new_uuid()
+    valid = {
+        "milestone_id": "first",
+        "title": "First",
+        "dependencies": [],
+        "predicates": [{"type": "first", "outcome": "passed"}],
+    }
+    cases = (
+        ("must be objects", ("not-an-object",)),
+        ("identifier is invalid", ({**valid, "milestone_id": "two words"},)),
+        ("identifier is duplicated", (valid, valid)),
+        ("title is required", ({**valid, "title": "  "},)),
+        ("dependencies must be a list", ({**valid, "dependencies": "first"},)),
+        ("predicates must be a list", ({**valid, "predicates": "later"},)),
+        ("reference prior milestones", ({**valid, "dependencies": ["absent"]},)),
+        ("typed evidence predicates", ({**valid, "predicates": []},)),
+        ("typed evidence predicates", ({**valid, "predicates": ["bare"]},)),
+    )
+    for message, milestones in cases:
+        with pytest.raises(ValueError, match=message):
+            create_goal(session_id, "invalid", milestones=milestones)
+
+
+def test_boolean_budget_limits_are_never_enforced() -> None:
+    goal = replace(
+        create_goal(new_uuid(), "bounded work"),
+        budgets={"tool_calls": True},
+    )
+    consumption = GoalConsumption(
+        turns=0,
+        tokens=0.0,
+        context_tokens=0.0,
+        output_tokens=0.0,
+        tool_calls=9.0,
+        attempts=0.0,
+        child_agents=0.0,
+        dollars=0.0,
+        elapsed_seconds=0.0,
+    )
+
+    assert exhausted_budget(goal, consumption) == ""
 
 
 def test_promoted_predicates_are_immutable_ordered_and_unique() -> None:

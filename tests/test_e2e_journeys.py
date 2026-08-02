@@ -20,6 +20,7 @@ import pytest
 import agent_harness.reconciliation as reconciliation_module
 import agent_harness.safety as safety_module
 import agent_harness.worker as worker_module
+import agent_harness.workspace_state as workspace_state_module
 from agent_harness import child_gate
 from agent_harness import process_control as process_control_module
 from agent_harness.blobs import BlobStore
@@ -4450,19 +4451,22 @@ def test_reconciliation_workspace_inspection_defenses(
     outside.mkdir()
     (outside / "file").write_text("outside\n", encoding="utf-8")
     (workspace / "outside-directory").symlink_to(outside)
-    original_git = reconciliation_module._git
+    original_git = workspace_state_module._git
 
     def unsafe_paths(path: Path, *arguments: str) -> bytes:
         if arguments[0] == "ls-files":
-            return b"../escape\0missing\0outside-directory/file\0"
+            return (
+                b"../escape\0missing\0provider-effect.fifo\0"
+                b"outside-directory/file\0"
+            )
         return original_git(path, *arguments)
 
-    monkeypatch.setattr(reconciliation_module, "_git", unsafe_paths)
+    monkeypatch.setattr(workspace_state_module, "_git", unsafe_paths)
     second_digest, unused_summary = inspect_workspace(workspace)
     del unused_summary
     assert len(second_digest) == 64
 
-    monkeypatch.setattr(reconciliation_module, "_git", original_git)
+    monkeypatch.setattr(workspace_state_module, "_git", original_git)
     monkeypatch.setattr(
         reconciliation_module.subprocess,
         "run",
@@ -4477,6 +4481,149 @@ def test_reconciliation_workspace_inspection_defenses(
         "full",
         approved=False,
     )
+
+
+def test_workspace_inspection_rejects_material_that_moves_underneath_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _repository(workspace)
+
+    with pytest.raises(HarnessError, match="Git operation failed"):
+        workspace_state_module._git(tmp_path / "not-a-repository", "status")
+
+    with pytest.raises(HarnessError, match="changed during inspection"):
+        workspace_state_module._special_workspace_objects(tmp_path / "absent")
+
+    class UnstableEntry:
+        def __init__(self, path: Path) -> None:
+            self.name = path.name
+            self.path = str(path)
+
+        def stat(self, *, follow_symlinks: bool = True) -> object:
+            del follow_symlinks
+            raise OSError("workspace object disappeared")
+
+    monkeypatch.setattr(
+        workspace_state_module.os,
+        "scandir",
+        lambda directory: [UnstableEntry(Path(directory) / "vanished")],
+    )
+    with pytest.raises(HarnessError, match="changed during inspection"):
+        workspace_state_module._special_workspace_objects(workspace)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_discovery_reuses_and_guards_its_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    try:
+        manager, record, unused_command = await _ambiguous_reconciliation(rig)
+        del unused_command
+        assert record.audit["discovery_checkpoint_id"]
+
+        reused = await manager._ensure_discovery_checkpoint(record)
+
+        assert reused.audit["discovery_checkpoint_id"] == (
+            record.audit["discovery_checkpoint_id"]
+        )
+    finally:
+        rig.close()
+
+    for message, digests in (
+        ("changed before reconciliation discovery", ["moved"]),
+        ("changed during reconciliation discovery", [None, "moved"]),
+    ):
+        root = tmp_path / ("discovery-" + str(len(digests)))
+        root.mkdir()
+        discovery_rig = JourneyRig(root)
+        try:
+            manager, record, unused_command = await _ambiguous_reconciliation(
+                discovery_rig
+            )
+            del unused_command
+            stripped = replace(
+                record,
+                audit={
+                    key: value
+                    for key, value in record.audit.items()
+                    if key != "discovery_checkpoint_id"
+                },
+            )
+            original_inspect = reconciliation_module.inspect_workspace
+            remaining = list(digests)
+
+            def drifting_inspect(workspace: Path) -> tuple[str, str]:
+                digest, summary = original_inspect(workspace)
+                if remaining:
+                    replacement = remaining.pop(0)
+                    if replacement is not None:
+                        return replacement, summary
+                return digest, summary
+
+            monkeypatch.setattr(
+                reconciliation_module,
+                "inspect_workspace",
+                drifting_inspect,
+            )
+            with pytest.raises(ConflictError, match=message):
+                await manager._ensure_discovery_checkpoint(stripped)
+            monkeypatch.undo()
+        finally:
+            discovery_rig.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_resolution_rejects_material_that_moves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for decision, message, drift_index in (
+        (
+            ReconciliationDecision.ACCEPT_CURRENT,
+            "during reconciliation resolution checkpoint",
+            1,
+        ),
+        (
+            ReconciliationDecision.RESTORE_PRE_TURN,
+            "during restored resolution checkpoint",
+            2,
+        ),
+    ):
+        root = tmp_path / ("resolution-" + str(drift_index))
+        root.mkdir()
+        rig = JourneyRig(root)
+        try:
+            manager, record, unused_command = await _ambiguous_reconciliation(rig)
+            del unused_command
+            original_inspect = reconciliation_module.inspect_workspace
+            observed = {"count": 0}
+
+            def drifting_inspect(workspace: Path) -> tuple[str, str]:
+                digest, summary = original_inspect(workspace)
+                observed["count"] += 1
+                if observed["count"] > drift_index:
+                    return "moved-material-digest", summary
+                return digest, summary
+
+            monkeypatch.setattr(
+                reconciliation_module,
+                "inspect_workspace",
+                drifting_inspect,
+            )
+            with pytest.raises(ConflictError, match=message):
+                await manager.resolve(
+                    record.reconciliation_id,
+                    decision,
+                    record.current_workspace_digest,
+                    approved=True,
+                )
+            monkeypatch.undo()
+        finally:
+            rig.close()
 
 
 async def _ambiguous_reconciliation(

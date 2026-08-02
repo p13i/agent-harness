@@ -55,6 +55,11 @@ def test_blob_store_round_trip_and_validation(tmp_path: Path) -> None:
     with pytest.raises(NotFoundError):
         store.get("0" * 64)
 
+    store.path(digest).chmod(0o600)
+    store.path(digest).write_bytes(b"tampered")
+    with pytest.raises(ConflictError, match="does not match its address"):
+        store.get(digest)
+
 
 def test_blob_store_removes_temporary_file_after_replace_failure(
     tmp_path: Path,
