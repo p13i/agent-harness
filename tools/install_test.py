@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shlex
 import subprocess
 import sys
 
@@ -697,6 +698,10 @@ def test_selector_contract_and_default_paths(tmp_path: Path) -> None:
     )
     assert content.startswith("#!/bin/sh\n")
     assert "unset RUNFILES_DIR RUNFILES_MANIFEST_FILE" in content
+    assert "export PYTHONDONTWRITEBYTECODE=1" in content
+    assert content.index("export PYTHONDONTWRITEBYTECODE=1") < content.index(
+        "\nexec "
+    )
     assert shlex_quote(str(executable)) in content
     assert default_bundle_root(tmp_path) == (
         tmp_path / ".local" / "lib" / "p13i-agent-harness"
@@ -855,6 +860,95 @@ def test_executable_validation_reports_launch_and_exit_failures(
         install_module.validate_executable(executable)
 
 
+def test_executable_validation_suppresses_bundle_bytecode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "agent-harness"
+    executable.write_text("content", encoding="utf-8")
+    captured_environment: dict[str, str] = {}
+
+    def accepted(
+        *unused: object,
+        **named: object,
+    ) -> subprocess.CompletedProcess[str]:
+        del unused
+        environment = named.get("env")
+        assert isinstance(environment, dict)
+        captured_environment.update(environment)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(install_module.subprocess, "run", accepted)
+
+    install_module.validate_executable(executable)
+
+    assert captured_environment["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_installed_python_bundle_remains_immutable_across_execution_surfaces(
+    tmp_path: Path,
+) -> None:
+    source = _python_source_executable(tmp_path / "source")
+    bundle = create_bundle(source, tmp_path / "bundles")
+    unguarded_environment = os.environ.copy()
+    unguarded_environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    unguarded_environment.pop("PYTHONPYCACHEPREFIX", None)
+
+    install_module.validate_executable(bundle.executable)
+    assert verify_bundle(bundle.root) == bundle
+
+    selector = tmp_path / "bin" / "agent-harness"
+    selector.parent.mkdir()
+    selector.write_text(
+        launcher(bundle.executable, bundle.build_id),
+        encoding="utf-8",
+    )
+    selector.chmod(0o755)
+    selector_result = subprocess.run(
+        ["/bin/sh", str(selector), "--help"],
+        env=unguarded_environment,
+        check=False,
+    )
+    assert selector_result.returncode == 0
+    assert verify_bundle(bundle.root) == bundle
+
+    unit = render_unit(
+        UnitConfiguration(
+            executable=bundle.executable,
+            state_dir=tmp_path / "state",
+            build_id=bundle.build_id,
+        )
+    )
+    environment_line = next(
+        line for line in unit.splitlines() if line.startswith("Environment=")
+    )
+    environment_name, separator, environment_value = environment_line[
+        len("Environment=") :
+    ].partition("=")
+    assert separator == "="
+    service_environment = unguarded_environment.copy()
+    service_environment[environment_name] = environment_value
+    command_line = next(
+        line for line in unit.splitlines() if line.startswith("ExecStart=")
+    )
+    service_result = subprocess.run(
+        shlex.split(command_line[len("ExecStart=") :]),
+        env=service_environment,
+        check=False,
+    )
+    assert service_result.returncode == 0
+    assert verify_bundle(bundle.root) == bundle
+
+    control_result = subprocess.run(
+        [str(bundle.executable), "--help"],
+        env=unguarded_environment,
+        check=False,
+    )
+    assert control_result.returncode == 0
+    with pytest.raises(BundleError, match="undeclared file"):
+        verify_bundle(bundle.root)
+
+
 def test_installer_atomic_write_removes_a_failed_temporary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -895,6 +989,10 @@ def test_systemd_unit_is_deterministic_private_and_socket_only(
     assert "UMask=0077" in content
     assert "KillMode=control-group" in content
     assert "Restart=on-failure" in content
+    assert "Environment=PYTHONDONTWRITEBYTECODE=1" in content
+    assert content.index("[Service]\n") < content.index(
+        "Environment=PYTHONDONTWRITEBYTECODE=1"
+    ) < content.index("[Install]\n")
     assert "tcp" not in content.casefold()
     assert unit_metadata(content) == (UNIT_VERSION, "build-one")
     assert unit_metadata("# invalid\n") == (None, "")
@@ -1166,6 +1264,16 @@ def test_service_diagnostics_are_read_only_and_actionable(
     assert [probe.status for probe in installed] == ["pass", "pass", "pass"]
     assert "selects build one" in installed[2].detail
 
+    legacy = manager.unit_path.read_text(encoding="utf-8").replace(
+        "Unit-Version: " + str(UNIT_VERSION),
+        "Unit-Version: 1",
+        1,
+    )
+    manager.unit_path.write_text(legacy, encoding="utf-8")
+    legacy_probe = manager.diagnostics()[2]
+    assert legacy_probe.status == "warning"
+    assert "service install" in legacy_probe.remediation
+
 
 def test_service_diagnostics_report_unavailable_dependencies(
     tmp_path: Path,
@@ -1302,6 +1410,30 @@ def _source_executable(root: Path, identity: str) -> Path:
     (package / "data.txt").write_text(identity + "\n", encoding="utf-8")
     (runfiles / "MANIFEST").write_text(
         "package/data.txt /cache/package/data.txt\n",
+        encoding="utf-8",
+    )
+    return executable
+
+
+def _python_source_executable(root: Path) -> Path:
+    root.mkdir(parents=True)
+    executable = root / "agent-harness"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        + "from pathlib import Path\n"
+        + "import sys\n"
+        + "runfiles = Path(str(Path(__file__)) + '.runfiles')\n"
+        + "sys.path.insert(0, str(runfiles))\n"
+        + "from package import probe\n"
+        + "print(probe.MESSAGE)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    package = Path(str(executable) + ".runfiles") / "package"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "probe.py").write_text(
+        "MESSAGE = 'help'\n",
         encoding="utf-8",
     )
     return executable

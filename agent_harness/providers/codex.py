@@ -108,6 +108,7 @@ class CodexAppServer:
         hook_command = " ".join(
             (
                 shlex.quote(str(Path(sys.executable).resolve())),
+                "-B",
                 shlex.quote(str(script_path)),
                 shlex.quote(str(gate.database)),
                 shlex.quote(gate.command_id),

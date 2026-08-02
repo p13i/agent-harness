@@ -125,6 +125,7 @@ _SAFE_ENVIRONMENT_NAMES = frozenset(
         "LANG",
         "LOGNAME",
         "NO_COLOR",
+        "PYTHONDONTWRITEBYTECODE",
         "SHELL",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",

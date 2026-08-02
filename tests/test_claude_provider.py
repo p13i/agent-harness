@@ -34,14 +34,16 @@ def test_npx_transport_pins_claude_code_package() -> None:
 
     command = transport._build_command()
 
-    assert command[:5] == [
+    assert command[:6] == [
         sys.executable,
         "-I",
+        "-B",
         "-S",
         "-c",
         "import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])",
     ]
-    assert command[5:7] == ["/usr/bin/npx", CLAUDE_CODE_PACKAGE]
+    assert command.index("-B") < command.index("-c")
+    assert command[6:8] == ["/usr/bin/npx", CLAUDE_CODE_PACKAGE]
     assert "--input-format" in command
     assert "stream-json" in command
 

@@ -131,7 +131,15 @@ class NpxClaudeTransport(SubprocessCLITransport):
         command = super()._build_command()
         npx_command = [command[0], CLAUDE_CODE_PACKAGE, *command[1:]]
         launcher = "import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])"
-        return [sys.executable, "-I", "-S", "-c", launcher, *npx_command]
+        return [
+            sys.executable,
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            launcher,
+            *npx_command,
+        ]
 
     async def connect(self) -> None:
         await super().connect()

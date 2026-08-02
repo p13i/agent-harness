@@ -86,6 +86,7 @@ def launcher(
         + "\n"
         "set -eu\n"
         "unset RUNFILES_DIR RUNFILES_MANIFEST_FILE\n"
+        "export PYTHONDONTWRITEBYTECODE=1\n"
         "exec "
         + shlex.quote(str(executable))
         + ' "$@"\n'
@@ -135,6 +136,7 @@ def validate_executable(executable: Path) -> None:
     environment = os.environ.copy()
     environment.pop("RUNFILES_DIR", None)
     environment.pop("RUNFILES_MANIFEST_FILE", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         result = subprocess.run(
             [str(executable), "--help"],

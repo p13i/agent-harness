@@ -13,7 +13,7 @@ import uuid
 
 
 SERVICE_NAME = "p13i-agent-harness.service"
-UNIT_VERSION = 1
+UNIT_VERSION = 2
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -76,6 +76,7 @@ def render_unit(configuration: UnitConfiguration) -> str:
         + "\n"
         + "[Service]\n"
         + "Type=simple\n"
+        + "Environment=PYTHONDONTWRITEBYTECODE=1\n"
         + "ExecStart="
         + executable_argument
         + " --state-dir "

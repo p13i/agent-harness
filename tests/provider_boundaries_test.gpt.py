@@ -190,23 +190,30 @@ def test_provider_base_contract_and_environment(
             "npm_config_package": "ignored",
             "OTHER_SECRET": "ignored",
             "LC_ACCESS_KEY": "ignored",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "CLAUDE_CODE_OAUTH_TOKEN": "claude-oauth",
             "ANTHROPIC_API_KEY": "anthropic",
             "OPENAI_API_KEY": "openai",
         },
     )
     monkeypatch.setattr(base, "trusted_provider_path", lambda: "/bin")
-    assert codex.provider_environment("codex") == {"PATH": "/bin"}
+    assert codex.provider_environment("codex") == {
+        "PATH": "/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
     assert codex.provider_environment("claude") == {
         "PATH": "/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "CLAUDE_CODE_OAUTH_TOKEN": "claude-oauth",
     }
     assert codex.provider_environment("codex", "api") == {
         "PATH": "/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "OPENAI_API_KEY": "openai",
     }
     assert codex.provider_environment("claude", "api") == {
         "PATH": "/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "ANTHROPIC_API_KEY": "anthropic",
     }
 
@@ -564,6 +571,8 @@ def test_codex_child_gate_argv_is_durable(tmp_path: Path) -> None:
     hook = next(value for value in arguments if value.startswith("hooks.PreToolUse="))
     assert "^(Agent|spawn_agent)$" in hook
     assert "child_gate.py" in hook
+    assert " -B " in hook
+    assert hook.index(" -B ") < hook.index("child_gate.py")
     assert str(durable_gate.database) in hook
     assert durable_gate.command_id in hook
     asyncio.run(server.close())
