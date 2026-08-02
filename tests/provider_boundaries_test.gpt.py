@@ -2301,3 +2301,15 @@ def test_kimi_run_turn_reports_a_nonzero_exit_as_a_failed_turn(
     assert [(item.event_type, item.text) for item in seen] == [
         ("turn.failed", "kimi: config.invalid")
     ]
+
+
+def test_selected_redaction_fails_closed_on_a_non_mapping_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        normalize,
+        "redact_observable",
+        lambda unused: ["unexpected"],
+    )
+
+    assert normalize._selected_redacted({"safe": "value"}, {"safe"}) == {}

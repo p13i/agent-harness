@@ -1553,6 +1553,190 @@ def test_dispatch_transition_policy_rejects_malformed_stages(tmp_path: Path) -> 
         validate(policy, current_store=missing_epoch)
 
 
+def test_dispatch_transition_validation_rejects_a_changed_receipt_shape(
+    tmp_path: Path,
+) -> None:
+    created = _owned_session(tmp_path)
+    goal_id = new_uuid()
+    created = replace(created, goal_id=goal_id)
+    next_ref = {"step_id": "step-one", "agent_role": "implementer"}
+    prior_command_id = new_uuid()
+    checkpoint_id = new_uuid()
+    generation_digest = "a" * 64
+    material_digest = "b" * 64
+    command_digest = "c" * 64
+    policy = {
+        "schema": "p13i/agent-harness/dispatch-generation-transition-policy/v1",
+        "session_id": created.session_id,
+        "external_ref": created.external_ref,
+        "epoch_id": "epoch-one",
+        "allowed_agent_roles": ["implementer"],
+        "allowed_step_prefixes": ["step-"],
+        "max_transitions": 1,
+        "transitions": [
+            {
+                "sequence": 1,
+                "next_turn_ref": next_ref,
+                "next_command_digest": command_digest,
+            }
+        ],
+    }
+    policy_digest = normalized_digest(policy)
+    receipt = {
+        "source": "retained",
+    }
+
+    class ChangingAuthorization(dict[str, Any]):
+        def __init__(self, values: dict[str, Any]) -> None:
+            super().__init__(values)
+            self.receipt_reads = 0
+
+        def get(self, key: str, default: object = None) -> object:
+            if key == "receipt":
+                self.receipt_reads += 1
+                if self.receipt_reads > 1:
+                    return "changed"
+            return super().get(key, default)
+
+    authorization = ChangingAuthorization(
+        {
+            "schema": (
+                "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
+            ),
+            "session_id": created.session_id,
+            "reason": "advance",
+            "receipt": receipt,
+            "receipt_sha256": normalized_digest(receipt),
+            "prior_command_id": prior_command_id,
+            "next_turn_ref": next_ref,
+            "goal_id": goal_id,
+            "epoch_id": "epoch-one",
+            "policy": policy,
+            "policy_sha256": policy_digest,
+            "transition_sequence": 1,
+            "prior_command_type": "message",
+            "prior_anchor_kind": "provider-result",
+            "prior_reconciliation_id": "",
+            "prior_reconciliation_resolution": "",
+            "prior_checkpoint_id": checkpoint_id,
+            "prior_generation_digest": generation_digest,
+            "prior_material_digest": material_digest,
+            "next_command_digest": command_digest,
+            "external_orchestrator": created.external_ref["orchestrator"],
+            "external_job_id": created.external_ref["job_id"],
+        }
+    )
+    anchor = {
+        "eligible": True,
+        "prior_command_id": prior_command_id,
+        "prior_command_type": "message",
+        "prior_anchor_kind": "provider-result",
+        "prior_reconciliation_id": "",
+        "prior_reconciliation_resolution": "",
+        "goal_id": goal_id,
+        "epoch_id": "epoch-one",
+        "prior_checkpoint_id": checkpoint_id,
+        "prior_generation_digest": generation_digest,
+        "prior_material_digest": material_digest,
+    }
+    store = SimpleNamespace(
+        session_safety=lambda unused: {"profile": "unattended"},
+        dispatch_invalidation_replay=lambda *unused: None,
+        get_session=lambda unused: created,
+        dispatch_transition_anchor=lambda unused: anchor,
+        goal_for_session=lambda unused: SimpleNamespace(
+            constraints=(
+                "dispatch-generation-transition-policy-sha256:" + policy_digest,
+                "dispatch-generation-transition-epoch:epoch-one",
+            )
+        ),
+    )
+    service = object.__new__(HarnessService)
+    service.store = store  # type: ignore[assignment]
+    payload = {
+        "reason": "advance",
+        "authorization": authorization,
+        "prior_command_id": prior_command_id,
+        "prior_command_type": "message",
+        "prior_anchor_kind": "provider-result",
+        "prior_reconciliation_id": "",
+        "prior_reconciliation_resolution": "",
+        "prior_checkpoint_id": checkpoint_id,
+        "prior_generation_digest": generation_digest,
+        "prior_material_digest": material_digest,
+        "next_turn_ref": next_ref,
+        "transition_sequence": 1,
+        "next_command_digest": command_digest,
+    }
+
+    with pytest.raises(ValueError, match="receipt is invalid"):
+        service.invalidate_dispatch_generation(
+            created.session_id,
+            payload,
+            idempotency_key="changed-receipt",
+        )
+
+
+def test_dispatch_transition_policy_rejects_a_shrinking_stage_collection(
+    tmp_path: Path,
+) -> None:
+    created = _owned_session(tmp_path)
+    next_ref = {"step_id": "step-two", "agent_role": "implementer"}
+    command_digest = "b" * 64
+
+    class ShrinkingStages(list[dict[str, Any]]):
+        def __init__(self, values: list[dict[str, Any]]) -> None:
+            super().__init__(values)
+            self.length_reads = 0
+
+        def __len__(self) -> int:
+            self.length_reads += 1
+            if self.length_reads <= 2:
+                return 2
+            return 1
+
+    stages = ShrinkingStages(
+        [
+            {
+                "sequence": 1,
+                "next_turn_ref": {
+                    "step_id": "step-one",
+                    "agent_role": "implementer",
+                },
+                "next_command_digest": "a" * 64,
+            },
+            {
+                "sequence": 2,
+                "next_turn_ref": next_ref,
+                "next_command_digest": command_digest,
+            },
+        ]
+    )
+    policy = {
+        "schema": "p13i/agent-harness/dispatch-generation-transition-policy/v1",
+        "session_id": created.session_id,
+        "external_ref": created.external_ref,
+        "epoch_id": "epoch-one",
+        "allowed_agent_roles": ["implementer"],
+        "allowed_step_prefixes": ["step-"],
+        "max_transitions": 2,
+        "transitions": stages,
+    }
+
+    with pytest.raises(ValueError, match="sequence is outside policy"):
+        service_module._require_dispatch_transition_policy(
+            GoalStoreProbe(SimpleNamespace(constraints=())),  # type: ignore[arg-type]
+            session_id=created.session_id,
+            session=created,
+            policy=policy,
+            policy_sha256="d" * 64,
+            next_turn_ref=next_ref,
+            transition_sequence=2,
+            next_command_digest=command_digest,
+            retained_policy=True,
+        )
+
+
 def test_worker_status_and_supervision_failure_are_defensive(tmp_path: Path) -> None:
     manager = service_module.WorkerManager(paths(tmp_path / "state"))
     status = manager.status()

@@ -22,10 +22,18 @@ from agent_harness import api as api_module
 from agent_harness import client as client_module
 from agent_harness import process_control as process_control_module
 from agent_harness import service as service_module
+from agent_harness import worker as worker_module
 from agent_harness import workspace as workspace_module
 from agent_harness.client import wait_command
 from agent_harness.config import paths, prepare_paths
-from agent_harness.errors import ConflictError, HarnessError, SafetyGuardError
+from agent_harness.errors import (
+    ConflictError,
+    HarnessError,
+    ProviderUnavailableError,
+    ReconciliationRequiredError,
+    SafetyGuardError,
+    WorkerOwnershipLostError,
+)
 from agent_harness.goals import create_goal
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import (
@@ -41,6 +49,7 @@ from agent_harness.models import (
 )
 from agent_harness.orchestration import normalized_digest
 from agent_harness.scheduler import Scheduler
+from agent_harness.safety import TurnGuard, limits_for
 from agent_harness.service import HarnessService, WorkerManager, _export_digests
 from agent_harness.storage import StateStore
 from agent_harness.transfer import (
@@ -49,6 +58,14 @@ from agent_harness.transfer import (
     open_transfer,
     seal_transfer,
 )
+from agent_harness.providers.base import (
+    ProviderAdapter,
+    ProviderEvent,
+    ProviderModel,
+    ProviderResult,
+    ProviderStatus,
+)
+from agent_harness.worker import SessionWorker
 
 
 class WorkerProbe:
@@ -3148,6 +3165,649 @@ def test_optional_numbers_reject_nonfinite_values() -> None:
     assert service_module._optional_number(2) == 2.0
     with pytest.raises(ValueError, match="numeric value must be finite"):
         service_module._optional_number(float("inf"))
+
+
+def test_workspace_link_normalization_ignores_current_directory_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BoundaryPath:
+        def __init__(self, *parts: str) -> None:
+            self.parts = parts
+
+        @property
+        def parent(self) -> BoundaryPath:
+            return self
+
+        def is_absolute(self) -> bool:
+            return False
+
+        def __truediv__(self, unused: object) -> BoundaryPath:
+            return BoundaryPath("directory", ".", "target")
+
+    monkeypatch.setattr(workspace_module, "PurePosixPath", BoundaryPath)
+    resolved = workspace_module._safe_link_target("member", "target")
+
+    assert resolved is not None
+    assert resolved.parts == ("directory", "target")
+
+
+class BoundaryAdapter(ProviderAdapter):
+    provider_id = "codex"
+
+    def __init__(
+        self,
+        behavior: str = "complete",
+        identities: list[tuple[int, str]] | None = None,
+    ) -> None:
+        self.behavior = behavior
+        self.identities = list(identities or [(0, "")])
+        self.interruptions = 0
+
+    async def run_turn(self, **values: Any) -> ProviderResult:
+        pre_prompt_gate = values.get("pre_prompt_gate")
+        if pre_prompt_gate is not None:
+            await pre_prompt_gate()
+        if self.behavior == "safety":
+            raise SafetyGuardError("stagnation", "codex", recoverable=True)
+        if self.behavior == "reconciliation":
+            raise ReconciliationRequiredError("reconciliation")
+        event_handler = values["event_handler"]
+        await event_handler(
+            ProviderEvent(
+                "provider.prompt.accepted",
+                status="accepted",
+                native_session_id="native",
+            )
+        )
+        return ProviderResult(
+            provider="codex",
+            native_session_id="native",
+            native_turn_id="turn",
+            status="complete",
+            usage={"total_tokens": 1},
+            ambiguous_mutation=self.behavior == "ambiguous",
+        )
+
+    async def models(self, workspace: Path) -> tuple[ProviderModel, ...]:
+        del workspace
+        return ()
+
+    def status(self) -> ProviderStatus:
+        return ProviderStatus(
+            provider="codex",
+            ready=True,
+            detail="boundary adapter",
+            capabilities=frozenset(),
+        )
+
+    async def interrupt(self) -> None:
+        self.interruptions += 1
+
+    def process_identity(self) -> tuple[int, str]:
+        if len(self.identities) > 1:
+            return self.identities.pop(0)
+        return self.identities[0]
+
+
+class BoundaryScheduler:
+    async def choose(self, *unused: object, **values: object) -> RoutingDecision:
+        return RoutingDecision(
+            provider="codex",
+            model="boundary-model",
+            effort=str(values.get("effort", "low")) or "low",
+            reason="boundary",
+            ranked=(),
+            rejected=(),
+            execution_profile=str(values.get("execution_profile", "")),
+            workload=str(values.get("workload", "")),
+        )
+
+
+def _worker_attempt(
+    root: Path,
+    adapter: BoundaryAdapter,
+    *,
+    profile: str = "interactive",
+) -> tuple[HarnessService, SessionWorker, Any, TurnGuard]:
+    service = HarnessService(
+        paths(root / "state"),
+        worker_manager=WorkerProbe(),
+    )
+    created = _create_direct(service, root)
+    workspace = Path(created.worktree)
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.name", "Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "--allow-empty", "-qm", "initial"],
+        check=True,
+    )
+    service.store.set_session_safety(created.session_id, profile)
+    command = service.store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "boundary"},
+        new_uuid(),
+    )
+    assert service.store.claim_command(created.session_id) is not None
+    limits = limits_for(profile, "implementation")
+    service.store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        profile,
+        limits.as_dict(),
+    )
+    service.store.create_child_launch_gate(
+        command.command_id,
+        created.session_id,
+        limits.max_child_agents,
+    )
+    worker = SessionWorker(
+        service.store,
+        service.blobs,
+        BoundaryScheduler(),  # type: ignore[arg-type]
+        {"codex": adapter},
+        created.session_id,
+    )
+    service.store.register_worker(created.session_id, 123, worker.incarnation)
+    worker._compile_context = lambda unused_session, unused_limits: SimpleNamespace(
+        text="canonical context",
+        estimated_tokens=10,
+    )
+    worker._guard_repeated_dispatch = lambda *unused, **values: None
+    return service, worker, command, TurnGuard(limits)
+
+
+def test_worker_rejects_a_mismatched_xhigh_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = HarnessService(
+        paths(tmp_path / "xhigh-state"),
+        worker_manager=WorkerProbe(),
+    )
+    created = _create_direct(service, tmp_path / "xhigh")
+    service.store.set_session_safety(created.session_id, "unattended")
+    command = service.store.enqueue_command(
+        created.session_id,
+        "message",
+        {
+            "text": "maximum",
+            "provider": "codex",
+            "effort": "xhigh",
+        },
+        "mismatched-xhigh",
+    )
+    claimed = service.store.claim_command(created.session_id)
+    assert claimed is not None
+    worker = SessionWorker(
+        service.store,
+        service.blobs,
+        BoundaryScheduler(),  # type: ignore[arg-type]
+        {},
+        created.session_id,
+    )
+    monkeypatch.setattr(
+        service.store,
+        "xhigh_authorization_or_park",
+        lambda unused: {"provider": "claude"},
+    )
+
+    asyncio.run(worker._execute_message(claimed))
+
+    failed = service.store.get_command(command.command_id)
+    assert failed.status == "failed"
+    assert failed.result["code"] == "E_SAFETY_EFFORT"
+    service.close()
+
+
+def test_worker_context_repetition_goal_and_reconciliation_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = object.__new__(SessionWorker)
+    worker.session_id = "session"
+
+    class TransitionStore:
+        def __init__(self, result: str) -> None:
+            self.result = result
+
+        def reserve_dispatch_generation_transition(self, *unused: object) -> str:
+            return self.result
+
+    monkeypatch.setattr(
+        worker_module,
+        "inspect_workspace",
+        lambda unused: ("material", "summary"),
+    )
+    for transition, reason in (
+        ("stage-mismatch", "dispatch-transition-stage-mismatch"),
+        ("epoch-mismatch", "dispatch-transition-epoch-mismatch"),
+    ):
+        worker.store = TransitionStore(transition)  # type: ignore[assignment]
+        with pytest.raises(SafetyGuardError) as raised:
+            worker._guard_repeated_dispatch(
+                "command",
+                "instruction",
+                "context",
+                tmp_path,
+                {},
+                "unattended",
+            )
+        assert raised.value.reason == reason
+
+    appended: list[tuple[str, dict[str, Any]]] = []
+    pair = worker_module._text_digest("pair")
+    fingerprint_store = SimpleNamespace(
+        all_events=lambda unused: [
+            SimpleNamespace(
+                event_type="tool.result.fingerprint",
+                metadata={"generation_digest": "current", "pair_digest": "other"},
+            ),
+            SimpleNamespace(
+                event_type="tool.result.fingerprint",
+                metadata={"generation_digest": "old", "pair_digest": pair},
+            ),
+        ],
+        append_event=lambda session_id, event_type, **values: appended.append(
+            (event_type, values["metadata"])
+        ),
+    )
+    worker.store = fingerprint_store  # type: ignore[assignment]
+    worker._dispatch_generation = lambda: {
+        "generation_digest": "current",
+        "invalidation_id": "",
+    }
+    worker._record_tool_result_fingerprint("command", "turn", "pair")
+    assert appended[0][0] == "tool.result.fingerprint"
+
+    captured: dict[str, Any] = {}
+    context_store = SimpleNamespace(
+        goal_for_session=lambda unused: None,
+        fork_lineage=lambda unused: {"source_context_digest": "inherited"},
+        context_events=lambda *unused, **values: [],
+        context_history_summary=lambda *unused: {},
+        event_count=lambda unused: 0,
+        context_unresolved_decisions=lambda unused: [],
+    )
+    worker.store = context_store  # type: ignore[assignment]
+    worker.blobs = SimpleNamespace(get_text=lambda digest: "text:" + digest)
+    monkeypatch.setattr(worker_module, "workspace_summary", lambda unused: "summary")
+    monkeypatch.setattr(
+        worker_module,
+        "workspace_context_artifacts",
+        lambda unused: [],
+    )
+
+    def capture_context(*unused: object, **values: Any) -> SimpleNamespace:
+        captured.update(values)
+        return SimpleNamespace(text="compiled")
+
+    monkeypatch.setattr(worker_module, "compile_context", capture_context)
+    created = Session(
+        session_id=new_uuid(),
+        name="boundary",
+        workspace=str(tmp_path),
+        worktree=str(tmp_path),
+        permission_mode="approval",
+        lifecycle="running",
+        attention="idle",
+        active_provider="",
+        model="",
+        effort="",
+        goal_id="",
+        external_ref={},
+        owner_host="host",
+        owner_epoch=1,
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    worker._compile_context(created, limits_for("interactive", "implementation"))
+    assert captured["inherited_context_digest"] == "inherited"
+    assert captured["inherited_context"] == "text:inherited"
+
+    updated_goal = SimpleNamespace(goal_id="goal", milestones=("new",))
+    goal_store = SimpleNamespace(
+        goal_for_session=lambda unused: SimpleNamespace(
+            goal_id="goal",
+            milestones=("old",),
+        ),
+        evidence=lambda unused: [],
+        update_milestone_statuses=lambda unused_goal, milestones: updated_goal,
+    )
+    worker.store = goal_store  # type: ignore[assignment]
+    worker._exhausted_budget = lambda: ""
+    monkeypatch.setattr(worker_module, "evaluate_milestones", lambda *unused: ("new",))
+    monkeypatch.setattr(
+        worker_module,
+        "evaluate_goal",
+        lambda *unused: SimpleNamespace(satisfied=False),
+    )
+    asyncio.run(worker._evaluate_goal())
+
+    class EmptyManager:
+        async def recover_after_restart(self, unused: str) -> SimpleNamespace:
+            return SimpleNamespace(reconciliations=())
+
+    monkeypatch.setattr(
+        worker_module,
+        "ReconciliationManager",
+        lambda unused_store, unused_blobs: EmptyManager(),
+    )
+    worker.store = SimpleNamespace()  # type: ignore[assignment]
+    worker.blobs = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="did not create reconciliation"):
+        asyncio.run(
+            worker._pause_for_ambiguous_dispatch(
+                "command",
+                "turn",
+                "codex",
+                "reason",
+            )
+        )
+
+
+def test_worker_fault_barrier_timing_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_sleep = asyncio.sleep
+
+    async def yield_once(unused: float) -> None:
+        await original_sleep(0)
+
+    with monkeypatch.context() as current:
+        current.setattr(worker_module.asyncio, "sleep", yield_once)
+        service, worker, command, guard = _worker_attempt(
+            tmp_path / "service-fault",
+            BoundaryAdapter(),
+        )
+        with pytest.raises(SafetyGuardError, match="proof-service-fault-timeout"):
+            asyncio.run(
+                worker._execute_attempt(
+                    command.command_id,
+                    {
+                        "proof_service_fault_probe": {
+                            "provider": "codex",
+                            "stage": "after-acceptance-before-terminal",
+                        }
+                    },
+                    "boundary",
+                    frozenset(),
+                    guard,
+                    0,
+                    enforce_concurrency=True,
+                )
+            )
+        assert any(
+            event.event_type == "proof.service-fault.timeout"
+            for event in service.store.all_events(worker.session_id)
+        )
+        service.close()
+
+    class TimedLoop:
+        def __init__(self, values: list[float]) -> None:
+            self.values = values
+
+        def time(self) -> float:
+            if len(self.values) > 1:
+                return self.values.pop(0)
+            return self.values[0]
+
+    with monkeypatch.context() as current:
+        current.setattr(worker_module.asyncio, "sleep", yield_once)
+        current.setattr(
+            worker_module.asyncio,
+            "get_running_loop",
+            lambda: TimedLoop([0.0, 1.0, 31.0]),
+        )
+        service, worker, command, guard = _worker_attempt(
+            tmp_path / "readiness-timeout",
+            BoundaryAdapter(),
+        )
+        with pytest.raises(SafetyGuardError, match="proof-fault-readiness-timeout"):
+            asyncio.run(
+                worker._execute_attempt(
+                    command.command_id,
+                    {
+                        "proof_fault_probe": {
+                            "provider": "codex",
+                            "stage": "after-lease-before-acceptance",
+                        }
+                    },
+                    "boundary",
+                    frozenset(),
+                    guard,
+                    0,
+                    enforce_concurrency=True,
+                )
+            )
+        service.close()
+
+    with monkeypatch.context() as current:
+        current.setattr(worker_module.asyncio, "sleep", yield_once)
+        current.setattr(
+            worker_module.asyncio,
+            "get_running_loop",
+            lambda: TimedLoop([0.0, 1.0]),
+        )
+        adapter = BoundaryAdapter(identities=[(10, "start"), (11, "changed")])
+        service, worker, command, guard = _worker_attempt(
+            tmp_path / "identity-changed",
+            adapter,
+            profile="unattended",
+        )
+        with pytest.raises(SafetyGuardError, match="process-identity-changed"):
+            asyncio.run(
+                worker._execute_attempt(
+                    command.command_id,
+                    {
+                        "proof_fault_probe": {
+                            "provider": "codex",
+                            "stage": "after-lease-before-acceptance",
+                        }
+                    },
+                    "boundary",
+                    frozenset(),
+                    guard,
+                    0,
+                    enforce_concurrency=True,
+                )
+            )
+        service.close()
+
+    with monkeypatch.context() as current:
+        current.setattr(worker_module.asyncio, "sleep", yield_once)
+        current.setattr(
+            worker_module.asyncio,
+            "get_running_loop",
+            lambda: TimedLoop([0.0, 1.0, 31.0]),
+        )
+        adapter = BoundaryAdapter(identities=[(10, "start")])
+        service, worker, command, guard = _worker_attempt(
+            tmp_path / "termination-timeout",
+            adapter,
+            profile="unattended",
+        )
+        with pytest.raises(SafetyGuardError, match="termination-timeout"):
+            asyncio.run(
+                worker._execute_attempt(
+                    command.command_id,
+                    {
+                        "proof_fault_probe": {
+                            "provider": "codex",
+                            "stage": "after-lease-before-acceptance",
+                        }
+                    },
+                    "boundary",
+                    frozenset(),
+                    guard,
+                    0,
+                    enforce_concurrency=True,
+                )
+            )
+        assert any(
+            event.event_type == "proof.fault.timeout"
+            for event in service.store.all_events(worker.session_id)
+        )
+        service.close()
+
+
+def test_worker_attempt_admission_ownership_and_result_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, worker, command, guard = _worker_attempt(
+        tmp_path / "denied",
+        BoundaryAdapter(),
+    )
+    monkeypatch.setattr(
+        service.store,
+        "reserve_route_admission",
+        lambda *unused, **values: {
+            "admitted": False,
+            "reason": "capacity",
+            "lease_id": "",
+        },
+    )
+    with pytest.raises(ProviderUnavailableError, match="admission denied"):
+        asyncio.run(
+            worker._execute_attempt(
+                command.command_id,
+                {},
+                "boundary",
+                frozenset(),
+                guard,
+                0,
+                enforce_concurrency=True,
+            )
+        )
+    monkeypatch.undo()
+    service.close()
+
+    service, worker, command, guard = _worker_attempt(
+        tmp_path / "lease-release",
+        BoundaryAdapter(),
+        profile="unattended",
+    )
+
+    class FailingGate:
+        def __init__(self, **unused: object) -> None:
+            raise RuntimeError("gate construction failed")
+
+    monkeypatch.setattr(worker_module, "ChildLaunchGate", FailingGate)
+    with pytest.raises(RuntimeError, match="gate construction failed"):
+        asyncio.run(
+            worker._execute_attempt(
+                command.command_id,
+                {},
+                "boundary",
+                frozenset(),
+                guard,
+                0,
+                enforce_concurrency=True,
+            )
+        )
+    assert service.store.process_leases(worker.session_id)[0]["state"] == "released"
+    monkeypatch.undo()
+    service.close()
+
+    original_sleep = asyncio.sleep
+
+    async def yield_once(unused: float) -> None:
+        await original_sleep(0)
+
+    service, worker, command, guard = _worker_attempt(
+        tmp_path / "ownership",
+        BoundaryAdapter(),
+    )
+    ownership = iter((True, False))
+    monkeypatch.setattr(
+        service.store,
+        "heartbeat_worker",
+        lambda *unused: next(ownership, False),
+    )
+    monkeypatch.setattr(worker_module.asyncio, "sleep", yield_once)
+    with pytest.raises(WorkerOwnershipLostError, match="result ownership"):
+        asyncio.run(
+            worker._execute_attempt(
+                command.command_id,
+                {},
+                "boundary",
+                frozenset(),
+                guard,
+                0,
+                enforce_concurrency=True,
+            )
+        )
+    monkeypatch.undo()
+    service.close()
+
+    for stage, action in ((0, "downgrade"), (1, "failover")):
+        service, worker, command, guard = _worker_attempt(
+            tmp_path / ("safety-" + str(stage)),
+            BoundaryAdapter("safety"),
+        )
+        with pytest.raises(SafetyGuardError, match="stagnation"):
+            asyncio.run(
+                worker._execute_attempt(
+                    command.command_id,
+                    {},
+                    "boundary",
+                    frozenset(),
+                    guard,
+                    stage,
+                    enforce_concurrency=True,
+                )
+            )
+        assert service.store.guard_incidents(worker.session_id)[0]["action"] == action
+        service.close()
+
+    service, worker, command, guard = _worker_attempt(
+        tmp_path / "reconciliation-error",
+        BoundaryAdapter("reconciliation"),
+    )
+    with pytest.raises(ReconciliationRequiredError):
+        asyncio.run(
+            worker._execute_attempt(
+                command.command_id,
+                {},
+                "boundary",
+                frozenset(),
+                guard,
+                0,
+                enforce_concurrency=True,
+            )
+        )
+    service.close()
+
+    service, worker, command, guard = _worker_attempt(
+        tmp_path / "ambiguous-result",
+        BoundaryAdapter("ambiguous"),
+    )
+
+    async def pause(*unused: object) -> str:
+        return "reconciliation"
+
+    monkeypatch.setattr(worker, "_pause_for_ambiguous_dispatch", pause)
+    with pytest.raises(ReconciliationRequiredError):
+        asyncio.run(
+            worker._execute_attempt(
+                command.command_id,
+                {},
+                "boundary",
+                frozenset(),
+                guard,
+                0,
+                enforce_concurrency=True,
+            )
+        )
+    service.close()
 
 
 if __name__ == "__main__":
