@@ -67,6 +67,8 @@ from agent_harness.providers.base import (
 )
 from agent_harness.worker import SessionWorker
 
+SUPPORTED_PROVIDERS = frozenset({"claude", "codex", "kimi"})
+
 
 class WorkerProbe:
     def __init__(self) -> None:
@@ -1748,7 +1750,7 @@ def test_service_turn_and_budget_extension_boundaries(tmp_path: Path) -> None:
                     "reason": "one authorized turn",
                     "allow_xhigh_once": True,
                     "command_id": command.command_id,
-                    "provider": "kimi",
+                    "provider": "other",
                 },
                 idempotency_key="xhigh-provider",
             )
@@ -2436,8 +2438,12 @@ def test_proof_fault_probe_requests_fail_closed_on_every_binding(
     )
     goal = _probe_goal(session, "proof-fault-authorization-sha256:" + digest)
 
-    service_module._validate_proof_fault_probe(session, goal, payload, key)
-    service_module._validate_proof_fault_probe(session, goal, {}, key)
+    service_module._validate_proof_fault_probe(
+        session, goal, payload, key, SUPPORTED_PROVIDERS
+    )
+    service_module._validate_proof_fault_probe(
+        session, goal, {}, key, SUPPORTED_PROVIDERS
+    )
 
     def rejected(message: str, mutate: Callable[[dict[str, Any]], None]) -> None:
         request = copy.deepcopy(payload)
@@ -2448,6 +2454,7 @@ def test_proof_fault_probe_requests_fail_closed_on_every_binding(
                 goal,
                 request,
                 key,
+                SUPPORTED_PROVIDERS,
             )
 
     rejected(
@@ -2480,7 +2487,7 @@ def test_proof_fault_probe_requests_fail_closed_on_every_binding(
     )
     rejected(
         "provider is unsupported",
-        lambda item: item["proof_fault_probe"].__setitem__("provider", "kimi"),
+        lambda item: item["proof_fault_probe"].__setitem__("provider", "other"),
     )
     rejected(
         "authorization digest is invalid",
@@ -2509,12 +2516,18 @@ def test_proof_fault_probe_requests_fail_closed_on_every_binding(
     )
 
     with pytest.raises(ValueError, match="requires an idempotency key"):
-        service_module._validate_proof_fault_probe(session, goal, payload, "")
+        service_module._validate_proof_fault_probe(
+            session, goal, payload, "", SUPPORTED_PROVIDERS
+        )
     foreign = _machines_session(tmp_path, orchestrator="operator")
     with pytest.raises(ValueError, match="p13i/machines ownership"):
-        service_module._validate_proof_fault_probe(foreign, goal, payload, key)
+        service_module._validate_proof_fault_probe(
+            foreign, goal, payload, key, SUPPORTED_PROVIDERS
+        )
     with pytest.raises(ValueError, match="is not precommitted"):
-        service_module._validate_proof_fault_probe(session, None, payload, key)
+        service_module._validate_proof_fault_probe(
+            session, None, payload, key, SUPPORTED_PROVIDERS
+        )
 
 
 def test_service_fault_probe_requests_fail_closed_on_every_binding(
@@ -2536,8 +2549,12 @@ def test_service_fault_probe_requests_fail_closed_on_every_binding(
         "proof-service-fault-authorization-sha256:" + digest,
     )
 
-    service_module._validate_service_fault_probe(session, goal, payload, key)
-    service_module._validate_service_fault_probe(session, goal, {}, key)
+    service_module._validate_service_fault_probe(
+        session, goal, payload, key, SUPPORTED_PROVIDERS
+    )
+    service_module._validate_service_fault_probe(
+        session, goal, {}, key, SUPPORTED_PROVIDERS
+    )
 
     def rejected(message: str, mutate: Callable[[dict[str, Any]], None]) -> None:
         request = copy.deepcopy(payload)
@@ -2548,6 +2565,7 @@ def test_service_fault_probe_requests_fail_closed_on_every_binding(
                 goal,
                 request,
                 key,
+                SUPPORTED_PROVIDERS,
             )
 
     rejected(
@@ -2581,7 +2599,7 @@ def test_service_fault_probe_requests_fail_closed_on_every_binding(
         "provider is unsupported",
         lambda item: item["proof_service_fault_probe"].__setitem__(
             "provider",
-            "kimi",
+            "other",
         ),
     )
     rejected(
@@ -2624,7 +2642,9 @@ def test_service_fault_probe_requests_fail_closed_on_every_binding(
     )
 
     with pytest.raises(ValueError, match="requires an idempotency key"):
-        service_module._validate_service_fault_probe(session, goal, payload, "")
+        service_module._validate_service_fault_probe(
+            session, goal, payload, "", SUPPORTED_PROVIDERS
+        )
     foreign = _machines_session(tmp_path, orchestrator="operator")
     with pytest.raises(ValueError, match="p13i/machines ownership"):
         service_module._validate_service_fault_probe(
@@ -2632,9 +2652,12 @@ def test_service_fault_probe_requests_fail_closed_on_every_binding(
             goal,
             payload,
             key,
+            SUPPORTED_PROVIDERS,
         )
     with pytest.raises(ValueError, match="is not precommitted"):
-        service_module._validate_service_fault_probe(session, None, payload, key)
+        service_module._validate_service_fault_probe(
+            session, None, payload, key, SUPPORTED_PROVIDERS
+        )
 
 
 def test_machines_goal_envelope_requires_every_typed_dimension() -> None:
@@ -2671,6 +2694,7 @@ def test_machines_goal_envelope_requires_every_typed_dimension() -> None:
             "permitted_providers": complete["permitted_providers"],
             "permitted_efforts": complete["permitted_efforts"],
             "budgets": budgets,
+            "supported_providers": frozenset({"claude", "codex", "kimi"}),
         }
         values.update(overrides)
         service_module._require_machines_goal_envelope(complete, **values)

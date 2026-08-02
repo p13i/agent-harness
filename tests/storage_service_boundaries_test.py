@@ -31,6 +31,8 @@ from agent_harness.service import HarnessService
 from agent_harness.storage import StateStore
 from tests.test_support import session
 
+SUPPORTED_PROVIDERS = frozenset({"claude", "codex", "kimi"})
+
 
 class WorkerProbe:
     def __init__(self) -> None:
@@ -442,7 +444,7 @@ def test_xhigh_authorization_rejects_stale_identity_and_inactive_commands(
         store.create_xhigh_authorization(
             first.session_id,
             new_uuid(),
-            "other",
+            "",
             authorization_request_digest="a" * 64,
             idempotency_key="provider-key",
             expires_at="2099-01-01T00:00:00+00:00",
@@ -1115,7 +1117,9 @@ def test_proof_fault_probe_validation_fails_closed(tmp_path: Path) -> None:
         "authorize one proof fault",
         constraints=("proof-fault-authorization-sha256:" + digest,),
     )
-    service_module._validate_proof_fault_probe(owned, goal, valid, key)
+    service_module._validate_proof_fault_probe(
+        owned, goal, valid, key, SUPPORTED_PROVIDERS
+    )
 
     cases: list[tuple[object, object | None, dict[str, Any], str, str]] = []
     bad = copy.deepcopy(valid)
@@ -1168,6 +1172,7 @@ def test_proof_fault_probe_validation_fails_closed(tmp_path: Path) -> None:
                 current_goal,  # type: ignore[arg-type]
                 payload,
                 current_key,
+                SUPPORTED_PROVIDERS,
             )
 
 
@@ -1180,7 +1185,9 @@ def test_service_fault_probe_validation_fails_closed(tmp_path: Path) -> None:
         "authorize one service fault",
         constraints=("proof-service-fault-authorization-sha256:" + digest,),
     )
-    service_module._validate_service_fault_probe(owned, goal, valid, key)
+    service_module._validate_service_fault_probe(
+        owned, goal, valid, key, SUPPORTED_PROVIDERS
+    )
 
     cases: list[tuple[object, object | None, dict[str, Any], str, str]] = []
     bad = copy.deepcopy(valid)
@@ -1233,6 +1240,7 @@ def test_service_fault_probe_validation_fails_closed(tmp_path: Path) -> None:
                 current_goal,  # type: ignore[arg-type]
                 payload,
                 current_key,
+                SUPPORTED_PROVIDERS,
             )
 
 
@@ -1383,6 +1391,7 @@ def test_machine_goal_envelope_rejects_unbounded_or_untyped_fields() -> None:
             permitted_providers=permitted_providers,
             permitted_efforts=permitted_efforts,
             budgets=current_budgets,
+            supported_providers=frozenset({"claude", "codex", "kimi"}),
         )
 
     validate(payload)

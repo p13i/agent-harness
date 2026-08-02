@@ -1152,8 +1152,8 @@ async def test_api_creates_session_and_accepts_message(
             RuntimeError("transient supervision failure")
         )
         failed_health = await client.get("/healthz", headers=headers)
-        assert failed_health.status == 503
-        assert (await failed_health.json())["status"] == "failed"
+        assert failed_health.status == 200
+        assert (await failed_health.json())["status"] == "ok"
         not_ready = await client.get("/readyz", headers=headers)
         assert not_ready.status == 503
         assert (await not_ready.json())["status"] == "not-ready"

@@ -662,7 +662,7 @@ def test_xhigh_authorizations_bind_one_active_command(tmp_path: Path) -> None:
         store.create_xhigh_authorization(
             created.session_id,
             command.command_id,
-            "kimi",
+            "",
             authorization_request_digest="a" * 64,
             idempotency_key="xhigh",
             expires_at="2099-01-01T00:00:00+00:00",

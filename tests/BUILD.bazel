@@ -3,6 +3,7 @@ load("@rules_python//python:defs.bzl", "py_test")
 test_suite(
     name = "local_acceptance",
     tests = [
+        ":adversarial_regressions_test",
         ":acceptance_test",
         ":chat_pty_test",
         ":e2e_tests",
@@ -88,6 +89,22 @@ py_test(
     deps = [
         "//agent_harness",
         "@agent_harness_pip//pytest",
+    ],
+)
+
+py_test(
+    name = "adversarial_regressions_test",
+    srcs = [
+        "test_adversarial_regressions.py",
+        "test_support.py",
+    ],
+    data = ["//contracts:openapi.gpt.yaml"],
+    main = "test_adversarial_regressions.py",
+    deps = [
+        "//agent_harness",
+        "@agent_harness_pip//aiohttp",
+        "@agent_harness_pip//pytest",
+        "@agent_harness_pip//pytest_asyncio",
     ],
 )
 

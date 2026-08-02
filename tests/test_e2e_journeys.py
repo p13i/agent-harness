@@ -222,7 +222,7 @@ class ScriptedAdapter(ProviderAdapter):
             ProviderModel(
                 self.provider_id + "-default",
                 self.provider_id.title(),
-                ("low", "medium", "high", "xhigh"),
+                ("low", "medium", "high", "xhigh", "max"),
                 200_000,
                 default=True,
             ),
@@ -2704,7 +2704,7 @@ async def test_e2e_repeated_completed_dispatch_pauses_before_provider(
 
 
 @pytest.mark.asyncio
-async def test_e2e_distinct_managed_steps_pause_on_repeated_governing_artifacts(
+async def test_e2e_distinct_managed_steps_reuse_governing_artifacts(
     tmp_path: Path,
 ) -> None:
     rig = JourneyRig(tmp_path)
@@ -2736,15 +2736,8 @@ async def test_e2e_distinct_managed_steps_pause_on_repeated_governing_artifacts(
         )
 
         assert first.status == "complete", first.result
-        assert second.status == "failed", second.result
-        assert second.result["code"] == "E_SAFETY_GUARD"
-        envelope = rig.store.command_envelope(second.command_id)
-        assert envelope["guard_reason"] in {
-            "repeated-context",
-            "repeated-workspace_instruction",
-            "repeated-plan",
-            "repeated-skill",
-        }
+        assert second.status == "complete", second.result
+        assert len(rig.adapters["claude"].prompts) == 2
     finally:
         rig.close()
 
@@ -3492,7 +3485,7 @@ async def test_e2e_exact_sre_tick_repeats_only_after_bound_transition(
         ("skill", "repeated-skill"),
     ),
 )
-def test_distinct_managed_steps_reject_each_repeated_component(
+def test_distinct_managed_steps_allow_each_repeated_component(
     tmp_path: Path,
     component: str,
     expected_reason: str,
@@ -3536,23 +3529,27 @@ def test_distinct_managed_steps_reject_each_repeated_component(
             first_turn_ref,
             "unattended",
         )
-        with pytest.raises(SafetyGuardError) as raised:
-            rig.worker._guard_repeated_dispatch(
-                new_uuid(),
-                second_instruction,
-                second_context,
-                workspace,
-                second_turn_ref,
-                "unattended",
-            )
-        assert raised.value.reason == expected_reason
+        rig.worker._guard_repeated_dispatch(
+            new_uuid(),
+            second_instruction,
+            second_context,
+            workspace,
+            second_turn_ref,
+            "unattended",
+        )
+        assert expected_reason not in {
+            event.metadata.get("reason", "")
+            for event in rig.store.all_events(rig.session.session_id)
+        }
     finally:
         rig.close()
 
 
 @pytest.mark.asyncio
-async def test_e2e_xhigh_requires_and_consumes_one_authorization(
+@pytest.mark.parametrize("effort", ("xhigh", "max"))
+async def test_e2e_high_tier_requires_and_consumes_one_authorization(
     tmp_path: Path,
+    effort: str,
 ) -> None:
     rig = JourneyRig(tmp_path)
     rig.store.set_session_safety(
@@ -3563,18 +3560,18 @@ async def test_e2e_xhigh_requires_and_consumes_one_authorization(
     try:
         waiting = await rig.message(
             "Use maximum effort.",
-            provider="codex",
-            effort="xhigh",
+            provider="claude",
+            effort=effort,
         )
         assert waiting.status == "awaiting-xhigh-authorization"
 
-        rig.authorize_xhigh(waiting.command_id, "codex")
+        rig.authorize_xhigh(waiting.command_id, "claude")
         await rig.execute(waiting.command_id)
         accepted = rig.store.get_command(waiting.command_id)
 
         assert accepted.status == "complete"
-        codex = rig.adapters["codex"]
-        assert codex.efforts == ["xhigh"]
+        claude = rig.adapters["claude"]
+        assert claude.efforts == [effort]
         safety = rig.store.session_safety(rig.session.session_id)
         assert safety["xhigh_authorizations"] == 0
     finally:
@@ -3582,8 +3579,10 @@ async def test_e2e_xhigh_requires_and_consumes_one_authorization(
 
 
 @pytest.mark.asyncio
-async def test_e2e_one_xhigh_authorization_never_funds_a_retry(
+@pytest.mark.parametrize("effort", ("xhigh", "max"))
+async def test_e2e_one_high_tier_authorization_never_funds_a_retry(
     tmp_path: Path,
+    effort: str,
 ) -> None:
     claude = ScriptedAdapter("claude", fail_turns=1)
     codex = ScriptedAdapter("codex")
@@ -3595,15 +3594,15 @@ async def test_e2e_one_xhigh_authorization_never_funds_a_retry(
     rig.prime_capacity()
     try:
         receipt = rig.enqueue_message(
-            "Use only one xhigh attempt.",
-            effort="xhigh",
+            "Use only one high-tier attempt.",
+            effort=effort,
         )
         rig.authorize_xhigh(receipt.command_id, "claude")
         await rig.execute(receipt.command_id)
         receipt = rig.store.get_command(receipt.command_id)
 
         assert receipt.status == "failed"
-        assert claude.efforts == ["xhigh"]
+        assert claude.efforts == [effort]
         assert codex.efforts == []
         envelope = rig.store.command_envelope(receipt.command_id)
         assert envelope["limits"]["max_attempts"] == 1

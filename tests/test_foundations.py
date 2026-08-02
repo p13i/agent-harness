@@ -369,13 +369,21 @@ def test_proof_helpers_cover_fail_closed_projection_boundaries(
     assert truncated == ["commands"]
     with pytest.raises(ValueError, match="after_sequence exceeds"):
         proof_module._proof_page(
-            {"payload": {"events": []}, "through_sequence": 0},
+            {
+                "payload": {"events": []},
+                "through_sequence": 0,
+                "digest": proof_module._digest({"events": []}),
+            },
             after_sequence=1,
             event_limit=1,
         )
     with pytest.raises(ValueError, match="not contiguous"):
         proof_module._proof_page(
-            {"payload": {"events": []}, "through_sequence": 1},
+            {
+                "payload": {"events": []},
+                "through_sequence": 1,
+                "digest": proof_module._digest({"events": []}),
+            },
             after_sequence=0,
             event_limit=1,
         )
@@ -384,6 +392,7 @@ def test_proof_helpers_cover_fail_closed_projection_boundaries(
             {
                 "payload": {"events": [{"sequence": 2}]},
                 "through_sequence": 1,
+                "digest": proof_module._digest({"events": [{"sequence": 2}]}),
             },
             after_sequence=0,
             event_limit=1,

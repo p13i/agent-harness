@@ -283,16 +283,6 @@ def test_codex_protocol_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
     assert codex._strings("fast") == ()
     assert codex._strings(["fast", 1, {"id": "flex"}, {"id": 2}]) == ("fast", "flex")
 
-    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "")
-    assert codex._process_start(42) == "42"
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda *args, **kwargs: " ".join(str(index) for index in range(24)),
-    )
-    assert codex._process_start(42) == "21"
-
-
 def test_codex_server_send_request_and_routes(tmp_path: Path) -> None:
     async def scenario() -> None:
         notifications: list[tuple[str, dict[str, Any]]] = []
@@ -1004,6 +994,10 @@ def test_codex_adapter_models_and_turn(
             notification_handler=_ignore_notification,
             request_handler=_decline,
         )
+        active._process_group = SimpleNamespace(
+            pid=44,
+            pid_start="canonical-start",
+        )
         adapter._active_server = active  # type: ignore[assignment]
         adapter._active_thread = "thread"
         adapter._active_turn = "turn"
@@ -1331,23 +1325,6 @@ def test_claude_helpers_and_transport(
     assert not claude._looks_like_spend_limit("monthly spend limit")
     assert claude._bounded("x" * 5000) == "x" * 4096
     assert not claude._has_native_session(tmp_path, "missing")
-
-    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "")
-    assert claude._process_start(7) == "7"
-
-    def unavailable(*args: Any, **kwargs: Any) -> str:
-        del args
-        del kwargs
-        raise OSError
-
-    monkeypatch.setattr(Path, "read_text", unavailable)
-    assert claude._process_start(7) == "7"
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda *args, **kwargs: " ".join(str(index) for index in range(24)),
-    )
-    assert claude._process_start(7) == "21"
 
     async def prompt() -> None:
         values = [value async for value in claude._prompt_stream("hello", "session")]
@@ -1754,9 +1731,9 @@ def test_claude_adapter_status_models_and_active_control(
         _process=SimpleNamespace(pid=0, returncode=None)
     )
     assert adapter.process_identity() == (0, "")
-    monkeypatch.setattr(claude, "_process_start", lambda pid: "started")
     adapter._transport = SimpleNamespace(
-        _process=SimpleNamespace(pid=55, returncode=None)
+        _process=SimpleNamespace(pid=55, returncode=None),
+        _process_group=SimpleNamespace(pid=55, pid_start="started"),
     )
     assert adapter.process_identity() == (55, "started")
     adapter._transport = SimpleNamespace(
