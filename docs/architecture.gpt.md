@@ -246,9 +246,9 @@ process, checkpoint observable work, and pause. Unattended
 effort at or above xhigh requires one explicit authorization,
 which one command consumes.
 
-All harness-managed background Claude, Codex, and Kimi processes
-hold a durable lease containing provider, profile, PID, PID
-start identity, heartbeat expiry, and session. Machines
+All harness-managed background provider processes hold a
+durable lease containing provider, profile, PID, PID start
+identity, heartbeat expiry, and session. Machines
 launchers use the same lease contract, and a host watchdog
 terminates unleased background processes after a grace
 period. Foreground terminal sessions are outside that
