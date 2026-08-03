@@ -12,6 +12,12 @@ from pathlib import Path
 
 API_VERSION = "1.11.0"
 CONTROL_PROTOCOL_VERSION = 3
+RUNTIME_BUNDLE_SCHEMAS = frozenset(
+    {
+        "p13i/agent-harness/install-bundle/v1",
+        "p13i/agent-harness/install-bundle/v2",
+    }
+)
 
 
 def _control_build_id() -> str:
@@ -54,7 +60,7 @@ def _manifest_build_id(manifest: Path) -> str:
         return ""
     if not isinstance(payload, dict):
         return ""
-    if payload.get("schema") != "p13i/agent-harness/install-bundle/v1":
+    if payload.get("schema") not in RUNTIME_BUNDLE_SCHEMAS:
         return ""
     build_id = payload.get("build_id")
     if not isinstance(build_id, str):

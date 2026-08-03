@@ -40,6 +40,7 @@ from agent_harness.workspace import (
     create_worktree,
     restore_checkpoint,
 )
+from tools.bundle import BUNDLE_SCHEMA, LEGACY_BUNDLE_SCHEMA
 
 
 def test_blob_store_round_trip_and_validation(tmp_path: Path) -> None:
@@ -108,7 +109,7 @@ def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
     outer_manifest.write_text(
         json.dumps(
             {
-                "schema": "p13i/agent-harness/install-bundle/v1",
+                "schema": LEGACY_BUNDLE_SCHEMA,
                 "build_id": tmp_path.name,
             }
         ),
@@ -133,7 +134,7 @@ def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
     manifest.write_text(
         json.dumps(
             {
-                "schema": "p13i/agent-harness/install-bundle/v1",
+                "schema": LEGACY_BUNDLE_SCHEMA,
                 "build_id": "different-build",
             }
         ),
@@ -143,7 +144,7 @@ def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
     manifest.write_text(
         json.dumps(
             {
-                "schema": "p13i/agent-harness/install-bundle/v1",
+                "schema": LEGACY_BUNDLE_SCHEMA,
                 "build_id": 1,
             }
         ),
@@ -153,7 +154,17 @@ def test_runtime_build_identity_is_read_from_verified_bundle_metadata(
     manifest.write_text(
         json.dumps(
             {
-                "schema": "p13i/agent-harness/install-bundle/v1",
+                "schema": LEGACY_BUNDLE_SCHEMA,
+                "build_id": "commit-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert runtime_build_id(executable) == "commit-sha"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": BUNDLE_SCHEMA,
                 "build_id": "commit-sha",
             }
         ),
