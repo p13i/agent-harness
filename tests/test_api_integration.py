@@ -52,6 +52,65 @@ class Workers:
         return
 
 
+@pytest.mark.asyncio
+async def test_api_records_and_replays_operator_usage_attestation(
+    tmp_path: Path,
+) -> None:
+    service = HarnessService(
+        paths(tmp_path / "state"),
+        worker_manager=Workers(),
+    )
+    client = TestClient(TestServer(create_app(service, "test-token")))
+    await client.start_server()
+    headers = {
+        "Authorization": "Bearer test-token",
+        "Idempotency-Key": "claude-usage-outage",
+    }
+    payload = {
+        "binding_percent": 44.0,
+        "credits_engaged": False,
+        "valid_seconds": 3600,
+        "evidence_sha256": "c" * 64,
+    }
+    try:
+        created = await client.post(
+            "/v1/providers/claude/usage-attestations",
+            headers=headers,
+            json=payload,
+        )
+        assert created.status == 201
+        created_value = await created.json()
+        replay = await client.post(
+            "/v1/providers/claude/usage-attestations",
+            headers=headers,
+            json=payload,
+        )
+        assert replay.status == 201
+        assert await replay.json() == created_value
+        providers = await service.scheduler.status(tmp_path)
+        assert providers["claude"]["usage"]["admissible"] is True
+        assert (
+            providers["claude"]["usage"]["payload"]["source"]
+            == "operator-attestation"
+        )
+        rejected = await client.post(
+            "/v1/providers/unknown/usage-attestations",
+            headers={
+                "Authorization": "Bearer test-token",
+                "Idempotency-Key": "invalid-usage-attestation",
+            },
+            json=payload,
+        )
+        assert rejected.status == 400
+    finally:
+        refresh = service.scheduler._status_refresh
+        if refresh is not None:
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+        await client.close()
+        service.close()
+
+
 def machines_session_payload(
     workspace: Path,
     external_ref: dict[str, str],

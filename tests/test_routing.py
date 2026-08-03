@@ -360,6 +360,172 @@ def test_scheduler_refreshes_usage_and_falls_back_on_model_failure(
     asyncio.run(scenario())
 
 
+def test_scheduler_uses_a_bounded_operator_usage_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = UsageSnapshot(
+        provider="claude",
+        binding_percent=None,
+        credits_engaged=False,
+        payload={},
+        error="HTTP 429",
+    )
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        return {"claude": failed}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        scheduler = Scheduler(store, {"claude": SlowAdapter()})
+        assert scheduler._operator_usage_fallback(failed) is failed
+        unchanged = UsageSnapshot(
+            provider="claude",
+            binding_percent=20.0,
+            credits_engaged=False,
+            payload={},
+        )
+        assert scheduler._operator_usage_fallback(unchanged) is unchanged
+        with pytest.raises(ValueError, match="attestation is invalid"):
+            scheduler.attest_operator_usage(
+                "claude",
+                {
+                    "binding_percent": True,
+                    "credits_engaged": False,
+                    "valid_seconds": True,
+                    "evidence_sha256": "invalid",
+                },
+            )
+        receipt = scheduler.attest_operator_usage(
+            "claude",
+            {
+                "binding_percent": 44.0,
+                "credits_engaged": False,
+                "valid_seconds": 3600,
+                "evidence_sha256": "a" * 64,
+            },
+        )
+        assert receipt["source"] == "operator-attestation"
+        assert receipt["sample_id"]
+        assert receipt["binding_percent"] == 44.0
+        assert receipt["credits_engaged"] is False
+        assert receipt["observed_at"]
+        assert receipt["provider"] == "claude"
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        selected = await scheduler.refresh_usage()
+        assert selected["claude"].binding_percent == 44.0
+        assert selected["claude"].error == ""
+        assert (
+            selected["claude"].payload["source"]
+            == "operator-attestation-fallback"
+        )
+        assert selected["claude"].payload["attestation_sample_id"]
+        assert len(selected["claude"].payload["live_probe_error_sha256"]) == 64
+        latest = store.latest_usage()["claude"]
+        assert latest["payload"]["error"] == ""
+        attestation = store.latest_operator_usage_attestation("claude")
+        assert attestation is not None
+        assert attestation["sample_id"] == receipt["sample_id"]
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_operator_usage_attestation_fails_closed_when_invalid_or_expired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    scheduler = Scheduler(store, {"claude": SlowAdapter()})
+    failed = UsageSnapshot(
+        provider="claude",
+        binding_percent=None,
+        credits_engaged=False,
+        payload={},
+        error="HTTP 429",
+    )
+    with monkeypatch.context() as context:
+        context.setattr(
+            store,
+            "latest_operator_usage_attestation",
+            lambda unused: {"payload": "invalid"},
+        )
+        assert scheduler._operator_usage_fallback(failed) is failed
+    with monkeypatch.context() as context:
+        context.setattr(
+            store,
+            "latest_operator_usage_attestation",
+            lambda unused: {"payload": {"payload": "invalid"}},
+        )
+        assert scheduler._operator_usage_fallback(failed) is failed
+    base = {
+        "schema": "p13i/agent-harness/operator-usage-attestation/v1",
+        "source": "operator-attestation",
+        "evidence_sha256": "b" * 64,
+        "attested_at": "2026-08-03T00:00:00+00:00",
+    }
+    store.record_usage(
+        "claude",
+        44.0,
+        False,
+        {"payload": {**base, "expires_at": "invalid"}, "error": ""},
+    )
+    assert scheduler._operator_usage_fallback(failed) is failed
+    store.record_usage(
+        "claude",
+        44.0,
+        False,
+        {
+            "payload": {
+                **base,
+                "expires_at": "2099-01-01T00:00:00",
+            },
+            "error": "",
+        },
+    )
+    assert scheduler._operator_usage_fallback(failed).error == ""
+    store.record_usage(
+        "claude",
+        44.0,
+        False,
+        {
+            "payload": {
+                **base,
+                "expires_at": "2020-01-01T00:00:00+00:00",
+            },
+            "error": "",
+        },
+    )
+    assert scheduler._operator_usage_fallback(failed) is failed
+    store.record_usage(
+        "claude",
+        95.0,
+        False,
+        {
+            "payload": {
+                **base,
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            },
+            "error": "",
+        },
+    )
+    assert scheduler._operator_usage_fallback(failed) is failed
+    store.record_usage(
+        "claude",
+        44.0,
+        True,
+        {
+            "payload": {
+                **base,
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            },
+            "error": "",
+        },
+    )
+    assert scheduler._operator_usage_fallback(failed) is failed
+    store.close()
+
+
 def test_scheduler_enforces_capacity_concurrency_model_and_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import math
 from pathlib import Path
 from typing import Any
@@ -36,19 +37,131 @@ class Scheduler:
 
     async def refresh_usage(self) -> dict[str, UsageSnapshot]:
         snapshots = await probe_all()
-        for snapshot in snapshots.values():
+        effective: dict[str, UsageSnapshot] = {}
+        for provider, snapshot in snapshots.items():
+            selected = self._operator_usage_fallback(snapshot)
+            effective[provider] = selected
             self.store.record_usage(
-                snapshot.provider,
-                snapshot.binding_percent,
-                snapshot.credits_engaged,
+                selected.provider,
+                selected.binding_percent,
+                selected.credits_engaged,
                 {
-                    "payload": snapshot.payload,
-                    "error": snapshot.error,
+                    "payload": selected.payload,
+                    "error": selected.error,
                 },
             )
-        self._usage_cache = snapshots
+        self._usage_cache = effective
         self._usage_at = asyncio.get_running_loop().time()
-        return snapshots
+        return effective
+
+    def attest_operator_usage(
+        self,
+        provider: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        binding = _optional_number(payload.get("binding_percent"))
+        valid_seconds = payload.get("valid_seconds")
+        evidence_sha256 = str(payload.get("evidence_sha256", ""))
+        valid_duration = isinstance(valid_seconds, int)
+        if isinstance(valid_seconds, bool):
+            valid_duration = False
+        valid_evidence = len(evidence_sha256) == 64
+        if valid_evidence:
+            valid_evidence = all(
+                character in "0123456789abcdef"
+                for character in evidence_sha256
+            )
+        if (
+            provider not in self.adapters
+            or binding is None
+            or binding >= 90.0
+            or payload.get("credits_engaged") is not False
+            or not valid_duration
+            or int(valid_seconds) < 1
+            or int(valid_seconds) > 7 * 24 * 60 * 60
+            or not valid_evidence
+        ):
+            raise ValueError("operator usage attestation is invalid")
+        attested_at = datetime.datetime.now(datetime.UTC)
+        expires_at = attested_at + datetime.timedelta(seconds=int(valid_seconds))
+        public_payload = {
+            "schema": "p13i/agent-harness/operator-usage-attestation/v1",
+            "source": "operator-attestation",
+            "evidence_sha256": evidence_sha256,
+            "attested_at": attested_at.isoformat(),
+            "expires_at": expires_at.isoformat(),
+        }
+        sample_id = self.store.record_usage(
+            provider,
+            binding,
+            False,
+            {"payload": public_payload, "error": ""},
+        )
+        snapshot = UsageSnapshot(
+            provider=provider,
+            binding_percent=binding,
+            credits_engaged=False,
+            payload=public_payload,
+        )
+        self._usage_cache[provider] = snapshot
+        self._usage_at = asyncio.get_running_loop().time()
+        durable = self.store.latest_usage()[provider]
+        return {
+            "sample_id": sample_id,
+            "provider": provider,
+            "binding_percent": binding,
+            "credits_engaged": False,
+            "observed_at": str(durable["observed_at"]),
+            **public_payload,
+        }
+
+    def _operator_usage_fallback(
+        self,
+        snapshot: UsageSnapshot,
+    ) -> UsageSnapshot:
+        if not snapshot.error:
+            return snapshot
+        attestation = self.store.latest_operator_usage_attestation(
+            snapshot.provider
+        )
+        if attestation is None:
+            return snapshot
+        stored = attestation.get("payload", {})
+        if not isinstance(stored, dict):
+            return snapshot
+        public = stored.get("payload", {})
+        if not isinstance(public, dict):
+            return snapshot
+        expires_at = str(public.get("expires_at", ""))
+        try:
+            expiration = datetime.datetime.fromisoformat(
+                expires_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return snapshot
+        if expiration.tzinfo is None:
+            expiration = expiration.replace(tzinfo=datetime.UTC)
+        if datetime.datetime.now(datetime.UTC) >= expiration:
+            return snapshot
+        binding = _optional_number(attestation.get("binding_percent"))
+        if binding is None or binding >= 90.0:
+            return snapshot
+        if attestation.get("credits_engaged") is not False:
+            return snapshot
+        fallback_payload = dict(public)
+        fallback_payload["source"] = "operator-attestation-fallback"
+        fallback_payload["attestation_sample_id"] = str(
+            attestation.get("sample_id", "")
+        )
+        fallback_payload["live_probe_error_sha256"] = hashlib.sha256(
+            snapshot.error.encode("utf-8")
+        ).hexdigest()
+        return UsageSnapshot(
+            provider=snapshot.provider,
+            binding_percent=binding,
+            credits_engaged=False,
+            payload=fallback_payload,
+        )
 
     async def usage(self) -> dict[str, UsageSnapshot]:
         now = asyncio.get_running_loop().time()

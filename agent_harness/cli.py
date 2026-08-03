@@ -107,6 +107,11 @@ def parser() -> argparse.ArgumentParser:
     extend.add_argument("--provider", choices=("claude", "codex"), default="")
     extend.add_argument("--reason", required=True)
     subcommands.add_parser("providers")
+    attest_usage = subcommands.add_parser("attest-provider-usage")
+    attest_usage.add_argument("provider", choices=("claude", "codex"))
+    attest_usage.add_argument("--binding-percent", type=float, required=True)
+    attest_usage.add_argument("--valid-seconds", type=int, required=True)
+    attest_usage.add_argument("--evidence-sha256", required=True)
     subcommands.add_parser("capabilities")
 
     paths_command = subcommands.add_parser("paths")
@@ -483,6 +488,22 @@ async def _run(arguments: argparse.Namespace) -> int:
         result = await client.request(
             "GET",
             "/v1/providers?workspace=" + workspace,
+        )
+        _print_json(result)
+        return 0
+    if arguments.command == "attest-provider-usage":
+        result = await client.request(
+            "POST",
+            "/v1/providers/"
+            + arguments.provider
+            + "/usage-attestations",
+            payload={
+                "binding_percent": arguments.binding_percent,
+                "credits_engaged": False,
+                "valid_seconds": arguments.valid_seconds,
+                "evidence_sha256": arguments.evidence_sha256,
+            },
+            idempotency_key=new_uuid(),
         )
         _print_json(result)
         return 0

@@ -809,6 +809,17 @@ def test_cli_dispatches_every_session_control(
         [*base, "status"],
         [*base, "status", "session-1"],
         [*base, "--cwd", str(tmp_path), "providers"],
+        [
+            *base,
+            "attest-provider-usage",
+            "claude",
+            "--binding-percent",
+            "44",
+            "--valid-seconds",
+            "3600",
+            "--evidence-sha256",
+            "d" * 64,
+        ],
         [*base, "capabilities"],
         [*base, "usage", "session-1"],
         [
@@ -928,6 +939,7 @@ def test_cli_dispatches_every_session_control(
     assert "/v1/sessions/session-1/messages" in paths
     assert "/v1/transfers/import" in paths
     assert "/v1/reconciliations/reconciliation-1/resolution" in paths
+    assert "/v1/providers/claude/usage-attestations" in paths
     assert any(
         item[1].endswith("/budget-extensions") and bool(item[3]) for item in requests
     )

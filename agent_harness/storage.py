@@ -6889,6 +6889,33 @@ class StateStore:
             }
         return result
 
+    def latest_operator_usage_attestation(
+        self,
+        provider: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM usage_samples
+                WHERE provider = ?
+                AND json_extract(payload_json, '$.payload.source')
+                    = 'operator-attestation'
+                ORDER BY observed_at DESC
+                LIMIT 1
+                """,
+                (provider,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sample_id": str(row["sample_id"]),
+            "provider": str(row["provider"]),
+            "observed_at": str(row["observed_at"]),
+            "binding_percent": row["binding_percent"],
+            "credits_engaged": bool(row["credits_engaged"]),
+            "payload": _load_object(row["payload_json"]),
+        }
+
     def active_provider_counts(self) -> dict[str, int]:
         with self._lock:
             rows = self._connection.execute(

@@ -219,6 +219,10 @@ def create_app(
         _route_preview,
     )
     app.router.add_get("/v1/providers", _providers)
+    app.router.add_post(
+        "/v1/providers/{provider}/usage-attestations",
+        _attest_provider_usage,
+    )
     app.router.add_get("/v1/leases", _leases)
     app.router.add_post("/v1/leases", _create_lease)
     app.router.add_patch("/v1/leases/{lease_id}", _update_lease)
@@ -822,6 +826,23 @@ async def _providers(request: web.Request) -> web.Response:
     workspace_text = request.query.get("workspace", ".")
     result = await service.scheduler.status(Path(workspace_text).resolve())
     return web.json_response({"providers": result})
+
+
+async def _attest_provider_usage(request: web.Request) -> web.Response:
+    payload = await _body(request)
+    provider = request.match_info["provider"]
+    return _optional_idempotent_response(
+        request,
+        "provider-usage-attestation:" + provider,
+        payload,
+        201,
+        lambda: {
+            "attestation": _service(request).scheduler.attest_operator_usage(
+                provider,
+                payload,
+            )
+        },
+    )
 
 
 async def _leases(request: web.Request) -> web.Response:
