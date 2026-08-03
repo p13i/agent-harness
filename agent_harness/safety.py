@@ -136,7 +136,7 @@ def limits_for(profile: str, workload: str) -> SafetyLimits:
             max_child_agents=2,
             max_dollars=None,
             stagnation_seconds=600,
-            binding_ceiling=70.0,
+            binding_ceiling=90.0,
             default_effort="medium",
             max_attempts=3,
         )
@@ -151,7 +151,7 @@ def limits_for(profile: str, workload: str) -> SafetyLimits:
         max_child_agents=2,
         max_dollars=None,
         stagnation_seconds=900,
-        binding_ceiling=70.0,
+        binding_ceiling=90.0,
         default_effort="high",
         max_attempts=3,
     )

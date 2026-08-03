@@ -1367,7 +1367,7 @@ async def test_api_creates_session_and_accepts_message(
             },
             {
                 "observed_at": "2099-01-01T00:00:00+00:00",
-                "binding_percent": 70,
+                "binding_percent": 90,
                 "credits_engaged": False,
             },
         ]
@@ -1390,7 +1390,7 @@ async def test_api_creates_session_and_accepts_message(
         )
         service.store.record_usage(
             "codex",
-            25.0,
+            89.0,
             False,
             {"payload": {}, "error": ""},
         )

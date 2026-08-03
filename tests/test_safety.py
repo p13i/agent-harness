@@ -48,8 +48,8 @@ def test_profiles_preserve_unattended_headroom() -> None:
     smoke = limits_for(LIVE_SMOKE, "implementation")
 
     assert interactive.binding_ceiling == 90.0
-    assert operations.binding_ceiling == 70.0
-    assert engineering.binding_ceiling == 70.0
+    assert operations.binding_ceiling == 90.0
+    assert engineering.binding_ceiling == 90.0
     assert smoke.binding_ceiling == 50.0
     assert operations.max_seconds == 900
     assert engineering.max_seconds == 2_700
