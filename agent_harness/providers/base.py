@@ -170,6 +170,18 @@ def trusted_provider_path() -> str:
     return os.pathsep.join(directories)
 
 
+def provider_npm_cache() -> Path:
+    """Return the durable npm cache beneath the private runtime root."""
+    return (
+        Path.home()
+        / "my"
+        / "chats"
+        / ".runtime"
+        / "provider-cache"
+        / "npm"
+    )
+
+
 def provider_environment(
     provider: str, auth_mode: str = "subscription"
 ) -> dict[str, str]:

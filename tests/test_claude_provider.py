@@ -1,4 +1,7 @@
 import sys
+from pathlib import Path
+
+import pytest
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -24,7 +27,15 @@ async def _empty_prompt():
         yield {}
 
 
-def test_npx_transport_pins_claude_code_package() -> None:
+def test_npx_transport_pins_claude_code_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "npm_config_cache",
+        "/actions-runner/_work/_temp/npm-cache",
+    )
     options = ClaudeAgentOptions(
         system_prompt={"type": "preset", "preset": "claude_code"},
         session_id="30d731ec-95c1-421c-9848-549419951165",
@@ -43,7 +54,19 @@ def test_npx_transport_pins_claude_code_package() -> None:
         "import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])",
     ]
     assert command.index("-B") < command.index("-c")
-    assert command[6:8] == ["/usr/bin/npx", CLAUDE_CODE_PACKAGE]
+    assert command[6:10] == [
+        "/usr/bin/npx",
+        "--cache",
+        str(
+            tmp_path
+            / "my"
+            / "chats"
+            / ".runtime"
+            / "provider-cache"
+            / "npm"
+        ),
+        CLAUDE_CODE_PACKAGE,
+    ]
     assert "--input-format" in command
     assert "stream-json" in command
 

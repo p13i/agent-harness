@@ -59,6 +59,7 @@ from agent_harness.providers.base import (
     ProviderResult,
     ProviderStatus,
     provider_environment,
+    provider_npm_cache,
     trusted_executable,
 )
 from agent_harness.providers.normalize import claude_payload
@@ -129,7 +130,13 @@ class NpxClaudeTransport(SubprocessCLITransport):
 
     def _build_command(self) -> list[str]:
         command = super()._build_command()
-        npx_command = [command[0], CLAUDE_CODE_PACKAGE, *command[1:]]
+        npx_command = [
+            command[0],
+            "--cache",
+            str(provider_npm_cache()),
+            CLAUDE_CODE_PACKAGE,
+            *command[1:],
+        ]
         launcher = "import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])"
         return [
             sys.executable,

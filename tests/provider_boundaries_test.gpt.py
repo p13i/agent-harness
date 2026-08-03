@@ -6,6 +6,7 @@ import asyncio
 import io
 import runpy
 import sqlite3
+import sys
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -146,6 +147,7 @@ def _server(tmp_path: Path) -> codex.CodexAppServer:
 
 
 def test_provider_base_contract_and_environment(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Adapter(ProviderAdapter):
@@ -216,6 +218,18 @@ def test_provider_base_contract_and_environment(
         "PYTHONDONTWRITEBYTECODE": "1",
         "ANTHROPIC_API_KEY": "anthropic",
     }
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = base.provider_npm_cache()
+    assert cache == (
+        tmp_path
+        / "my"
+        / "chats"
+        / ".runtime"
+        / "provider-cache"
+        / "npm"
+    )
+    assert not cache.exists()
 
 
 def test_trusted_provider_executable_ignores_hostile_path_and_fails_closed(
@@ -1273,6 +1287,31 @@ def test_claude_helpers_and_transport(
     )
     assert transport._find_cli() == "/usr/bin/npx"
     asyncio.run(transport._check_claude_version())
+
+    monkeypatch.setattr(
+        claude.SubprocessCLITransport,
+        "_build_command",
+        lambda unused: ["/usr/bin/npx", "--output-format", "stream-json"],
+    )
+    monkeypatch.setattr(
+        claude,
+        "provider_npm_cache",
+        lambda: tmp_path / "npm-cache",
+    )
+    assert transport._build_command() == [
+        sys.executable,
+        "-I",
+        "-B",
+        "-S",
+        "-c",
+        "import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])",
+        "/usr/bin/npx",
+        "--cache",
+        str(tmp_path / "npm-cache"),
+        "@anthropic-ai/claude-code@2.1.220",
+        "--output-format",
+        "stream-json",
+    ]
 
     assert claude._permission_mode("full") == "bypassPermissions"
     assert claude._permission_mode("plan") == "plan"
