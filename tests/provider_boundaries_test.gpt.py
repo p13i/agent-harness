@@ -390,6 +390,14 @@ def test_codex_server_readers_and_timeout(
             "�second",
         ]
 
+        closing = _server(tmp_path)
+        closing.process = Process(  # type: ignore[assignment]
+            stdout=Stream([]),
+            stderr=Stream([]),
+        )
+        closing._closing = True
+        await closing._read_messages()
+
         server.process = None
         await server._read_messages()
         await server._read_stderr()

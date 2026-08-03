@@ -718,7 +718,10 @@ class SessionWorker:
                 }
             )
         submitted_tokens = (len(prompt) + 3) // 4
-        violation = guard.begin_attempt(submitted_tokens)
+        violation = guard.begin_attempt(
+            submitted_tokens,
+            charge_reported_cost=decision.credits_engaged,
+        )
         if violation:
             raise SafetyGuardError(
                 violation,

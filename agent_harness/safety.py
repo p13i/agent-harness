@@ -447,9 +447,15 @@ class TurnGuard:
         self._attempt_exact_input = 0
         self._attempt_exact_cached_input = 0
         self._attempt_exact_dollars = 0.0
+        self._charge_reported_cost = True
         self._material_state_digest = ""
 
-    def begin_attempt(self, context_tokens: int) -> str:
+    def begin_attempt(
+        self,
+        context_tokens: int,
+        *,
+        charge_reported_cost: bool = True,
+    ) -> str:
         self.consumption.attempts += 1
         submitted = max(0, context_tokens)
         self.consumption.context_tokens += submitted
@@ -458,6 +464,7 @@ class TurnGuard:
         self._attempt_exact_input = 0
         self._attempt_exact_cached_input = 0
         self._attempt_exact_dollars = 0.0
+        self._charge_reported_cost = charge_reported_cost
         self.consumption.total_tokens += submitted
         return self.violation()
 
@@ -615,7 +622,7 @@ class TurnGuard:
     def _observe_usage(self, value: object) -> None:
         normalized = normalize_usage(value)
         cost = normalize_cost(value)
-        if has_exact_cost(value):
+        if self._charge_reported_cost and has_exact_cost(value):
             exact_dollars = max(self._attempt_exact_dollars, cost)
             self.consumption.dollars += exact_dollars - self._attempt_exact_dollars
             self._attempt_exact_dollars = exact_dollars

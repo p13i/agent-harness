@@ -350,6 +350,22 @@ def test_provider_usage_cannot_reduce_accounted_consumption() -> None:
     assert incremental["total_tokens"] == 120
 
 
+def test_subscription_attempt_ignores_provider_cost_equivalent() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_dollars=0.0))
+    guard.begin_attempt(1, charge_reported_cost=False)
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            metadata={"total_cost_usd": 0.25},
+        )
+    )
+
+    assert guard.violation() == ""
+    assert guard.consumption.dollars == 0.0
+    assert guard.consumption.exact_dollars is False
+
+
 def test_invalid_provider_usage_retains_conservative_estimates() -> None:
     guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
     guard.begin_attempt(500)

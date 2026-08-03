@@ -1663,7 +1663,9 @@ async def test_worker_attempt_guard_event_lease_and_failure_boundaries(
 
         limited = SimpleNamespace(
             limits=limits_for("interactive", "implementation"),
-            begin_attempt=lambda unused: "context-tokens",
+            begin_attempt=lambda unused, *, charge_reported_cost=True: (
+                "context-tokens"
+            ),
         )
         with pytest.raises(SafetyGuardError, match="context-tokens"):
             await rig.worker._execute_attempt(
@@ -1817,7 +1819,13 @@ async def test_stagnation_after_acceptance_requires_reconciliation(
                 consumption = SafetyConsumption()
             self.consumption = consumption
 
-        def begin_attempt(self, context_tokens: int) -> str:
+        def begin_attempt(
+            self,
+            context_tokens: int,
+            *,
+            charge_reported_cost: bool = True,
+        ) -> str:
+            del charge_reported_cost
             self.consumption.attempts += 1
             self.consumption.context_tokens += context_tokens
             return ""
@@ -2638,6 +2646,42 @@ async def test_e2e_zero_dollar_goal_rejects_metered_route_before_provider(
         assert receipt.status == "failed"
         assert receipt.result["code"] == "E_PROVIDER_UNAVAILABLE"
         assert not claude.prompts
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_subscription_cost_equivalent_is_not_metered_spend(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter(
+        "claude",
+        cost=0.25,
+        claims_cost_reporting=True,
+    )
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.scheduler._usage_cache = {
+        "claude": _usage("claude", 20.0, credits=False),
+        "codex": _usage("codex", 20.0),
+    }
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    try:
+        goal = create_goal(
+            rig.session.session_id,
+            "Use subscription capacity only.",
+            budgets={"dollars": 0},
+        )
+        rig.store.create_goal(goal)
+
+        receipt = await rig.message(
+            "Complete on the subscription route.",
+            provider="claude",
+        )
+
+        assert receipt.status == "complete"
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["consumption"]["dollars"] == 0
+        assert envelope["consumption"]["exact_dollars"] is False
     finally:
         rig.close()
 

@@ -59,10 +59,12 @@ class CodexAppServer:
         self._next_id = 0
         self.stderr_tail: list[str] = []
         self._process_group: ProcessGroupIdentity | None = None
+        self._closing = False
 
     async def start(self) -> None:
         if self.process is not None:
             return
+        self._closing = False
         command = [
             trusted_executable("npx"),
             "-y",
@@ -141,6 +143,7 @@ class CodexAppServer:
         process = self.process
         if process is None:
             return
+        self._closing = True
         if process.stdin is not None:
             process.stdin.close()
         identity = self._process_group
@@ -158,6 +161,7 @@ class CodexAppServer:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.process = None
         self._process_group = None
+        self._closing = False
 
     async def request(
         self,
@@ -214,6 +218,8 @@ class CodexAppServer:
                 await self._route(payload)
         except BaseException as error:
             failure = error
+        if failure is None and self._closing:
+            return
         if failure is None:
             detail = "Codex app-server connection closed"
             if self.stderr_tail:
