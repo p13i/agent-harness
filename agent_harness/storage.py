@@ -19,7 +19,7 @@ from agent_harness.errors import (
     WorkerOwnershipLostError,
 )
 from agent_harness.goals import goal_contract_digest
-from agent_harness.ids import new_uuid, utc_now
+from agent_harness.ids import derived_uuid, new_uuid, utc_now
 from agent_harness.models import (
     Attention,
     Checkpoint,
@@ -5226,6 +5226,194 @@ class StateStore:
             ).fetchone()
         return _reconciliation(current)
 
+    def project_resolved_reconciliation(
+        self,
+        reconciliation_id: str,
+    ) -> CommandReceipt | None:
+        """Project a reconciliation that was accepted before this ran.
+
+        A reconciliation resolved by an earlier build left its command
+        stranded on the ambiguous topology even though the turn had
+        finished. Re-confirming the same resolution replays the
+        projection; it declines once the command is already terminal,
+        so it is safe to repeat.
+        """
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM reconciliations
+                WHERE reconciliation_id = ?
+                """,
+                (reconciliation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("reconciliation")
+            if (
+                str(row["status"]) != ReconciliationStatus.RESOLVED
+                or str(row["resolution"]) != ReconciliationDecision.ACCEPT_CURRENT
+            ):
+                return None
+            audit = _load_object(str(row["audit_json"]))
+            identity = _object_or_empty(audit.get("dispatch_identity"))
+            attempt_id = str(identity.get("attempt_id", ""))
+            turn_id = str(identity.get("turn_id", ""))
+            command_id = str(row["command_id"])
+            session_id = str(row["session_id"])
+            # The resolution this replays certified one crossed
+            # boundary. A second one means a dispatch the original
+            # receipt never covered, so there is no single outcome to
+            # project and this declines rather than picking a side.
+            boundaries = connection.execute(
+                """
+                SELECT COUNT(*) AS total FROM command_dispatches
+                WHERE session_id = ? AND command_id = ? AND crossed_boundary = 1
+                """,
+                (session_id, command_id),
+            ).fetchone()
+            if boundaries is None or int(boundaries["total"]) != 1:
+                return None
+            attempt = connection.execute(
+                """
+                SELECT provider_attempts.* FROM provider_attempts
+                JOIN command_dispatches USING(attempt_id)
+                WHERE provider_attempts.attempt_id = ?
+                    AND provider_attempts.session_id = ?
+                    AND command_dispatches.command_id = ?
+                    AND command_dispatches.turn_id = ?
+                    AND command_dispatches.crossed_boundary = 1
+                """,
+                (attempt_id, session_id, command_id, turn_id),
+            ).fetchone()
+            if attempt is None:
+                return None
+            if not _topology_receipt_binds(
+                _object_or_empty(audit.get("topology_receipt")),
+                reconciliation_id=reconciliation_id,
+                session_id=session_id,
+                command_id=command_id,
+                attempt_id=attempt_id,
+                turn_id=turn_id,
+            ):
+                return None
+            completion = self._reconciled_completion_evidence(
+                connection,
+                row,
+                attempt,
+                turn_id,
+                audit,
+                ReconciliationDecision.ACCEPT_CURRENT,
+            )
+            if completion is None:
+                return None
+            now = utc_now()
+            settled = self._settle_reconciled_topology(
+                connection,
+                command_id,
+                turn_id,
+                attempt,
+                completion,
+                now,
+            )
+            receipt = _object_or_empty(audit.get("topology_receipt"))
+            receipt.update(
+                {
+                    "attempt_state": settled["settled_state"],
+                    "turn_state": settled["settled_state"],
+                    "dispatch_state": settled["settled_state"],
+                    "envelope_state": settled["envelope_state"],
+                    "guard_reason": settled["guard_reason"],
+                    "prior_guard_reason": settled["prior_guard_reason"],
+                    "command_status": str(CommandStatus.COMPLETE),
+                    "completion_evidence": dict(completion),
+                    "projected_at": now,
+                }
+            )
+            audit["topology_receipt"] = receipt
+            connection.execute(
+                """
+                UPDATE reconciliations SET audit_json = ?
+                WHERE reconciliation_id = ?
+                """,
+                (_dump(audit), reconciliation_id),
+            )
+            # The original resolution event stays exactly as recorded.
+            # This appends the later transition so the topology change
+            # is observable, and so a proof taken at the new
+            # through_sequence explains its own digest instead of
+            # differing silently at the old one.
+            self._append_projection_event(
+                connection,
+                session_id,
+                reconciliation_id,
+                command_id,
+                receipt,
+                now,
+            )
+            command = connection.execute(
+                "SELECT * FROM commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+        return _command(command)
+
+    def _append_projection_event(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        reconciliation_id: str,
+        command_id: str,
+        receipt: dict[str, Any],
+        now: str,
+    ) -> None:
+        event_id = derived_uuid(
+            "p13i/agent-harness/reconciliation-projected/" + reconciliation_id
+        )
+        existing = connection.execute(
+            """
+            SELECT sequence FROM events
+            WHERE session_id = ? AND event_id = ?
+                AND event_type = 'reconciliation.projected'
+            """,
+            (session_id, event_id),
+        ).fetchone()
+        if existing is not None:
+            return
+        sequence_row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        sequence = 1
+        if sequence_row is not None:
+            sequence = int(sequence_row["sequence"]) + 1
+        evidence = _object_or_empty(receipt.get("completion_evidence"))
+        connection.execute(
+            """
+            INSERT INTO events VALUES (
+                ?, ?, ?, 'reconciliation.projected', '', '',
+                'complete', ?, '', '', ?
+            )
+            """,
+            (
+                session_id,
+                sequence,
+                event_id,
+                _dump(
+                    {
+                        "reconciliation_id": reconciliation_id,
+                        "command_id": command_id,
+                        "decision": str(ReconciliationDecision.ACCEPT_CURRENT),
+                        "resolution_checkpoint_id": str(
+                            evidence.get("checkpoint_id", "")
+                        ),
+                        "resolution_workspace_digest": str(
+                            evidence.get("workspace_material_digest", "")
+                        ),
+                        "topology_receipt": dict(receipt),
+                    }
+                ),
+                now,
+            ),
+        )
+
     def resolve_reconciliation_record(
         self,
         reconciliation_id: str,
@@ -5264,6 +5452,7 @@ class StateStore:
                 row,
                 audit,
                 now,
+                decision,
             )
             connection.execute(
                 """
@@ -5383,6 +5572,7 @@ class StateStore:
                 row,
                 audit,
                 now,
+                decision,
             )
             connection.execute(
                 """
@@ -5503,6 +5693,7 @@ class StateStore:
         reconciliation: sqlite3.Row,
         audit: dict[str, Any],
         now: str,
+        decision: str,
     ) -> dict[str, Any]:
         command_id = str(reconciliation["command_id"])
         session_id = str(reconciliation["session_id"])
@@ -5601,48 +5792,26 @@ class StateStore:
                 }
             )
 
-        connection.execute(
-            """
-            UPDATE provider_attempts SET status = 'ambiguous',
-                ended_at = CASE WHEN ended_at = '' THEN ? ELSE ended_at END
-            WHERE attempt_id = ?
-            """,
-            (now, attempt_id),
+        completion = self._reconciled_completion_evidence(
+            connection,
+            reconciliation,
+            attempt,
+            turn_id,
+            resolved_audit,
+            decision,
         )
-        connection.execute(
-            """
-            UPDATE turns SET status = 'ambiguous',
-                completed_at = CASE
-                    WHEN completed_at = '' THEN ? ELSE completed_at END
-            WHERE turn_id = ?
-            """,
-            (now, turn_id),
+        settled = self._settle_reconciled_topology(
+            connection,
+            command_id,
+            turn_id,
+            attempt,
+            completion,
+            now,
         )
-        connection.execute(
-            """
-            UPDATE command_dispatches SET state = 'ambiguous', updated_at = ?
-            WHERE attempt_id = ?
-            """,
-            (now, attempt_id),
-        )
-        envelope = connection.execute(
-            """
-            SELECT command_id FROM command_envelopes WHERE command_id = ?
-            """,
-            (command_id,),
-        ).fetchone()
-        envelope_state = ""
-        guard_reason = ""
-        if envelope is not None:
-            envelope_state = "paused"
-            guard_reason = "ambiguous-provider-dispatch"
-            connection.execute(
-                """
-                UPDATE command_envelopes SET state = ?, guard_reason = ?,
-                    updated_at = ? WHERE command_id = ?
-                """,
-                (envelope_state, guard_reason, now, command_id),
-            )
+        settled_state = str(settled["settled_state"])
+        envelope_state = str(settled["envelope_state"])
+        guard_reason = str(settled["guard_reason"])
+        prior_guard_reason = str(settled["prior_guard_reason"])
         resolved_audit["dispatch_identity"] = {
             "attempt_id": attempt_id,
             "turn_id": turn_id,
@@ -5670,15 +5839,223 @@ class StateStore:
             "attempt_id": attempt_id,
             "turn_id": turn_id,
             "checkpoint_id": str(dispatch["checkpoint_id"]),
-            "attempt_state": "ambiguous",
-            "turn_state": "ambiguous",
-            "dispatch_state": "ambiguous",
+            "attempt_state": settled_state,
+            "turn_state": settled_state,
+            "dispatch_state": settled_state,
             "envelope_state": envelope_state,
             "guard_reason": guard_reason,
             "leases": lease_receipts,
             "recorded_at": now,
         }
+        if completion is not None:
+            resolved_audit["topology_receipt"].update(
+                {
+                    "command_status": str(CommandStatus.COMPLETE),
+                    "prior_guard_reason": prior_guard_reason,
+                    "completion_evidence": dict(completion),
+                }
+            )
         return resolved_audit
+
+    def _settle_reconciled_topology(
+        self,
+        connection: sqlite3.Connection,
+        command_id: str,
+        turn_id: str,
+        attempt: sqlite3.Row,
+        completion: dict[str, Any] | None,
+        now: str,
+    ) -> dict[str, Any]:
+        attempt_id = str(attempt["attempt_id"])
+        settled_state = "ambiguous"
+        if completion is not None:
+            settled_state = "complete"
+        connection.execute(
+            """
+            UPDATE provider_attempts SET status = ?,
+                ended_at = CASE WHEN ended_at = '' THEN ? ELSE ended_at END
+            WHERE attempt_id = ?
+            """,
+            (settled_state, now, attempt_id),
+        )
+        connection.execute(
+            """
+            UPDATE turns SET status = ?,
+                completed_at = CASE
+                    WHEN completed_at = '' THEN ? ELSE completed_at END
+            WHERE turn_id = ?
+            """,
+            (settled_state, now, turn_id),
+        )
+        connection.execute(
+            """
+            UPDATE command_dispatches SET state = ?, updated_at = ?
+            WHERE attempt_id = ?
+            """,
+            (settled_state, now, attempt_id),
+        )
+        envelope = connection.execute(
+            """
+            SELECT command_id, guard_reason FROM command_envelopes
+            WHERE command_id = ?
+            """,
+            (command_id,),
+        ).fetchone()
+        envelope_state = ""
+        guard_reason = ""
+        prior_guard_reason = ""
+        if envelope is not None:
+            prior_guard_reason = str(envelope["guard_reason"])
+            envelope_state = "paused"
+            guard_reason = "ambiguous-provider-dispatch"
+            if completion is not None:
+                envelope_state = "complete"
+                guard_reason = ""
+            connection.execute(
+                """
+                UPDATE command_envelopes SET state = ?, guard_reason = ?,
+                    updated_at = ? WHERE command_id = ?
+                """,
+                (envelope_state, guard_reason, now, command_id),
+            )
+        if completion is not None:
+            connection.execute(
+                """
+                UPDATE commands SET status = ?, result_json = ?, updated_at = ?
+                WHERE command_id = ?
+                """,
+                (
+                    CommandStatus.COMPLETE,
+                    _dump(_reconciled_command_result(attempt, completion)),
+                    now,
+                    command_id,
+                ),
+            )
+        return {
+            "settled_state": settled_state,
+            "envelope_state": envelope_state,
+            "guard_reason": guard_reason,
+            "prior_guard_reason": prior_guard_reason,
+        }
+
+    def _reconciled_completion_evidence(
+        self,
+        connection: sqlite3.Connection,
+        reconciliation: sqlite3.Row,
+        attempt: sqlite3.Row,
+        turn_id: str,
+        resolved_audit: dict[str, Any],
+        decision: str,
+    ) -> dict[str, Any] | None:
+        """Project a resolved dispatch onto the completion the log already proves.
+
+        Returns ``None`` unless the accepted turn left an observable
+        terminal record. Every field is read back from the recorded
+        event log; nothing here reconstructs an unobserved outcome.
+        """
+        if decision != ReconciliationDecision.ACCEPT_CURRENT:
+            return None
+        native_session_id = str(attempt["native_session_id"])
+        if not native_session_id:
+            return None
+        checkpoint_id = str(resolved_audit.get("resolution_checkpoint_id", ""))
+        workspace_digest = str(resolved_audit.get("resolution_workspace_digest", ""))
+        if not checkpoint_id or not _is_digest(workspace_digest):
+            return None
+        session_id = str(reconciliation["session_id"])
+        command_id = str(reconciliation["command_id"])
+        # The checkpoint the result points at has to be a real anchor
+        # in this session, not just an id the audit happens to carry.
+        checkpoint = connection.execute(
+            """
+            SELECT checkpoint_id FROM checkpoints
+            WHERE checkpoint_id = ? AND session_id = ?
+            """,
+            (checkpoint_id, session_id),
+        ).fetchone()
+        if checkpoint is None:
+            return None
+        command = connection.execute(
+            "SELECT * FROM commands WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        if command is None or str(command["status"]) not in {
+            CommandStatus.DISPATCHING,
+            CommandStatus.FAILED,
+        }:
+            return None
+        prior_result_json = str(command["result_json"])
+        prior_result = _load_object(prior_result_json)
+        bound_reconciliation = str(prior_result.get("reconciliation_id", ""))
+        if bound_reconciliation and bound_reconciliation != str(
+            reconciliation["reconciliation_id"]
+        ):
+            return None
+        completions = connection.execute(
+            """
+            SELECT sequence FROM events
+            WHERE session_id = ? AND turn_id = ?
+                AND event_type = 'turn.completed' AND status = 'complete'
+            ORDER BY sequence
+            """,
+            (session_id, turn_id),
+        ).fetchall()
+        if len(completions) != 1:
+            return None
+        # A turn that also failed, was interrupted, reported a provider
+        # error, or completed under a non-complete status did not end
+        # the way the single completion suggests. Providers can emit a
+        # complete-looking resume hint and then fail the turn, so one
+        # matching completion is not on its own proof of the outcome.
+        contradictions = connection.execute(
+            """
+            SELECT COUNT(*) AS total FROM events
+            WHERE session_id = ? AND turn_id = ?
+                AND (
+                    event_type IN ('turn.failed', 'turn.interrupted', 'provider.error')
+                    OR (event_type = 'turn.completed' AND status != 'complete')
+                )
+            """,
+            (session_id, turn_id),
+        ).fetchone()
+        if contradictions is None or int(contradictions["total"]) != 0:
+            return None
+        messages = connection.execute(
+            """
+            SELECT sequence, text FROM events
+            WHERE session_id = ? AND turn_id = ?
+                AND event_type = 'agent.message' AND text != ''
+            ORDER BY sequence
+            """,
+            (session_id, turn_id),
+        ).fetchall()
+        if not messages:
+            return None
+        completion_sequence = int(completions[0]["sequence"])
+        final_message = messages[-1]
+        message_sequence = int(final_message["sequence"])
+        if message_sequence > completion_sequence:
+            return None
+        return {
+            "reconciliation_id": str(reconciliation["reconciliation_id"]),
+            "native_session_id": native_session_id,
+            "turn_id": turn_id,
+            "attempt_id": str(attempt["attempt_id"]),
+            "final_message_sequence": message_sequence,
+            "final_message_sha256": hashlib.sha256(
+                str(final_message["text"]).encode("utf-8")
+            ).hexdigest(),
+            "turn_completed_sequence": completion_sequence,
+            "checkpoint_id": checkpoint_id,
+            "workspace_material_digest": workspace_digest,
+            # Keep why the command was failed, not what it said: the
+            # code is a closed vocabulary, the digest proves the trace
+            # without republishing provider or guard prose.
+            "prior_code": str(prior_result.get("code", "")),
+            "prior_result_sha256": hashlib.sha256(
+                prior_result_json.encode("utf-8")
+            ).hexdigest(),
+        }
 
     def create_approval(
         self,
@@ -8053,6 +8430,54 @@ def _load_object(value: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ValueError("stored JSON is not an object")
     return decoded
+
+
+def _is_digest(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    return all(character in "0123456789abcdef" for character in value)
+
+
+def _topology_receipt_binds(
+    receipt: dict[str, Any],
+    *,
+    reconciliation_id: str,
+    session_id: str,
+    command_id: str,
+    attempt_id: str,
+    turn_id: str,
+) -> bool:
+    """Require the retained receipt to name this exact resolution."""
+    if not receipt:
+        return False
+    return (
+        str(receipt.get("reconciliation_id", "")) == reconciliation_id
+        and str(receipt.get("session_id", "")) == session_id
+        and str(receipt.get("command_id", "")) == command_id
+        and str(receipt.get("attempt_id", "")) == attempt_id
+        and str(receipt.get("turn_id", "")) == turn_id
+    )
+
+
+def _reconciled_command_result(
+    attempt: sqlite3.Row,
+    completion: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "provider": str(attempt["provider"]),
+        "model": str(attempt["model"]),
+        "effort": str(attempt["effort"]),
+        "turn_id": str(completion["turn_id"]),
+        "native_session_id": str(completion["native_session_id"]),
+        "status": "complete",
+        "checkpoint_id": str(completion["checkpoint_id"]),
+        "workspace_material_digest": str(completion["workspace_material_digest"]),
+        "final_message_sha256": str(completion["final_message_sha256"]),
+        "reconciliation_id": str(completion["reconciliation_id"]),
+        "reconciled_resolution": str(ReconciliationDecision.ACCEPT_CURRENT),
+        "prior_code": str(completion["prior_code"]),
+        "prior_result_sha256": str(completion["prior_result_sha256"]),
+    }
 
 
 def _session(row: sqlite3.Row | dict[str, Any]) -> Session:

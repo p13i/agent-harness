@@ -15,6 +15,11 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+def derived_uuid(name: str) -> str:
+    """Derive a stable UUID so a repeated write stays one record."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

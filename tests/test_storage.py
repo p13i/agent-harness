@@ -1,5 +1,7 @@
+import asyncio
 import copy
 import datetime
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -7,6 +9,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from test_support import session
@@ -17,6 +20,7 @@ import agent_harness.records as records_module
 import agent_harness.storage as storage_module
 import agent_harness.sync as sync_module
 from agent_harness import child_gate
+from agent_harness.blobs import BlobStore
 from agent_harness.config import paths, prepare_paths
 from agent_harness.errors import ConflictError, NotFoundError
 from agent_harness.goals import create_goal, make_evidence
@@ -31,6 +35,7 @@ from agent_harness.orchestration import (
     normalized_digest,
 )
 from agent_harness.proof import proof_snapshot
+from agent_harness.reconciliation import ReconciliationManager
 from agent_harness.records import load_portable_records
 from agent_harness.storage import StateStore
 from agent_harness.sync import (
@@ -3342,3 +3347,911 @@ def test_proof_route_admissibility_requires_bounded_binding_usage() -> None:
         True,
         True,
     )
+
+
+def _ambiguous_live_dispatch(
+    tmp_path: Path,
+    *,
+    native_session_id: str = "native-live",
+    record_completion: bool = True,
+    record_message: bool = True,
+    message_after_completion: bool = False,
+    contradiction: tuple[str, str] | None = None,
+) -> SimpleNamespace:
+    """Reproduce a crossed-boundary dispatch whose turn already finished."""
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "live transport step"},
+        "live-transport",
+    )
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        {"max_dollars": 0.0},
+    )
+    assert store.claim_command(created.session_id) is not None
+    now = utc_now()
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="claude",
+        native_session_id=native_session_id,
+        model="sonnet",
+        effort="low",
+        auth_mode="subscription",
+        status="running",
+        started_at=now,
+        ended_at="",
+    )
+    store.create_attempt(attempt)
+    turn_id = store.start_turn(created.session_id, attempt.attempt_id)
+    checkpoint = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=store.last_sequence(created.session_id),
+        provider="claude",
+        native_session_id=native_session_id,
+        base_commit="base",
+        patch_digest="patch",
+        untracked_digest="untracked",
+        context_digest="context",
+        created_at=now,
+    )
+    store.add_checkpoint(checkpoint)
+    store.record_dispatch_checkpoint(
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        checkpoint.checkpoint_id,
+    )
+    store.mark_provider_boundary(attempt.attempt_id)
+    text = "live-transport/claude-live: completed - nonce ba5e0a97418e71ad"
+    if record_message and not message_after_completion:
+        store.append_event(
+            created.session_id,
+            "agent.message",
+            role="assistant",
+            text=text,
+            turn_id=turn_id,
+        )
+    if record_completion:
+        store.append_event(
+            created.session_id,
+            "turn.completed",
+            status="complete",
+            text=text,
+            turn_id=turn_id,
+        )
+    if record_message and message_after_completion:
+        store.append_event(
+            created.session_id,
+            "agent.message",
+            role="assistant",
+            text=text,
+            turn_id=turn_id,
+        )
+    if contradiction is not None:
+        contradiction_type, contradiction_status = contradiction
+        store.append_event(
+            created.session_id,
+            contradiction_type,
+            status=contradiction_status,
+            turn_id=turn_id,
+        )
+    recovery = store.recover_interrupted_commands(
+        created.session_id,
+        "digest-current",
+        "summary-current",
+    )
+    assert len(recovery.reconciliations) == 1
+    record = recovery.reconciliations[0]
+    assert store.get_command(command.command_id).status == CommandStatus.FAILED
+    resolution = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=store.last_sequence(created.session_id),
+        provider="claude",
+        native_session_id="",
+        base_commit="base",
+        patch_digest="patch",
+        untracked_digest="untracked",
+        context_digest="context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(resolution)
+    return SimpleNamespace(
+        store=store,
+        session=created,
+        command=command,
+        attempt=attempt,
+        turn_id=turn_id,
+        record=record,
+        text=text,
+        resolution_checkpoint_id=resolution.checkpoint_id,
+        workspace_digest="b" * 64,
+    )
+
+
+def _resolution_audit(rig: SimpleNamespace) -> dict[str, Any]:
+    return {
+        "actor": "test",
+        "checkpoint_id": rig.resolution_checkpoint_id,
+        "resolution_checkpoint_id": rig.resolution_checkpoint_id,
+        "resolution_workspace_digest": rig.workspace_digest,
+    }
+
+
+def _topology(rig: SimpleNamespace, resolved: Any) -> dict[str, Any]:
+    del rig
+    receipt = resolved.audit["topology_receipt"]
+    assert isinstance(receipt, dict)
+    return receipt
+
+
+def test_accept_current_projects_the_recorded_turn_completion(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+
+    resolved = store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+
+    completed = store.get_command(rig.command.command_id)
+    assert completed.status == CommandStatus.COMPLETE
+    assert completed.result["status"] == "complete"
+    assert completed.result["native_session_id"] == "native-live"
+    assert completed.result["turn_id"] == rig.turn_id
+    assert completed.result["provider"] == "claude"
+    assert completed.result["model"] == "sonnet"
+    assert completed.result["effort"] == "low"
+    assert completed.result["checkpoint_id"] == rig.resolution_checkpoint_id
+    assert completed.result["workspace_material_digest"] == rig.workspace_digest
+    assert completed.result["reconciled_resolution"] == "accept-current"
+    assert completed.result["reconciliation_id"] == rig.record.reconciliation_id
+    assert completed.result["final_message_sha256"] == hashlib.sha256(
+        rig.text.encode("utf-8")
+    ).hexdigest()
+
+    attempts = store.attempts(rig.session.session_id)
+    assert [item.status for item in attempts] == ["complete"]
+    assert attempts[0].native_session_id == "native-live"
+    envelope = store.command_envelope(rig.command.command_id)
+    assert envelope["state"] == "complete"
+    assert envelope["guard_reason"] == ""
+    with store.transaction() as connection:
+        row = connection.execute(
+            """
+            SELECT turns.status AS turn_state,
+                command_dispatches.state AS dispatch_state
+            FROM turns JOIN command_dispatches USING(turn_id)
+            WHERE command_dispatches.attempt_id = ?
+            """,
+            (rig.attempt.attempt_id,),
+        ).fetchone()
+    assert row["turn_state"] == "complete"
+    assert row["dispatch_state"] == "complete"
+
+    receipt = _topology(rig, resolved)
+    assert receipt["attempt_state"] == "complete"
+    assert receipt["turn_state"] == "complete"
+    assert receipt["dispatch_state"] == "complete"
+    assert receipt["envelope_state"] == "complete"
+    assert receipt["guard_reason"] == ""
+    assert receipt["command_status"] == "complete"
+    evidence = receipt["completion_evidence"]
+    assert evidence["native_session_id"] == "native-live"
+    assert evidence["attempt_id"] == rig.attempt.attempt_id
+    assert evidence["final_message_sequence"] < evidence["turn_completed_sequence"]
+
+    snapshot = proof_snapshot(store, rig.session.session_id)
+    projected = [
+        item
+        for item in snapshot["commands"]
+        if item["command_id"] == rig.command.command_id
+    ]
+    assert len(projected) == 1
+    assert projected[0]["status"] == "complete"
+    assert projected[0]["result"]["native_session_id"] == "native-live"
+    assert projected[0]["result"]["final_message_sha256"] == (
+        completed.result["final_message_sha256"]
+    )
+    assert [item["status"] for item in snapshot["attempts"]] == ["complete"]
+    assert [item["status"] for item in snapshot["turns"]] == ["complete"]
+    store.close()
+
+
+def test_accept_current_projection_survives_the_idempotent_resolution_path(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+
+    resolved, created = store.resolve_reconciliation_once(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+        None,
+        idempotency_key="resolve-once",
+        operation="reconciliation-resolve",
+        request_digest="request",
+    )
+
+    assert created is True
+    assert resolved.status == "resolved"
+    assert _topology(rig, resolved)["command_status"] == "complete"
+    assert store.get_command(rig.command.command_id).status == CommandStatus.COMPLETE
+    replayed, replay_created = store.resolve_reconciliation_once(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+        None,
+        idempotency_key="resolve-once",
+        operation="reconciliation-resolve",
+        request_digest="request",
+    )
+    assert replay_created is False
+    assert replayed == resolved
+    assert store.get_command(rig.command.command_id).status == CommandStatus.COMPLETE
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "decision,kwargs",
+    [
+        ("accept-current", {"record_completion": False}),
+        ("accept-current", {"record_message": False}),
+        ("accept-current", {"native_session_id": ""}),
+        ("accept-current", {"message_after_completion": True}),
+        # A single matching completion is not proof when the same turn
+        # also ended some other way. The last case is the observed Kimi
+        # shape: a complete-looking resume hint, then turn.failed.
+        ("accept-current", {"contradiction": ("turn.completed", "interrupted")}),
+        ("accept-current", {"contradiction": ("turn.interrupted", "interrupted")}),
+        ("accept-current", {"contradiction": ("provider.error", "failed")}),
+        ("accept-current", {"contradiction": ("turn.failed", "failed")}),
+        ("restore-pre-turn", {}),
+        ("stop", {}),
+    ],
+)
+def test_reconciliation_without_proven_completion_stays_ambiguous(
+    tmp_path: Path,
+    decision: str,
+    kwargs: dict[str, Any],
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path, **kwargs)
+    store = rig.store
+
+    resolved = store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        decision,
+        "digest-current",
+        _resolution_audit(rig),
+    )
+
+    failed = store.get_command(rig.command.command_id)
+    assert failed.status == CommandStatus.FAILED
+    assert failed.result["code"] == "E_NEEDS_RECONCILIATION"
+    assert [item.status for item in store.attempts(rig.session.session_id)] == [
+        "ambiguous"
+    ]
+    envelope = store.command_envelope(rig.command.command_id)
+    assert envelope["state"] == "paused"
+    assert envelope["guard_reason"] == "ambiguous-provider-dispatch"
+    receipt = _topology(rig, resolved)
+    assert receipt["attempt_state"] == "ambiguous"
+    assert receipt["turn_state"] == "ambiguous"
+    assert receipt["dispatch_state"] == "ambiguous"
+    assert "command_status" not in receipt
+    assert "completion_evidence" not in receipt
+    with store.transaction() as connection:
+        dispatch = connection.execute(
+            "SELECT state FROM command_dispatches WHERE command_id = ?",
+            (rig.command.command_id,),
+        ).fetchone()
+    assert dispatch["state"] == "ambiguous"
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "audit",
+    [
+        {"actor": "test"},
+        {"actor": "test", "resolution_workspace_digest": "b" * 64},
+        {"actor": "test", "resolution_checkpoint_id": "checkpoint", "digest": ""},
+    ],
+)
+def test_accept_current_without_certified_material_stays_ambiguous(
+    tmp_path: Path,
+    audit: dict[str, Any],
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+
+    resolved = store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        audit,
+    )
+
+    assert store.get_command(rig.command.command_id).status == CommandStatus.FAILED
+    assert _topology(rig, resolved)["attempt_state"] == "ambiguous"
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "status,result",
+    [
+        (CommandStatus.FAILED, {"reconciliation_id": "other"}),
+        (CommandStatus.CANCELLED, {}),
+    ],
+)
+def test_accept_current_declines_a_command_it_does_not_own(
+    tmp_path: Path,
+    status: str,
+    result: dict[str, Any],
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    payload = dict(result)
+    if payload.get("reconciliation_id") == "other":
+        payload["reconciliation_id"] = new_uuid()
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE commands SET status = ?, result_json = ?
+            WHERE command_id = ?
+            """,
+            (status, json.dumps(payload), rig.command.command_id),
+        )
+
+    resolved = store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+
+    assert store.get_command(rig.command.command_id).status == status
+    assert _topology(rig, resolved)["attempt_state"] == "ambiguous"
+    store.close()
+
+
+def _strand_resolved_reconciliation(rig: SimpleNamespace) -> None:
+    """Rewrite the resolution the way the pre-projection build left it."""
+    store = rig.store
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE provider_attempts SET status = 'ambiguous'
+            WHERE attempt_id = ?
+            """,
+            (rig.attempt.attempt_id,),
+        )
+        connection.execute(
+            "UPDATE turns SET status = 'ambiguous' WHERE turn_id = ?",
+            (rig.turn_id,),
+        )
+        connection.execute(
+            """
+            UPDATE command_dispatches SET state = 'ambiguous'
+            WHERE attempt_id = ?
+            """,
+            (rig.attempt.attempt_id,),
+        )
+        connection.execute(
+            """
+            UPDATE command_envelopes SET state = 'paused',
+                guard_reason = 'ambiguous-provider-dispatch'
+            WHERE command_id = ?
+            """,
+            (rig.command.command_id,),
+        )
+        connection.execute(
+            """
+            UPDATE commands SET status = ?, result_json = ?
+            WHERE command_id = ?
+            """,
+            (
+                CommandStatus.FAILED,
+                json.dumps(
+                    {
+                        "code": "E_SAFETY_GUARD",
+                        "message": "execution safety guard stopped claude: dollars",
+                        "reconciliation_id": rig.record.reconciliation_id,
+                    }
+                ),
+                rig.command.command_id,
+            ),
+        )
+
+
+def test_resolved_reconciliation_projects_a_stranded_completion(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    _strand_resolved_reconciliation(rig)
+    assert store.get_command(rig.command.command_id).status == CommandStatus.FAILED
+
+    projected = store.project_resolved_reconciliation(rig.record.reconciliation_id)
+
+    assert projected is not None
+    assert projected.status == CommandStatus.COMPLETE
+    assert projected.result["native_session_id"] == "native-live"
+    assert projected.result["final_message_sha256"] == hashlib.sha256(
+        rig.text.encode("utf-8")
+    ).hexdigest()
+    assert [item.status for item in store.attempts(rig.session.session_id)] == [
+        "complete"
+    ]
+    envelope = store.command_envelope(rig.command.command_id)
+    assert envelope["state"] == "complete"
+    assert envelope["guard_reason"] == ""
+    receipt = store.reconciliation(rig.record.reconciliation_id).audit[
+        "topology_receipt"
+    ]
+    assert receipt["command_status"] == "complete"
+    assert receipt["prior_guard_reason"] == "ambiguous-provider-dispatch"
+
+    # The prior failure is preserved as a code and a digest, never as
+    # the raw guard or provider prose.
+    assert projected.result["prior_code"] == "E_SAFETY_GUARD"
+    assert "prior_message" not in projected.result
+    assert "dollars" not in json.dumps(projected.result)
+    assert projected.result["prior_result_sha256"] == hashlib.sha256(
+        json.dumps(
+            {
+                "code": "E_SAFETY_GUARD",
+                "message": "execution safety guard stopped claude: dollars",
+                "reconciliation_id": rig.record.reconciliation_id,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+    # The transition is observable, explains the digest change at the
+    # new through_sequence, and leaves the resolution event untouched.
+    events = store.all_events(rig.session.session_id)
+    projected_events = [
+        item for item in events if item.event_type == "reconciliation.projected"
+    ]
+    assert len(projected_events) == 1
+    transition = projected_events[0]
+    assert transition.sequence == events[-1].sequence
+    assert transition.metadata["reconciliation_id"] == rig.record.reconciliation_id
+    assert transition.metadata["command_id"] == rig.command.command_id
+    assert transition.metadata["decision"] == "accept-current"
+    assert transition.metadata["resolution_checkpoint_id"] == (
+        rig.resolution_checkpoint_id
+    )
+    assert transition.metadata["resolution_workspace_digest"] == rig.workspace_digest
+    assert transition.metadata["topology_receipt"] == receipt
+    resolved_events = [
+        item for item in events if item.event_type == "reconciliation.resolved"
+    ]
+    assert len(resolved_events) <= 1
+
+    assert store.project_resolved_reconciliation(rig.record.reconciliation_id) is None
+    assert store.get_command(rig.command.command_id).status == CommandStatus.COMPLETE
+    repeated = [
+        item
+        for item in store.all_events(rig.session.session_id)
+        if item.event_type == "reconciliation.projected"
+    ]
+    assert len(repeated) == 1
+    assert repeated[0].event_id == transition.event_id
+    store.close()
+
+
+def test_restranded_replay_reuses_the_recorded_projection_event(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    _strand_resolved_reconciliation(rig)
+    first = store.project_resolved_reconciliation(rig.record.reconciliation_id)
+    assert first is not None
+    transition = [
+        item
+        for item in store.all_events(rig.session.session_id)
+        if item.event_type == "reconciliation.projected"
+    ][0]
+    through_sequence = store.last_sequence(rig.session.session_id)
+
+    # The build that stranded this command runs once more and strands
+    # it again, so the replay has a real topology to settle and reaches
+    # the append with its own transition already in the log.
+    _strand_resolved_reconciliation(rig)
+    assert store.get_command(rig.command.command_id).status == CommandStatus.FAILED
+
+    replayed = store.project_resolved_reconciliation(rig.record.reconciliation_id)
+
+    # The settle runs again and lands on the same answer.
+    assert replayed is not None
+    assert replayed.status == CommandStatus.COMPLETE
+    assert replayed.result == first.result
+    assert [item.status for item in store.attempts(rig.session.session_id)] == [
+        "complete"
+    ]
+    envelope = store.command_envelope(rig.command.command_id)
+    assert envelope["state"] == "complete"
+    assert envelope["guard_reason"] == ""
+
+    # The already-recorded transition is reused, not duplicated, so the
+    # proof through_sequence and the event it explains both hold still.
+    repeated = [
+        item
+        for item in store.all_events(rig.session.session_id)
+        if item.event_type == "reconciliation.projected"
+    ]
+    assert repeated == [transition]
+    assert store.last_sequence(rig.session.session_id) == through_sequence
+    store.close()
+
+
+def test_projection_event_moves_the_proof_through_sequence(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    _strand_resolved_reconciliation(rig)
+    before = proof_snapshot(store, rig.session.session_id)
+
+    store.project_resolved_reconciliation(rig.record.reconciliation_id)
+
+    after = proof_snapshot(store, rig.session.session_id)
+    before_through = before["event_range"]["through_sequence"]
+    assert after["event_range"]["through_sequence"] > before_through
+    appended = [
+        item for item in after["events"] if item["sequence"] > before_through
+    ]
+    assert [item["event_type"] for item in appended] == ["reconciliation.projected"]
+    assert after["snapshot_digest"] != before["snapshot_digest"]
+    projected_command = [
+        item
+        for item in after["commands"]
+        if item["command_id"] == rig.command.command_id
+    ][0]
+    assert projected_command["status"] == "complete"
+    assert projected_command["result"]["prior_code"] == "E_SAFETY_GUARD"
+    assert projected_command["result"]["prior_result_sha256"]
+    assert "message" not in projected_command["result"]
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["second-boundary", "missing-receipt", "foreign-receipt", "absent-checkpoint"],
+)
+def test_projection_requires_its_bound_topology(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    _strand_resolved_reconciliation(rig)
+    record = store.reconciliation(rig.record.reconciliation_id)
+    audit = dict(record.audit)
+    with store.transaction() as connection:
+        if tamper == "second-boundary":
+            second_attempt = ProviderAttempt(
+                attempt_id=new_uuid(),
+                session_id=rig.session.session_id,
+                provider="claude",
+                native_session_id="native-second",
+                model="sonnet",
+                effort="low",
+                auth_mode="subscription",
+                status="running",
+                started_at=utc_now(),
+                ended_at="",
+            )
+            connection.execute(
+                """
+                INSERT INTO provider_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    second_attempt.attempt_id,
+                    second_attempt.session_id,
+                    second_attempt.provider,
+                    second_attempt.native_session_id,
+                    second_attempt.model,
+                    second_attempt.effort,
+                    second_attempt.auth_mode,
+                    second_attempt.status,
+                    second_attempt.started_at,
+                    second_attempt.ended_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO command_dispatches(
+                    attempt_id, command_id, session_id, turn_id,
+                    checkpoint_id, crossed_boundary, state,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, 'ambiguous', ?, ?)
+                """,
+                (
+                    second_attempt.attempt_id,
+                    rig.command.command_id,
+                    rig.session.session_id,
+                    rig.turn_id,
+                    rig.resolution_checkpoint_id,
+                    utc_now(),
+                    utc_now(),
+                ),
+            )
+        if tamper == "missing-receipt":
+            audit.pop("topology_receipt", None)
+            connection.execute(
+                "UPDATE reconciliations SET audit_json = ? WHERE reconciliation_id = ?",
+                (json.dumps(audit), rig.record.reconciliation_id),
+            )
+        if tamper == "foreign-receipt":
+            receipt = dict(audit["topology_receipt"])
+            receipt["attempt_id"] = new_uuid()
+            audit["topology_receipt"] = receipt
+            connection.execute(
+                "UPDATE reconciliations SET audit_json = ? WHERE reconciliation_id = ?",
+                (json.dumps(audit), rig.record.reconciliation_id),
+            )
+        if tamper == "absent-checkpoint":
+            connection.execute(
+                "DELETE FROM checkpoints WHERE checkpoint_id = ?",
+                (rig.resolution_checkpoint_id,),
+            )
+
+    assert store.project_resolved_reconciliation(rig.record.reconciliation_id) is None
+
+    assert store.get_command(rig.command.command_id).status == CommandStatus.FAILED
+    bound = [
+        item
+        for item in store.attempts(rig.session.session_id)
+        if item.attempt_id == rig.attempt.attempt_id
+    ]
+    assert [item.status for item in bound] == ["ambiguous"]
+    assert store.command_envelope(rig.command.command_id)["state"] == "paused"
+    assert not [
+        item
+        for item in store.all_events(rig.session.session_id)
+        if item.event_type == "reconciliation.projected"
+    ]
+    store.close()
+
+
+def test_manager_replay_projects_a_stranded_completion(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    blobs = BlobStore(tmp_path / "blobs")
+    manager = ReconciliationManager(store, blobs)
+    audit = _resolution_audit(rig)
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        audit,
+    )
+    _strand_resolved_reconciliation(rig)
+
+    replayed = asyncio.run(
+        manager.resolve(
+            rig.record.reconciliation_id,
+            "accept-current",
+            "digest-current",
+        )
+    )
+
+    assert replayed.status == "resolved"
+    assert store.get_command(rig.command.command_id).status == CommandStatus.COMPLETE
+    # The returned record must describe stored state, not the copy read
+    # before the projection rewrote the receipt.
+    returned_receipt = replayed.audit["topology_receipt"]
+    assert returned_receipt["command_status"] == "complete"
+    assert returned_receipt["attempt_state"] == "complete"
+    assert returned_receipt["turn_state"] == "complete"
+    assert returned_receipt["dispatch_state"] == "complete"
+    assert returned_receipt["envelope_state"] == "complete"
+    assert returned_receipt["completion_evidence"]["native_session_id"] == (
+        "native-live"
+    )
+    assert returned_receipt == store.reconciliation(
+        rig.record.reconciliation_id
+    ).audit["topology_receipt"]
+    store.close()
+
+
+def test_conflicting_replay_key_leaves_a_stranded_command_untouched(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    blobs = BlobStore(tmp_path / "blobs")
+    manager = ReconciliationManager(store, blobs)
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    _strand_resolved_reconciliation(rig)
+    store.idempotent_mutation(
+        "shared-key",
+        "other-operation",
+        "other-digest",
+        lambda: {"unrelated": True},
+        200,
+    )
+
+    with pytest.raises(ConflictError):
+        asyncio.run(
+            manager.resolve(
+                rig.record.reconciliation_id,
+                "accept-current",
+                "digest-current",
+                idempotency_key="shared-key",
+                operation="reconciliation-resolve",
+                request_digest="request",
+            )
+        )
+
+    stranded = store.get_command(rig.command.command_id)
+    assert stranded.status == CommandStatus.FAILED
+    assert stranded.result["code"] == "E_SAFETY_GUARD"
+    assert [item.status for item in store.attempts(rig.session.session_id)] == [
+        "ambiguous"
+    ]
+    assert store.command_envelope(rig.command.command_id)["state"] == "paused"
+
+    resolved = asyncio.run(
+        manager.resolve(
+            rig.record.reconciliation_id,
+            "accept-current",
+            "digest-current",
+            idempotency_key="fresh-key",
+            operation="reconciliation-resolve",
+            request_digest="request",
+        )
+    )
+    assert resolved.status == "resolved"
+    assert store.get_command(rig.command.command_id).status == CommandStatus.COMPLETE
+    store.close()
+
+
+def test_replayed_receipt_does_not_reproject_a_settled_command(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    blobs = BlobStore(tmp_path / "blobs")
+    manager = ReconciliationManager(store, blobs)
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    first = asyncio.run(
+        manager.resolve(
+            rig.record.reconciliation_id,
+            "accept-current",
+            "digest-current",
+            idempotency_key="replay-key",
+            operation="reconciliation-resolve",
+            request_digest="request",
+        )
+    )
+    _strand_resolved_reconciliation(rig)
+
+    replayed = asyncio.run(
+        manager.resolve(
+            rig.record.reconciliation_id,
+            "accept-current",
+            "digest-current",
+            idempotency_key="replay-key",
+            operation="reconciliation-resolve",
+            request_digest="request",
+        )
+    )
+
+    assert replayed == first
+    assert store.get_command(rig.command.command_id).status == CommandStatus.FAILED
+    store.close()
+
+
+def test_resolved_reconciliation_projection_declines_unprovable_work(
+    tmp_path: Path,
+) -> None:
+    rig = _ambiguous_live_dispatch(tmp_path, record_completion=False)
+    store = rig.store
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+
+    assert store.project_resolved_reconciliation(rig.record.reconciliation_id) is None
+    assert store.get_command(rig.command.command_id).status == CommandStatus.FAILED
+
+    stopped = _ambiguous_live_dispatch(tmp_path / "stopped")
+    stopped.store.resolve_reconciliation_record(
+        stopped.record.reconciliation_id,
+        "stop",
+        "digest-current",
+        _resolution_audit(stopped),
+    )
+    assert (
+        stopped.store.project_resolved_reconciliation(
+            stopped.record.reconciliation_id
+        )
+        is None
+    )
+
+    missing_attempt = _ambiguous_live_dispatch(tmp_path / "detached")
+    missing_attempt.store.resolve_reconciliation_record(
+        missing_attempt.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(missing_attempt),
+    )
+    with missing_attempt.store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE reconciliations SET audit_json = ?
+            WHERE reconciliation_id = ?
+            """,
+            (
+                json.dumps({"dispatch_identity": {"attempt_id": new_uuid()}}),
+                missing_attempt.record.reconciliation_id,
+            ),
+        )
+    assert (
+        missing_attempt.store.project_resolved_reconciliation(
+            missing_attempt.record.reconciliation_id
+        )
+        is None
+    )
+
+    with pytest.raises(NotFoundError):
+        store.project_resolved_reconciliation(new_uuid())
+    store.close()
+    stopped.store.close()
+    missing_attempt.store.close()

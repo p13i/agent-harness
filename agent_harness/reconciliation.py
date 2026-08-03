@@ -158,6 +158,18 @@ class ReconciliationManager:
                 and record.current_workspace_digest == observed_workspace_digest
             ):
                 _require_resolution_workspace_digest(record, selected)
+                replayed = None
+                if idempotency_key:
+                    # Settle the key before projecting: a reused or
+                    # conflicting key must leave a stranded command
+                    # exactly as it found it.
+                    replayed = self.store.mutation_receipt(
+                        idempotency_key,
+                        operation,
+                        request_digest,
+                    )
+                if replayed is None:
+                    self.store.project_resolved_reconciliation(reconciliation_id)
                 if idempotency_key:
                     resolved, unused_created = self.store.resolve_reconciliation_once(
                         reconciliation_id,
@@ -172,7 +184,9 @@ class ReconciliationManager:
                     del unused_created
                     return resolved
                 self._apply_session_resolution(record, selected)
-                return record
+                # The projection rewrote the topology receipt, so the
+                # record read before it is already stale.
+                return self.store.reconciliation(reconciliation_id)
             raise ConflictError("reconciliation was already resolved differently")
         if record.current_workspace_digest != observed_workspace_digest:
             raise ConflictError("observed workspace digest is stale")
