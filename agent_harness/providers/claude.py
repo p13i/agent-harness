@@ -75,7 +75,7 @@ def _child_gate(child_launch_gate: ChildLaunchGate | None) -> Any:
     ) -> dict[str, Any]:
         del context
         tool_name = str(hook_input.get("tool_name", ""))
-        if tool_name not in {"Agent", "spawn_agent"}:
+        if tool_name not in {"Agent", "Task", "spawn_agent"}:
             return {}
         if child_launch_gate is None:
             return {
@@ -307,7 +307,7 @@ class ClaudeAdapter(ProviderAdapter):
             hooks={
                 "PreToolUse": [
                     HookMatcher(
-                        matcher="^(Agent|spawn_agent)$",
+                        matcher="^(Agent|Task|spawn_agent)$",
                         hooks=[gate_child_launch],
                     )
                 ]
@@ -613,6 +613,18 @@ def _normalized_child_event(
     metadata = event.metadata
     if metadata is None:
         metadata = {}
+    if "child_id" in metadata and event.event_type.startswith("agent.child."):
+        normalized = "tool.progress"
+        if event.event_type in {
+            "agent.child.cancelled",
+            "agent.child.completed",
+            "agent.child.failed",
+        }:
+            normalized = "tool.completed"
+        return replace(
+            event,
+            event_type=normalized,
+        )
     if event.event_type == "agent.child.started":
         tool_id = str(metadata.get("id", ""))
         if tool_id:

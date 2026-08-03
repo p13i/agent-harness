@@ -841,6 +841,10 @@ def test_claude_child_gate_denies_third_before_start(tmp_path: Path) -> None:
             )
             == {}
         )
+        task = {**inputs[0], "tool_name": "Task", "tool_use_id": "task-tool"}
+        assert (await gate(task, None, {}))["hookSpecificOutput"][
+            "permissionDecision"
+        ] == "deny"
 
     asyncio.run(scenario())
 
@@ -1335,6 +1339,30 @@ def test_claude_helpers_and_transport(
         child_ids,
     )
     assert started.event_type == "agent.child.started"
+    assert child_ids == {"child-1"}
+    bash_task = claude._normalized_child_event(
+        ProviderEvent(
+            "agent.child.started",
+            metadata={
+                "child_id": "bash-process",
+                "tool_use_id": "bash-tool",
+            },
+        ),
+        child_ids,
+    )
+    assert bash_task.event_type == "tool.progress"
+    assert child_ids == {"child-1"}
+    bash_task_completed = claude._normalized_child_event(
+        ProviderEvent(
+            "agent.child.completed",
+            metadata={
+                "child_id": "bash-process",
+                "tool_use_id": "bash-tool",
+            },
+        ),
+        child_ids,
+    )
+    assert bash_task_completed.event_type == "tool.completed"
     assert child_ids == {"child-1"}
     unrelated = ProviderEvent(
         "tool.completed",
