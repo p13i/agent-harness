@@ -14,7 +14,8 @@ import stat
 import uuid
 
 
-BUNDLE_SCHEMA = "p13i/agent-harness/install-bundle/v1"
+LEGACY_BUNDLE_SCHEMA = "p13i/agent-harness/install-bundle/v1"
+BUNDLE_SCHEMA = "p13i/agent-harness/install-bundle/v2"
 BUNDLE_MANIFEST = "bundle-manifest.json"
 EXECUTABLE_RELATIVE_PATH = Path("bin") / "agent-harness"
 _BUILD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -87,6 +88,7 @@ def create_bundle(
         if source_manifest.exists():
             source_manifest.unlink()
 
+        _seal_regular_files(staging)
         files = _manifest_entries(staging)
         content_digest = _content_digest(files)
         selected_build_id = build_id
@@ -100,7 +102,9 @@ def create_bundle(
             "executable": EXECUTABLE_RELATIVE_PATH.as_posix(),
             "files": files,
         }
-        _write_manifest(staging / BUNDLE_MANIFEST, payload)
+        manifest = staging / BUNDLE_MANIFEST
+        _write_manifest(manifest, payload)
+        os.chmod(manifest, 0o444)
 
         destination = bundle_root / selected_build_id
         if destination.exists():
@@ -109,14 +113,15 @@ def create_bundle(
                 raise BundleError(
                     "bundle build identifier already names different content"
                 )
-            shutil.rmtree(staging)
+            _remove_tree(staging)
             return existing
+        _seal_directories(staging)
         staging.replace(destination)
         _sync_directory(bundle_root)
         return verify_bundle(destination)
     except BaseException:
         if staging.exists():
-            shutil.rmtree(staging)
+            _remove_tree(staging)
         raise
 
 
@@ -135,8 +140,10 @@ def verify_bundle(bundle_root: Path) -> Bundle:
         raise BundleError("bundle manifest cannot be read") from error
     if not isinstance(payload, dict):
         raise BundleError("bundle manifest must be an object")
-    if payload.get("schema") != BUNDLE_SCHEMA:
+    schema = payload.get("schema")
+    if schema not in {LEGACY_BUNDLE_SCHEMA, BUNDLE_SCHEMA}:
         raise BundleError("bundle manifest schema is unsupported")
+    sealed = schema == BUNDLE_SCHEMA
 
     build_id = payload.get("build_id")
     content_digest = payload.get("content_digest")
@@ -154,6 +161,10 @@ def verify_bundle(bundle_root: Path) -> Bundle:
     executable_relative = safe_relative_path(executable_value)
     if not isinstance(files, list):
         raise BundleError("bundle file manifest is invalid")
+    if sealed:
+        if stat.S_IMODE(manifest_path.stat().st_mode) & 0o222:
+            raise BundleError("bundle manifest is writable")
+        _validate_sealed_directories(bundle_root)
 
     declared: dict[str, dict[str, object]] = {}
     for item in files:
@@ -175,6 +186,8 @@ def verify_bundle(bundle_root: Path) -> Bundle:
             raise BundleError("bundle file size is invalid: " + normalized)
         if not isinstance(mode, int) or isinstance(mode, bool):
             raise BundleError("bundle file mode is invalid: " + normalized)
+        if sealed and mode & 0o222:
+            raise BundleError("bundle file mode is writable: " + normalized)
         declared[normalized] = item
 
     actual: set[str] = set()
@@ -265,6 +278,42 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
         shutil.copystat(source, destination, follow_symlinks=True)
     except OSError as error:
         raise BundleError("failed to copy runfile: " + str(source)) from error
+
+
+def _seal_regular_files(root: Path) -> None:
+    for path in _walk_regular_files(root):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        os.chmod(path, mode & ~0o222)
+
+
+def _seal_directories(root: Path) -> None:
+    directories = [
+        Path(current) for current, unused_directories, unused_names in os.walk(root)
+    ]
+    for directory in sorted(
+        directories,
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        mode = stat.S_IMODE(directory.stat().st_mode)
+        os.chmod(directory, mode & ~0o222)
+
+
+def _validate_sealed_directories(root: Path) -> None:
+    for current, unused, names in os.walk(root, followlinks=False):
+        del unused, names
+        directory = Path(current)
+        if stat.S_IMODE(directory.stat().st_mode) & 0o222:
+            raise BundleError("bundle contains a writable directory")
+
+
+def _remove_tree(root: Path) -> None:
+    for current, unused, names in os.walk(root, followlinks=False):
+        del unused, names
+        directory = Path(current)
+        mode = stat.S_IMODE(directory.stat().st_mode)
+        os.chmod(directory, mode | 0o700)
+    shutil.rmtree(root)
 
 
 def _walk_regular_files(root: Path) -> tuple[Path, ...]:

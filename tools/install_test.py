@@ -22,6 +22,8 @@ from agent_harness.service_manager import unit_metadata
 from tools import bundle as bundle_module
 from tools import install as install_module
 from tools.bundle import BUNDLE_MANIFEST
+from tools.bundle import BUNDLE_SCHEMA
+from tools.bundle import LEGACY_BUNDLE_SCHEMA
 from tools.bundle import BundleError
 from tools.bundle import create_bundle
 from tools.bundle import main as bundle_main
@@ -38,6 +40,17 @@ from tools.install import main
 from tools.install import read_selection
 from tools.install import rollback
 from tools.install import select_bundle
+
+
+def _make_writable(path: Path) -> None:
+    path.chmod((path.stat().st_mode & 0o777) | 0o200)
+
+
+def _rewrite(path: Path, content: str) -> None:
+    original_mode = path.stat().st_mode & 0o777
+    _make_writable(path)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(original_mode)
 
 
 def test_bundle_dereferences_runfiles_and_is_content_addressed(
@@ -77,6 +90,27 @@ def test_bundle_dereferences_runfiles_and_is_content_addressed(
     ) == "nested\n"
     assert not (copied_runfiles / "MANIFEST").exists()
     assert not any(path.is_symlink() for path in first.root.rglob("*"))
+    assert not any(
+        path.stat().st_mode & 0o222
+        for path in (first.root, *first.root.rglob("*"))
+    )
+    assert json.loads(
+        (first.root / BUNDLE_MANIFEST).read_text(encoding="utf-8")
+    )["schema"] == BUNDLE_SCHEMA
+
+
+def test_legacy_bundle_remains_verifiable_for_rollback(tmp_path: Path) -> None:
+    source = _source_executable(tmp_path / "source", "one")
+    bundle = create_bundle(source, tmp_path / "bundles")
+    manifest = bundle.root / BUNDLE_MANIFEST
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["schema"] = LEGACY_BUNDLE_SCHEMA
+    _rewrite(manifest, json.dumps(payload))
+    for path in (bundle.root, *bundle.root.rglob("*")):
+        if path.is_dir():
+            path.chmod((path.stat().st_mode & 0o777) | 0o200)
+
+    assert verify_bundle(bundle.root) == bundle
 
 
 @pytest.mark.parametrize(
@@ -152,6 +186,7 @@ def test_bundle_rejects_build_identifier_collisions(
         ("missing", "missing declared"),
         ("link", "symbolic link"),
         ("mode", "mode mismatch"),
+        ("directory-mode", "writable directory"),
     ],
 )
 def test_bundle_integrity_detects_tree_mutations(
@@ -163,18 +198,41 @@ def test_bundle_integrity_detects_tree_mutations(
     bundle = create_bundle(source, tmp_path / "bundles")
     runfile = Path(str(bundle.executable) + ".runfiles") / "package" / "data.txt"
     if mutation == "content":
+        original_mode = runfile.stat().st_mode & 0o777
+        runfile.chmod(original_mode | 0o200)
         runfile.write_text("changed and longer\n", encoding="utf-8")
+        runfile.chmod(original_mode)
     elif mutation == "extra":
+        original_mode = bundle.root.stat().st_mode & 0o777
+        bundle.root.chmod(original_mode | 0o200)
         (bundle.root / "extra").write_text("extra\n", encoding="utf-8")
+        bundle.root.chmod(original_mode)
     elif mutation == "missing":
+        original_mode = runfile.parent.stat().st_mode & 0o777
+        runfile.parent.chmod(original_mode | 0o200)
         runfile.unlink()
+        runfile.parent.chmod(original_mode)
     elif mutation == "link":
+        original_mode = runfile.parent.stat().st_mode & 0o777
+        runfile.parent.chmod(original_mode | 0o200)
         runfile.unlink()
         runfile.symlink_to(bundle.executable)
+        runfile.parent.chmod(original_mode)
+    elif mutation == "directory-mode":
+        bundle.root.chmod(0o700)
     else:
         runfile.chmod(0o600)
 
     with pytest.raises(BundleError, match=message):
+        verify_bundle(bundle.root)
+
+
+def test_sealed_bundle_rejects_a_writable_manifest(tmp_path: Path) -> None:
+    source = _source_executable(tmp_path / "source", "one")
+    bundle = create_bundle(source, tmp_path / "bundles")
+    _make_writable(bundle.root / BUNDLE_MANIFEST)
+
+    with pytest.raises(BundleError, match="manifest is writable"):
         verify_bundle(bundle.root)
 
 
@@ -186,11 +244,11 @@ def test_bundle_integrity_rejects_invalid_manifests(
     manifest = bundle.root / BUNDLE_MANIFEST
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     payload["files"][0]["path"] = "../escape"
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _rewrite(manifest, json.dumps(payload))
     with pytest.raises(BundleError, match="escapes"):
         verify_bundle(bundle.root)
 
-    manifest.write_text("not json", encoding="utf-8")
+    _rewrite(manifest, "not json")
     with pytest.raises(BundleError, match="cannot be read"):
         verify_bundle(bundle.root)
 
@@ -216,7 +274,7 @@ def test_bundle_integrity_rejects_invalid_top_level_fields(
     manifest = bundle.root / BUNDLE_MANIFEST
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     payload[field] = value
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _rewrite(manifest, json.dumps(payload))
 
     with pytest.raises(BundleError, match=message):
         verify_bundle(bundle.root)
@@ -239,18 +297,21 @@ def test_bundle_integrity_rejects_tampered_digests_and_payload_type(
     bundle = create_bundle(source, tmp_path / "bundles")
     manifest = bundle.root / BUNDLE_MANIFEST
     if mutation == "manifest-type":
-        manifest.write_text("[]", encoding="utf-8")
+        _rewrite(manifest, "[]")
     elif mutation == "file-digest":
         runfile = (
             Path(str(bundle.executable) + ".runfiles")
             / "package"
             / "data.txt"
         )
+        original_mode = runfile.stat().st_mode & 0o777
+        _make_writable(runfile)
         runfile.write_text("two\n", encoding="utf-8")
+        runfile.chmod(original_mode)
     else:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         payload["content_digest"] = "0" * 64
-        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        _rewrite(manifest, json.dumps(payload))
 
     with pytest.raises(BundleError, match=message):
         verify_bundle(bundle.root)
@@ -265,6 +326,7 @@ def test_bundle_integrity_rejects_tampered_digests_and_payload_type(
         ("digest", "file digest"),
         ("size", "file size"),
         ("mode", "file mode"),
+        ("writable-mode", "file mode is writable"),
     ],
 )
 def test_bundle_integrity_rejects_invalid_file_entries(
@@ -287,9 +349,11 @@ def test_bundle_integrity_rejects_invalid_file_entries(
         entry["sha256"] = "short"
     elif mutation == "size":
         entry["size"] = True
+    elif mutation == "writable-mode":
+        entry["mode"] = 0o644
     else:
         entry["mode"] = True
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _rewrite(manifest, json.dumps(payload))
 
     with pytest.raises(BundleError, match=message):
         verify_bundle(bundle.root)
@@ -318,7 +382,7 @@ def test_bundle_integrity_rejects_root_and_executable_mutations(
         verify_bundle(renamed)
     renamed.rename(bundle.root)
 
-    bundle.executable.chmod(0o600)
+    bundle.executable.chmod(0o400)
     manifest = bundle.root / BUNDLE_MANIFEST
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     executable_entry = next(
@@ -326,9 +390,9 @@ def test_bundle_integrity_rejects_root_and_executable_mutations(
         for entry in payload["files"]
         if entry["path"] == "bin/agent-harness"
     )
-    executable_entry["mode"] = 0o600
+    executable_entry["mode"] = 0o400
     payload["content_digest"] = bundle_module._content_digest(payload["files"])
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _rewrite(manifest, json.dumps(payload))
     with pytest.raises(BundleError, match="not executable"):
         verify_bundle(bundle.root)
 
@@ -422,6 +486,27 @@ def test_bundle_filesystem_error_boundaries(
             source,
             tmp_path / "copied-file",
         )
+
+
+def test_bundle_cleanup_unseals_a_failed_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_executable(tmp_path / "source", "one")
+    bundle_root = tmp_path / "bundles"
+    original_replace = Path.replace
+
+    def fail_promotion(path: Path, target: Path) -> Path:
+        if path.name.startswith(".bundle-"):
+            raise OSError("promotion failed")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_promotion)
+
+    with pytest.raises(OSError, match="promotion failed"):
+        create_bundle(source, bundle_root)
+
+    assert not list(bundle_root.glob(".bundle-*"))
 
 
 def test_bundle_walk_rejects_special_files_and_skips_manifest(
@@ -939,14 +1024,15 @@ def test_installed_python_bundle_remains_immutable_across_execution_surfaces(
     assert service_result.returncode == 0
     assert verify_bundle(bundle.root) == bundle
 
-    control_result = subprocess.run(
-        [str(bundle.executable), "--help"],
-        env=unguarded_environment,
-        check=False,
-    )
-    assert control_result.returncode == 0
-    with pytest.raises(BundleError, match="undeclared file"):
-        verify_bundle(bundle.root)
+    if os.geteuid() != 0:
+        control_result = subprocess.run(
+            [str(bundle.executable), "--help"],
+            env=unguarded_environment,
+            check=False,
+        )
+        assert control_result.returncode == 0
+        assert not any(bundle.root.rglob("*.pyc"))
+        assert verify_bundle(bundle.root) == bundle
 
 
 def test_installer_atomic_write_removes_a_failed_temporary(
