@@ -35,13 +35,16 @@ from agent_harness.goals import (
     evaluate_milestones,
     exhausted_budget,
     goal_consumption,
+    make_evidence,
 )
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import (
     Attention,
     CommandReceipt,
     CommandStatus,
+    Evidence,
     Goal,
+    GoalKind,
     GoalStatus,
     Lifecycle,
     ProviderAttempt,
@@ -76,6 +79,106 @@ from agent_harness.workspace_state import inspect_workspace
 
 CONTROL_COMMANDS = frozenset({"interrupt", "pause", "resume", "stop", "steer"})
 APPROVAL_POLL_LIMIT = 3600
+WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
+def _observe_bash_command_result(
+    event: ProviderEvent,
+    bash_commands: dict[str, str],
+    failures: list[dict[str, Any]],
+    *,
+    provider: str,
+    attempt_id: str,
+    turn_id: str,
+) -> None:
+    metadata = event.metadata
+    if metadata is None:
+        return
+    if event.event_type == "tool.started":
+        if str(metadata.get("name", "")).casefold() != "bash":
+            return
+        tool_id = str(metadata.get("id", ""))
+        tool_input = metadata.get("input")
+        if not tool_id or not isinstance(tool_input, dict):
+            return
+        command = tool_input.get("command")
+        if isinstance(command, str) and command:
+            bash_commands[tool_id] = command
+        return
+    if event.event_type != "tool.completed":
+        return
+    tool_id = str(metadata.get("tool_use_id", ""))
+    command = bash_commands.pop(tool_id, "")
+    if not command:
+        return
+    exit_code = metadata.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return
+    if exit_code == 0:
+        return
+    failures.append(
+        {
+            "attempt_id": attempt_id,
+            "command": command,
+            "exit_code": exit_code,
+            "provider": provider,
+            "tool_use_id": tool_id,
+            "turn_id": turn_id,
+        }
+    )
+
+
+def _failed_command_evidence(
+    goal: Goal | None,
+    failures: object,
+) -> tuple[Evidence, ...]:
+    if goal is None or goal.kind != GoalKind.FINITE:
+        return ()
+    if not isinstance(failures, list):
+        return ()
+    predicates = [
+        predicate
+        for predicate in goal.predicates
+        if str(predicate.get("type", "")) == "command"
+        and str(predicate.get("outcome", "passed")) == "passed"
+    ]
+    result: list[Evidence] = []
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        command = str(failure.get("command", ""))
+        exact = [
+            predicate
+            for predicate in predicates
+            if str(predicate.get("subject", "")) == command
+        ]
+        predicate = None
+        if len(exact) == 1:
+            predicate = exact[0]
+        elif len(predicates) == 1:
+            predicate = predicates[0]
+        if predicate is None:
+            continue
+        value = {
+            "attempt_id": str(failure.get("attempt_id", "")),
+            "command_digest": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+            "exit_code": int(failure["exit_code"]),
+            "predicate_digest": _structured_digest(predicate),
+            "provider": str(failure.get("provider", "")),
+            "schema": "p13i/agent-harness/failed-command-evidence/v1",
+            "tool_use_id": str(failure.get("tool_use_id", "")),
+            "turn_id": str(failure.get("turn_id", "")),
+        }
+        result.append(
+            make_evidence(
+                goal.goal_id,
+                "command",
+                str(predicate.get("subject", "")),
+                "failed",
+                value,
+            )
+        )
+    return tuple(result)
 
 
 class SessionWorker:
@@ -99,6 +202,7 @@ class SessionWorker:
         self._active_adapter: ProviderAdapter | None = None
         self._active_command_id = ""
         self._active_turn_id = ""
+        self._worker_heartbeat_at = 0.0
 
     async def run(self) -> None:
         prior_leases = [
@@ -111,6 +215,7 @@ class SessionWorker:
             os.getpid(),
             self.incarnation,
         )
+        self._worker_heartbeat_at = time.monotonic()
         try:
             for lease in prior_leases:
                 try:
@@ -208,10 +313,7 @@ class SessionWorker:
 
     async def _loop(self) -> None:
         while not self._stopping:
-            if not self.store.heartbeat_worker(
-                self.session_id,
-                self.incarnation,
-            ):
+            if not self._maintain_worker_ownership():
                 return
             session = self.store.get_session(self.session_id)
             if session.lifecycle in {
@@ -262,6 +364,27 @@ class SessionWorker:
                     "message": "unsupported command type",
                 },
             )
+
+    def _maintain_worker_ownership(self, *, force: bool = False) -> bool:
+        observed_at = time.monotonic()
+        heartbeat_due = (
+            observed_at - self._worker_heartbeat_at
+            >= WORKER_HEARTBEAT_INTERVAL_SECONDS
+        )
+        if force:
+            heartbeat_due = True
+        if not heartbeat_due:
+            return self.store.worker_owned(
+                self.session_id,
+                self.incarnation,
+            )
+        owned = self.store.heartbeat_worker(
+            self.session_id,
+            self.incarnation,
+        )
+        if owned:
+            self._worker_heartbeat_at = observed_at
+        return owned
 
     async def _message(self, command: CommandReceipt) -> None:
         try:
@@ -503,6 +626,10 @@ class SessionWorker:
             str(result["native_session_id"]),
             guard.consumption.as_dict(),
             result,
+            goal_evidence=_failed_command_evidence(
+                self.store.goal_for_session(self.session_id),
+                result.pop("failed_command_results", []),
+            ),
         )
         await self._evaluate_goal()
 
@@ -799,6 +926,8 @@ class SessionWorker:
             )
         resolved_native_session_id = native_session_id
         context_delivery_accepted = False
+        bash_commands: dict[str, str] = {}
+        failed_command_results: list[dict[str, Any]] = []
         service_fault_active = (
             recovery_stage == 0
             and str(service_fault_probe.get("provider", "")) == decision.provider
@@ -832,6 +961,14 @@ class SessionWorker:
                     status="running",
                     native_session_id=resolved_native_session_id,
                 )
+            _observe_bash_command_result(
+                event,
+                bash_commands,
+                failed_command_results,
+                provider=decision.provider,
+                attempt_id=attempt_id,
+                turn_id=turn_id,
+            )
             guard.observe(event)
             tool_pair = guard.take_completed_tool_pair()
             if tool_pair:
@@ -1157,10 +1294,7 @@ class SessionWorker:
             raise
         try:
             while not run_task.done():
-                if not self.store.heartbeat_worker(
-                    self.session_id,
-                    self.incarnation,
-                ):
+                if not self._maintain_worker_ownership():
                     await self._interrupt_guarded_turn(adapter, run_task)
                     raise WorkerOwnershipLostError(
                         "worker incarnation lost active dispatch ownership"
@@ -1233,10 +1367,7 @@ class SessionWorker:
                     )
                 await asyncio.sleep(0.1)
             result = await run_task
-            if not self.store.heartbeat_worker(
-                self.session_id,
-                self.incarnation,
-            ):
+            if not self._maintain_worker_ownership(force=True):
                 raise WorkerOwnershipLostError(
                     "worker incarnation lost result ownership"
                 )
@@ -1464,6 +1595,7 @@ class SessionWorker:
             "workspace_material_digest": completed_material_digest,
             "usage": result.usage,
             "safety": guard.snapshot(),
+            "failed_command_results": failed_command_results,
         }
 
     async def _pause_for_ambiguous_dispatch(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import uuid
 from collections.abc import AsyncIterator
@@ -65,6 +66,9 @@ from agent_harness.providers.base import (
 from agent_harness.providers.normalize import claude_payload
 
 CLAUDE_CODE_PACKAGE = "@anthropic-ai/claude-code@2.1.220"
+EXPLICIT_NONZERO_EXIT_CODE = re.compile(
+    r"\AExit code ([1-9][0-9]*)(?:\r?\n|\Z)"
+)
 
 
 def _child_gate(child_launch_gate: ChildLaunchGate | None) -> Any:
@@ -330,6 +334,7 @@ class ClaudeAdapter(ProviderAdapter):
         usage: dict[str, Any] = {}
         result_status = "failed"
         child_tool_ids: set[str] = set()
+        bash_tool_ids: set[str] = set()
         try:
             await client.connect(
                 _prompt_stream(
@@ -353,6 +358,10 @@ class ClaudeAdapter(ProviderAdapter):
                     event = _normalized_child_event(
                         event,
                         child_tool_ids,
+                    )
+                    event = _normalized_bash_event(
+                        event,
+                        bash_tool_ids,
                     )
                     if event.event_type == "turn.completed":
                         result_status = "complete"
@@ -643,6 +652,36 @@ def _normalized_child_event(
             status="failed",
         )
     return replace(event, event_type="agent.child.completed")
+
+
+def _normalized_bash_event(
+    event: ProviderEvent,
+    bash_tool_ids: set[str],
+) -> ProviderEvent:
+    metadata = event.metadata
+    if metadata is None:
+        return event
+    if event.event_type == "tool.started":
+        if str(metadata.get("name", "")).casefold() != "bash":
+            return event
+        tool_id = str(metadata.get("id", ""))
+        if tool_id:
+            bash_tool_ids.add(tool_id)
+        return event
+    if event.event_type != "tool.completed":
+        return event
+    tool_id = str(metadata.get("tool_use_id", ""))
+    if tool_id not in bash_tool_ids:
+        return event
+    bash_tool_ids.remove(tool_id)
+    normalized_metadata = dict(metadata)
+    if metadata.get("is_error") is False:
+        normalized_metadata["exit_code"] = 0
+    elif metadata.get("is_error") is True:
+        match = EXPLICIT_NONZERO_EXIT_CODE.match(event.text)
+        if match is not None:
+            normalized_metadata["exit_code"] = int(match.group(1))
+    return replace(event, metadata=normalized_metadata)
 
 
 def _message_session_id(message: object) -> str:

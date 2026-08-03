@@ -2431,6 +2431,227 @@ async def test_e2e_evidence_completes_a_finite_goal(
 
 
 @pytest.mark.asyncio
+async def test_failed_bash_result_records_goal_evidence_without_completion(
+    tmp_path: Path,
+) -> None:
+    class FailedBashAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            event_handler = values["event_handler"]
+            await event_handler(
+                ProviderEvent(
+                    "provider.prompt.accepted",
+                    status="accepted",
+                    native_session_id="claude-native-session",
+                )
+            )
+            await event_handler(
+                ProviderEvent(
+                    "tool.started",
+                    text="Bash",
+                    metadata={
+                        "id": "bash-failed",
+                        "input": {"command": "make test"},
+                        "name": "Bash",
+                    },
+                )
+            )
+            await event_handler(
+                ProviderEvent(
+                    "tool.completed",
+                    text="Exit code 7\ntests failed",
+                    metadata={
+                        "exit_code": 7,
+                        "is_error": True,
+                        "tool_use_id": "bash-failed",
+                    },
+                )
+            )
+            return ProviderResult(
+                provider="claude",
+                native_session_id="claude-native-session",
+                native_turn_id="claude-turn",
+                status="complete",
+                usage={"total_tokens": 42},
+            )
+
+    rig = JourneyRig(tmp_path, claude=FailedBashAdapter("claude"))
+    rig.prime_capacity()
+    try:
+        goal = create_goal(
+            rig.session.session_id,
+            "Run the exact test command successfully.",
+            predicates=(
+                {
+                    "type": "command",
+                    "subject": "make test",
+                    "outcome": "passed",
+                },
+            ),
+        )
+        rig.store.create_goal(goal)
+
+        receipt = await rig.message("Run make test.", provider="claude")
+
+        assert receipt.status == "complete"
+        evidence = rig.store.evidence(goal.goal_id)
+        assert len(evidence) == 1
+        assert evidence[0].evidence_type == "command"
+        assert evidence[0].subject == "make test"
+        assert evidence[0].outcome == "failed"
+        assert evidence[0].value["exit_code"] == 7
+        assert len(evidence[0].value["command_digest"]) == 64
+        assert evidence[0].value["schema"] == (
+            "p13i/agent-harness/failed-command-evidence/v1"
+        )
+        assert rig.store.get_goal(goal.goal_id).status == "active"
+        assert rig.store.get_session(rig.session.session_id).lifecycle == "running"
+        events = rig.store.all_events(rig.session.session_id)
+        goal_evidence = [
+            event for event in events if event.event_type == "goal.evidence"
+        ]
+        assert len(goal_evidence) == 1
+        assert goal_evidence[0].turn_id
+        assert not any(event.event_type == "goal.completed" for event in events)
+    finally:
+        rig.close()
+
+
+def test_failed_command_evidence_and_heartbeat_boundaries(tmp_path: Path) -> None:
+    failures: list[dict[str, Any]] = []
+    commands: dict[str, str] = {}
+    common = {
+        "provider": "claude",
+        "attempt_id": "attempt",
+        "turn_id": "turn",
+    }
+    worker_module._observe_bash_command_result(
+        ProviderEvent("tool.started"),
+        commands,
+        failures,
+        **common,
+    )
+    worker_module._observe_bash_command_result(
+        ProviderEvent("tool.started", metadata={"id": "read", "name": "Read"}),
+        commands,
+        failures,
+        **common,
+    )
+    worker_module._observe_bash_command_result(
+        ProviderEvent("tool.started", metadata={"name": "Bash"}),
+        commands,
+        failures,
+        **common,
+    )
+    worker_module._observe_bash_command_result(
+        ProviderEvent(
+            "tool.started",
+            metadata={
+                "id": "bad-input",
+                "input": "not-an-object",
+                "name": "Bash",
+            },
+        ),
+        commands,
+        failures,
+        **common,
+    )
+    worker_module._observe_bash_command_result(
+        ProviderEvent(
+            "tool.started",
+            metadata={"id": "empty", "input": {"command": ""}, "name": "Bash"},
+        ),
+        commands,
+        failures,
+        **common,
+    )
+    worker_module._observe_bash_command_result(
+        ProviderEvent("tool.progress", metadata={"id": "progress"}),
+        commands,
+        failures,
+        **common,
+    )
+    worker_module._observe_bash_command_result(
+        ProviderEvent(
+            "tool.completed",
+            metadata={"exit_code": 1, "tool_use_id": "unknown"},
+        ),
+        commands,
+        failures,
+        **common,
+    )
+    for tool_id, exit_code in (
+        ("boolean", True),
+        ("missing", None),
+        ("success", 0),
+        ("failure", 2),
+    ):
+        commands[tool_id] = "make test"
+        metadata: dict[str, Any] = {"tool_use_id": tool_id}
+        if exit_code is not None:
+            metadata["exit_code"] = exit_code
+        worker_module._observe_bash_command_result(
+            ProviderEvent("tool.completed", metadata=metadata),
+            commands,
+            failures,
+            **common,
+        )
+    assert len(failures) == 1
+
+    assert worker_module._failed_command_evidence(None, failures) == ()
+    invariant = create_goal(
+        new_uuid(),
+        "Remain healthy.",
+        kind="invariant",
+        predicates=({"type": "command", "subject": "make test"},),
+    )
+    assert worker_module._failed_command_evidence(invariant, failures) == ()
+    finite = create_goal(
+        new_uuid(),
+        "Pass tests.",
+        predicates=({"type": "command", "subject": "make test"},),
+    )
+    assert worker_module._failed_command_evidence(finite, {}) == ()
+    evidence = worker_module._failed_command_evidence(finite, [None, *failures])
+    assert len(evidence) == 1
+    fallback = create_goal(
+        new_uuid(),
+        "Pass the named build stage.",
+        predicates=(
+            {"type": "command", "subject": "build-stage"},
+            {"type": "probe", "subject": "health"},
+        ),
+    )
+    assert len(worker_module._failed_command_evidence(fallback, failures)) == 1
+    ambiguous = create_goal(
+        new_uuid(),
+        "Pass both commands.",
+        predicates=(
+            {"type": "command", "subject": "build"},
+            {"type": "command", "subject": "test"},
+            {"type": "command", "subject": "ignored", "outcome": "failed"},
+        ),
+    )
+    assert worker_module._failed_command_evidence(ambiguous, failures) == ()
+
+    rig = JourneyRig(tmp_path)
+    try:
+        calls: list[str] = []
+        rig.worker._worker_heartbeat_at = worker_module.time.monotonic()
+        original_heartbeat = rig.store.heartbeat_worker
+        rig.store.heartbeat_worker = lambda *unused: calls.append("heartbeat") or True
+        assert rig.worker._maintain_worker_ownership()
+        assert calls == []
+        rig.worker._worker_heartbeat_at = 0.0
+        assert rig.worker._maintain_worker_ownership()
+        assert calls == ["heartbeat"]
+        rig.store.heartbeat_worker = lambda *unused: False
+        assert not rig.worker._maintain_worker_ownership(force=True)
+        rig.store.heartbeat_worker = original_heartbeat
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_exhausted_goal_budget_pauses_before_provider_work(
     tmp_path: Path,
 ) -> None:

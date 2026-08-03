@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
 import threading
 from pathlib import Path
@@ -24,6 +25,7 @@ from agent_harness.errors import (
     NotFoundError,
     SafetyGuardError,
 )
+from agent_harness.goals import make_evidence
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import Checkpoint, CommandStatus, ProviderAttempt
 from agent_harness.orchestration import (
@@ -179,6 +181,22 @@ def test_terminal_dispatch_is_reconciled_and_success_finalizes_atomically(
             SafetyConsumption().as_dict(),
             {**result, "checkpoint_id": new_uuid()},
         )
+    with pytest.raises(ConflictError, match="evidence goal is not current"):
+        completed_store.complete_command_execution(
+            completed.command_id,
+            turn_id,
+            "native-one",
+            SafetyConsumption().as_dict(),
+            result,
+            goal_evidence=(
+                make_evidence(
+                    new_uuid(),
+                    "command",
+                    "make test",
+                    "failed",
+                ),
+            ),
+        )
     receipt = completed_store.complete_command_execution(
         completed.command_id,
         turn_id,
@@ -210,6 +228,103 @@ def test_terminal_dispatch_is_reconciled_and_success_finalizes_atomically(
             result,
         )
     completed_store.close()
+
+
+def test_atomic_completion_fails_closed_when_session_row_is_missing(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "complete one effect"},
+        new_uuid(),
+    )
+    assert store.claim_command(created.session_id) is not None
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        limits_for("unattended", "implementation").as_dict(),
+    )
+    attempt, turn_id, checkpoint = _dispatch(store, created, command.command_id)
+    store.mark_provider_boundary(attempt.attempt_id)
+    corruptor = sqlite3.connect(store.path, isolation_level=None)
+    corruptor.execute("PRAGMA foreign_keys=OFF")
+    corruptor.execute(
+        "DELETE FROM sessions WHERE session_id = ?",
+        (created.session_id,),
+    )
+
+    with pytest.raises(NotFoundError, match="session"):
+        store.complete_command_execution(
+            command.command_id,
+            turn_id,
+            "native-one",
+            SafetyConsumption().as_dict(),
+            {
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "status": "complete",
+            },
+        )
+
+    corruptor.close()
+    store.close()
+
+
+def test_sqlite_begin_retries_only_bounded_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = StateStore(database)
+    holder = sqlite3.connect(database, isolation_level=None)
+    store._connection.execute("PRAGMA busy_timeout=1")
+    holder.execute("BEGIN IMMEDIATE")
+    delays: list[float] = []
+
+    def release_holder(delay: float) -> None:
+        delays.append(delay)
+        holder.execute("COMMIT")
+
+    with monkeypatch.context() as context:
+        context.setattr(storage_module.time, "sleep", release_holder)
+        with store.transaction() as connection:
+            connection.execute("SELECT 1")
+    assert delays == [storage_module.SQLITE_BEGIN_BACKOFF_SECONDS[0]]
+
+    holder.execute("BEGIN IMMEDIATE")
+    delays.clear()
+    with monkeypatch.context() as context:
+        context.setattr(
+            storage_module.time,
+            "sleep",
+            lambda delay: delays.append(delay),
+        )
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            with store.transaction():
+                pass
+    assert delays == list(storage_module.SQLITE_BEGIN_BACKOFF_SECONDS)
+    holder.execute("ROLLBACK")
+
+    calls = 0
+
+    def arbitrary_failure() -> None:
+        nonlocal calls
+        calls += 1
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as context:
+        context.setattr(store, "_begin_immediate_once", arbitrary_failure)
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+            with store.transaction():
+                pass
+    assert calls == 1
+    assert not storage_module._sqlite_contention(
+        sqlite3.OperationalError("database is locked")
+    )
+    holder.close()
+    store.close()
 
 
 def test_adapters_publish_the_canonical_process_group_identity() -> None:

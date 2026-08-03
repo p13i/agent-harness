@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -51,6 +52,9 @@ from agent_harness.safety import effort_requires_xhigh_authorization
 from agent_harness.workspace_state import inspect_workspace
 
 SCHEMA_VERSION = 5
+SQLITE_BEGIN_ATTEMPTS = 5
+SQLITE_BEGIN_BACKOFF_SECONDS = (0.025, 0.05, 0.1, 0.2)
+SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 PROOF_SNAPSHOT_MAX_PER_SESSION = 128
 PROOF_SNAPSHOT_RETENTION_HOURS = 336
 TRANSITION_CONTROL_COMMANDS = frozenset(
@@ -622,7 +626,9 @@ class StateStore:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=FULL")
         self._connection.execute("PRAGMA foreign_keys=ON")
-        self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.execute(
+            "PRAGMA busy_timeout=" + str(SQLITE_BUSY_TIMEOUT_MILLISECONDS)
+        )
 
     def _initialize(self) -> None:
         with self._lock:
@@ -938,7 +944,7 @@ class StateStore:
             outermost = self._transaction_depth == 0
             savepoint = ""
             if outermost:
-                self._connection.execute("BEGIN IMMEDIATE")
+                self._begin_immediate()
             else:
                 self._savepoint_sequence += 1
                 savepoint = "nested_" + str(self._savepoint_sequence)
@@ -960,6 +966,20 @@ class StateStore:
                     self._connection.execute("COMMIT")
                 else:
                     self._connection.execute("RELEASE " + savepoint)
+
+    def _begin_immediate(self) -> None:
+        for attempt in range(SQLITE_BEGIN_ATTEMPTS):
+            try:
+                self._begin_immediate_once()
+                return
+            except sqlite3.OperationalError as error:
+                final_attempt = attempt + 1 == SQLITE_BEGIN_ATTEMPTS
+                if not _sqlite_contention(error) or final_attempt:
+                    raise
+                time.sleep(SQLITE_BEGIN_BACKOFF_SECONDS[attempt])
+
+    def _begin_immediate_once(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
 
     def close(self) -> None:
         with self._lock:
@@ -4667,6 +4687,8 @@ class StateStore:
         native_session_id: str,
         consumption: dict[str, Any],
         result: dict[str, Any],
+        *,
+        goal_evidence: tuple[Evidence, ...] = (),
     ) -> CommandReceipt:
         now = utc_now()
         with self.transaction() as connection:
@@ -4693,6 +4715,15 @@ class StateStore:
                 raise ConflictError("completed command checkpoint is missing")
             if str(dispatch["status"]) != CommandStatus.DISPATCHING:
                 raise ConflictError("completed command is not dispatching")
+            session = connection.execute(
+                "SELECT goal_id FROM sessions WHERE session_id = ?",
+                (str(dispatch["session_id"]),),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session")
+            for evidence in goal_evidence:
+                if evidence.goal_id != str(session["goal_id"]):
+                    raise ConflictError("completed command evidence goal is not current")
             attempt_id = str(dispatch["attempt_id"])
             connection.execute(
                 """
@@ -4731,6 +4762,49 @@ class StateStore:
                 """,
                 (CommandStatus.COMPLETE, _dump(result), now, command_id),
             )
+            sequence_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS sequence
+                FROM events WHERE session_id = ?
+                """,
+                (str(dispatch["session_id"]),),
+            ).fetchone()
+            sequence = int(sequence_row["sequence"])
+            for evidence in goal_evidence:
+                connection.execute(
+                    "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        evidence.evidence_id,
+                        evidence.goal_id,
+                        evidence.evidence_type,
+                        evidence.subject,
+                        evidence.outcome,
+                        _dump(evidence.value),
+                        evidence.created_at,
+                    ),
+                )
+                sequence += 1
+                connection.execute(
+                    "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(dispatch["session_id"]),
+                        sequence,
+                        new_uuid(),
+                        "goal.evidence",
+                        "",
+                        "",
+                        "complete",
+                        _dump(evidence.as_dict()),
+                        "",
+                        turn_id,
+                        now,
+                    ),
+                )
+            if goal_evidence:
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                    (now, str(dispatch["session_id"])),
+                )
             row = connection.execute(
                 "SELECT * FROM commands WHERE command_id = ?",
                 (command_id,),
@@ -8356,6 +8430,14 @@ class StateStore:
                 str(safety.get("updated_at", now)),
             ),
         )
+
+
+def _sqlite_contention(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, bool) or not isinstance(code, int):
+        return False
+    primary_code = code & 0xFF
+    return primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
 
 
 def _dump(value: Any) -> str:

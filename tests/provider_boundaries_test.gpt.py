@@ -1436,6 +1436,91 @@ def test_claude_helpers_and_transport(
     asyncio.run(prompt())
 
 
+def test_claude_bash_exit_codes_are_structured_only_when_proven() -> None:
+    bash_tool_ids: set[str] = set()
+    without_metadata = ProviderEvent("tool.started")
+    assert (
+        claude._normalized_bash_event(without_metadata, bash_tool_ids)
+        is without_metadata
+    )
+    read = ProviderEvent(
+        "tool.started",
+        metadata={"id": "read-1", "name": "Read"},
+    )
+    assert claude._normalized_bash_event(read, bash_tool_ids) is read
+    missing_id = ProviderEvent(
+        "tool.started",
+        metadata={"name": "Bash"},
+    )
+    assert claude._normalized_bash_event(missing_id, bash_tool_ids) is missing_id
+    started = ProviderEvent(
+        "tool.started",
+        metadata={"id": "bash-1", "name": "Bash"},
+    )
+    assert claude._normalized_bash_event(started, bash_tool_ids) is started
+    progress = ProviderEvent("tool.progress", metadata={"id": "bash-1"})
+    assert claude._normalized_bash_event(progress, bash_tool_ids) is progress
+    unrelated = ProviderEvent(
+        "tool.completed",
+        metadata={"tool_use_id": "other", "is_error": False},
+    )
+    assert claude._normalized_bash_event(unrelated, bash_tool_ids) is unrelated
+    succeeded = claude._normalized_bash_event(
+        ProviderEvent(
+            "tool.completed",
+            text="tests passed",
+            metadata={"tool_use_id": "bash-1", "is_error": False},
+        ),
+        bash_tool_ids,
+    )
+    assert succeeded.metadata == {
+        "exit_code": 0,
+        "is_error": False,
+        "tool_use_id": "bash-1",
+    }
+    assert not bash_tool_ids
+
+    for tool_id, text, expected in (
+        ("bash-2", "Exit code 124\nbuild timed out", 124),
+        ("bash-3", "Exit code 7", 7),
+    ):
+        claude._normalized_bash_event(
+            ProviderEvent(
+                "tool.started",
+                metadata={"id": tool_id, "name": "bash"},
+            ),
+            bash_tool_ids,
+        )
+        failed = claude._normalized_bash_event(
+            ProviderEvent(
+                "tool.completed",
+                text=text,
+                metadata={"tool_use_id": tool_id, "is_error": True},
+            ),
+            bash_tool_ids,
+        )
+        assert failed.metadata is not None
+        assert failed.metadata["exit_code"] == expected
+
+    claude._normalized_bash_event(
+        ProviderEvent(
+            "tool.started",
+            metadata={"id": "bash-4", "name": "Bash"},
+        ),
+        bash_tool_ids,
+    )
+    unproved = claude._normalized_bash_event(
+        ProviderEvent(
+            "tool.completed",
+            text="command failed without an explicit process status",
+            metadata={"tool_use_id": "bash-4", "is_error": True},
+        ),
+        bash_tool_ids,
+    )
+    assert unproved.metadata is not None
+    assert "exit_code" not in unproved.metadata
+
+
 def test_claude_message_normalization_boundaries() -> None:
     blocks = [
         claude.TextBlock("text"),
