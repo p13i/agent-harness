@@ -206,4 +206,5 @@ def provider_environment(
         if credential_name and credential:
             environment[credential_name] = credential
     environment["PATH"] = trusted_provider_path()
+    environment["npm_config_cache"] = str(provider_npm_cache())
     return environment

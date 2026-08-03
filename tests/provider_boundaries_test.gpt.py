@@ -189,6 +189,7 @@ def test_provider_base_contract_and_environment(
         "environ",
         {
             "PATH": "/bin",
+            "npm_config_cache": "/actions-runner/_work/_temp/npm-cache",
             "npm_config_package": "ignored",
             "OTHER_SECRET": "ignored",
             "LC_ACCESS_KEY": "ignored",
@@ -199,24 +200,41 @@ def test_provider_base_contract_and_environment(
         },
     )
     monkeypatch.setattr(base, "trusted_provider_path", lambda: "/bin")
+    expected_cache = str(
+        tmp_path
+        / "my"
+        / "chats"
+        / ".runtime"
+        / "provider-cache"
+        / "npm"
+    )
+    monkeypatch.setattr(
+        base,
+        "provider_npm_cache",
+        lambda: Path(expected_cache),
+    )
     assert codex.provider_environment("codex") == {
         "PATH": "/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "npm_config_cache": expected_cache,
     }
     assert codex.provider_environment("claude") == {
         "PATH": "/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
         "CLAUDE_CODE_OAUTH_TOKEN": "claude-oauth",
+        "npm_config_cache": expected_cache,
     }
     assert codex.provider_environment("codex", "api") == {
         "PATH": "/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
         "OPENAI_API_KEY": "openai",
+        "npm_config_cache": expected_cache,
     }
     assert codex.provider_environment("claude", "api") == {
         "PATH": "/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
         "ANTHROPIC_API_KEY": "anthropic",
+        "npm_config_cache": expected_cache,
     }
 
     monkeypatch.setenv("HOME", str(tmp_path))
