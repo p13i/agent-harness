@@ -746,8 +746,9 @@ async def test_retry_hydrates_persisted_consumption_and_keeps_extension(
         unused_payload: dict[str, Any],
         unused_text: str,
         guard: TurnGuard,
+        unused_evaluator: Any = None,
     ) -> dict[str, Any]:
-        del unused_command_id, unused_payload, unused_text
+        del unused_command_id, unused_payload, unused_text, unused_evaluator
         captured.append(guard.consumption)
         raise SafetyGuardError("persisted-stop", "automatic routing")
 

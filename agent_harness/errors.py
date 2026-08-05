@@ -55,8 +55,15 @@ class WorkerOwnershipLostError(RuntimeError):
 
 
 class ProviderUnavailableError(HarnessError):
-    def __init__(self, provider: str, *, detail: str = "") -> None:
+    def __init__(
+        self,
+        provider: str,
+        *,
+        detail: str = "",
+        rejected: tuple[dict[str, str], ...] = (),
+    ) -> None:
         self.provider = provider
+        self.rejected = rejected
         message = provider + " is unavailable"
         if detail:
             message = message + ": " + detail
@@ -112,6 +119,35 @@ class SafetyGuardError(HarnessError):
         self.reason = reason
         self.provider = provider
         self.recoverable = recoverable
+
+
+class PolicyBlockedError(HarnessError):
+    """A policy rule blocked the dispatch outright."""
+
+    def __init__(self, rule: str, reason: str, *, provider: str = "") -> None:
+        self.rule = rule
+        self.reason = reason
+        self.provider = provider
+        super().__init__(
+            "E_POLICY_BLOCKED",
+            "policy rule " + rule + " blocked the dispatch: " + reason,
+            status=403,
+        )
+
+
+class PolicyDeferredError(HarnessError):
+    """A policy rule deferred the dispatch until conditions change."""
+
+    def __init__(self, rule: str, reason: str, *, provider: str = "") -> None:
+        self.rule = rule
+        self.reason = reason
+        self.provider = provider
+        super().__init__(
+            "E_POLICY_DEFERRED",
+            "policy rule " + rule + " deferred the dispatch: " + reason,
+            retryable=True,
+            status=202,
+        )
 
 
 class NeedsReconciliationError(HarnessError):

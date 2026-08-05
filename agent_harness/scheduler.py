@@ -9,7 +9,24 @@ import math
 from pathlib import Path
 from typing import Any
 
+from agent_harness.errors import PolicyDeferredError, ProviderUnavailableError
 from agent_harness.models import RoutingCandidate, RoutingDecision, Session
+from agent_harness.policy import (
+    BLOCK,
+    DEFER,
+    LEVEL_GOAL,
+    LEVEL_SERVER,
+    RULE_APPROVAL_REQUIRED,
+    RULE_BINDING_CEILING,
+    RULE_GOAL_CONCURRENCY,
+    RULE_PERMITTED_EFFORTS,
+    RULE_PERMITTED_PROVIDERS,
+    RULE_REVIEW_PROVIDER_MUST_DIFFER,
+    RULE_UNATTENDED_CONCURRENCY,
+    PolicyDecision,
+    PolicyEvaluator,
+    is_review_workload,
+)
 from agent_harness.providers.base import ProviderAdapter, ProviderModel
 from agent_harness.routing import route
 from agent_harness.safety import INTERACTIVE
@@ -214,6 +231,8 @@ class Scheduler:
         permitted_providers: frozenset[str] = frozenset(),
         permitted_efforts: frozenset[str] = frozenset(),
         max_concurrency: int = 1,
+        policy: PolicyEvaluator | None = None,
+        implementation_providers: frozenset[str] = frozenset(),
     ) -> RoutingDecision:
         if metered_budget is not None and not math.isfinite(metered_budget):
             raise ValueError("metered budget must be finite")
@@ -230,13 +249,67 @@ class Scheduler:
                 command_id,
             )
             goal_capacity_available = active_goal_commands < max_concurrency
+        review_differ_active = False
+        if policy is not None:
+            review_differ_active = (
+                policy.review_provider_must_differ
+                and is_review_workload(workload)
+                and bool(implementation_providers)
+            )
+        approval_required = False
+        if policy is not None:
+            approval_required = policy.require_approval and not provider
+        pre_route_decisions: list[PolicyDecision] = []
+        gate_notes: dict[str, tuple[str, str]] = {}
+        review_excluded = False
         candidates: list[RoutingCandidate] = []
         for provider_id, adapter in self.adapters.items():
             if provider_id in excluded:
                 continue
-            if permitted_providers and provider_id not in permitted_providers:
-                continue
             status = adapter.status()
+            if review_differ_active and provider_id in implementation_providers:
+                review_excluded = True
+                pre_route_decisions.append(
+                    PolicyDecision(
+                        outcome=BLOCK,
+                        rule=RULE_REVIEW_PROVIDER_MUST_DIFFER,
+                        reason=(
+                            "provider ran implementation turns; the review "
+                            "workload requires an independent provider"
+                        ),
+                        level=LEVEL_SERVER,
+                        provider=provider_id,
+                        command_id=command_id,
+                    )
+                )
+                continue
+            if approval_required and "approval" not in status.capabilities:
+                pre_route_decisions.append(
+                    PolicyDecision(
+                        outcome=BLOCK,
+                        rule=RULE_APPROVAL_REQUIRED,
+                        reason=(
+                            "provider cannot prompt for the policy-required "
+                            "dispatch approval"
+                        ),
+                        level=LEVEL_SERVER,
+                        provider=provider_id,
+                        command_id=command_id,
+                    )
+                )
+                continue
+            if permitted_providers and provider_id not in permitted_providers:
+                pre_route_decisions.append(
+                    PolicyDecision(
+                        outcome=BLOCK,
+                        rule=RULE_PERMITTED_PROVIDERS,
+                        reason="provider is outside the goal-permitted providers",
+                        level=LEVEL_GOAL,
+                        provider=provider_id,
+                        command_id=command_id,
+                    )
+                )
+                continue
             provider_usage = usage.get(provider_id)
             binding: float | None = None
             credits = False
@@ -251,8 +324,20 @@ class Scheduler:
             if binding_ceiling is not None:
                 if binding is None and execution_profile != INTERACTIVE:
                     safety_ready = False
+                    gate_notes[provider_id] = (
+                        RULE_BINDING_CEILING,
+                        "binding usage is unavailable for the policy "
+                        "binding ceiling",
+                    )
                 if binding is not None and binding >= binding_ceiling:
                     safety_ready = False
+                    gate_notes[provider_id] = (
+                        RULE_BINDING_CEILING,
+                        "binding usage "
+                        + str(binding)
+                        + " reached the policy binding ceiling "
+                        + str(binding_ceiling),
+                    )
             if enforce_concurrency and execution_profile == "unattended":
                 active = self._active_other_unattended_count(
                     provider_id,
@@ -260,8 +345,16 @@ class Scheduler:
                 )
                 if active >= 1:
                     safety_ready = False
+                    gate_notes[provider_id] = (
+                        RULE_UNATTENDED_CONCURRENCY,
+                        "another unattended command is active on this provider",
+                    )
             if not goal_capacity_available:
                 safety_ready = False
+                gate_notes[provider_id] = (
+                    RULE_GOAL_CONCURRENCY,
+                    "the goal concurrency limit is already consumed",
+                )
             chosen_model = _select_model(models.get(provider_id, ()), model)
             if chosen_model is None:
                 continue
@@ -271,6 +364,20 @@ class Scheduler:
                 permitted_efforts,
             )
             if chosen_effort is None:
+                if permitted_efforts:
+                    pre_route_decisions.append(
+                        PolicyDecision(
+                            outcome=BLOCK,
+                            rule=RULE_PERMITTED_EFFORTS,
+                            reason=(
+                                "no model effort satisfies the goal-permitted "
+                                "efforts"
+                            ),
+                            level=LEVEL_GOAL,
+                            provider=provider_id,
+                            command_id=command_id,
+                        )
+                    )
                 continue
             candidates.append(
                 RoutingCandidate(
@@ -289,15 +396,140 @@ class Scheduler:
                     usage_observed_at=str(usage_sample.get("observed_at", "")),
                 )
             )
-        return route(
-            candidates,
-            required_capabilities=required_capabilities,
-            workload=workload,
-            manual_provider=provider,
-            metered_budget=metered_budget,
-            binding_ceiling=binding_ceiling,
-            execution_profile=execution_profile,
+        if review_excluded and not candidates:
+            decision = PolicyDecision(
+                outcome=DEFER,
+                rule=RULE_REVIEW_PROVIDER_MUST_DIFFER,
+                reason=(
+                    "only the implementing provider is admissible; deferring "
+                    "until an independent provider is available"
+                ),
+                level=LEVEL_SERVER,
+                command_id=command_id,
+            )
+            self._emit_policy_decisions(
+                session.session_id,
+                policy,
+                [*pre_route_decisions, decision],
+            )
+            raise PolicyDeferredError(
+                RULE_REVIEW_PROVIDER_MUST_DIFFER,
+                decision.reason,
+            )
+        try:
+            decision = route(
+                candidates,
+                required_capabilities=required_capabilities,
+                workload=workload,
+                manual_provider=provider,
+                metered_budget=metered_budget,
+                binding_ceiling=binding_ceiling,
+                execution_profile=execution_profile,
+            )
+        except ProviderUnavailableError as error:
+            decisions = [
+                *pre_route_decisions,
+                *self._gate_decisions(
+                    policy,
+                    error.rejected,
+                    gate_notes,
+                    command_id=command_id,
+                ),
+            ]
+            if review_excluded:
+                deferred = PolicyDecision(
+                    outcome=DEFER,
+                    rule=RULE_REVIEW_PROVIDER_MUST_DIFFER,
+                    reason=(
+                        "only the implementing provider remains admissible; "
+                        "deferring until an independent provider is available"
+                    ),
+                    level=LEVEL_SERVER,
+                    command_id=command_id,
+                )
+                self._emit_policy_decisions(
+                    session.session_id,
+                    policy,
+                    [*decisions, deferred],
+                )
+                raise PolicyDeferredError(
+                    RULE_REVIEW_PROVIDER_MUST_DIFFER,
+                    deferred.reason,
+                ) from error
+            self._emit_policy_decisions(
+                session.session_id,
+                policy,
+                decisions,
+            )
+            raise
+        self._emit_policy_decisions(
+            session.session_id,
+            policy,
+            [
+                *pre_route_decisions,
+                *self._gate_decisions(
+                    policy,
+                    decision.rejected,
+                    gate_notes,
+                    command_id=command_id,
+                ),
+                *self._allow_decision(
+                    policy,
+                    decision,
+                    command_id=command_id,
+                ),
+            ],
         )
+        return decision
+
+    def _gate_decisions(
+        self,
+        policy: PolicyEvaluator | None,
+        rejected: Any,
+        gate_notes: dict[str, tuple[str, str]],
+        *,
+        command_id: str,
+    ) -> list[PolicyDecision]:
+        if policy is None:
+            return []
+        return policy.gate_decisions(
+            rejected,
+            gate_notes,
+            command_id=command_id,
+        )
+
+    def _allow_decision(
+        self,
+        policy: PolicyEvaluator | None,
+        decision: RoutingDecision,
+        *,
+        command_id: str,
+    ) -> list[PolicyDecision]:
+        if policy is None:
+            return []
+        return [
+            policy.allow_decision(
+                decision.provider,
+                decision.reason,
+                command_id=command_id,
+            )
+        ]
+
+    def _emit_policy_decisions(
+        self,
+        session_id: str,
+        policy: PolicyEvaluator | None,
+        decisions: list[PolicyDecision],
+    ) -> None:
+        if policy is None:
+            return
+        for decision in decisions:
+            self.store.append_event(
+                session_id,
+                "policy.decision",
+                status=decision.outcome,
+                metadata=decision.as_dict(),
+            )
 
     def _active_other_unattended_count(
         self,
