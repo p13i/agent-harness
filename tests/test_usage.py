@@ -58,7 +58,7 @@ def test_usage_probes_are_bounded_and_provider_complete(
 
     monkeypatch.setattr(usage, "_timed_probe", timed)
     results = asyncio.run(usage.probe_all())
-    assert set(results) == {"codex", "claude"}
+    assert set(results) == {"codex", "claude", "kimi"}
     monkeypatch.setattr(usage, "_timed_probe", original_timed_probe)
 
     assert (
@@ -369,3 +369,171 @@ def test_usage_normalization_omits_private_payloads() -> None:
     assert usage._object("unknown") == {}
     assert usage._usage_window(None, "utilization") is None
     assert UsageSnapshot("test", None, False, {}).as_dict()["provider"] == ("test")
+
+
+def test_kimi_binding_is_maximum_derived_window() -> None:
+    snapshot = normalize_usage(
+        "kimi",
+        {
+            "limits": [
+                {
+                    "window": {
+                        "timeUnit": "TIME_UNIT_MINUTE",
+                        "duration": 300,
+                    },
+                    "detail": {
+                        "limit": "100",
+                        "remaining": "60",
+                        "resetTime": "later",
+                    },
+                },
+                {
+                    "window": {
+                        "timeUnit": "TIME_UNIT_DAY",
+                        "duration": 1,
+                    },
+                    "detail": {"limit": "100", "remaining": "0"},
+                },
+                "not-a-dict",
+                {
+                    "window": {
+                        "timeUnit": "TIME_UNIT_MINUTE",
+                        "duration": 90,
+                    },
+                    "detail": {"limit": "0", "remaining": "0"},
+                },
+            ],
+            "usage": {
+                "limit": "200",
+                "remaining": "100",
+                "resetTime": "later",
+            },
+            "user": {"membership": {"level": "LEVEL_PRO"}},
+        },
+    )
+    # The 5-hour window derives 40 percent and the weekly window 50.
+    assert snapshot.binding_percent == 50
+    assert not snapshot.credits_engaged
+    assert snapshot.payload["windows"] == [
+        {"label": "5-hour", "percent": 40.0, "resets_at": "later"},
+        {"label": "weekly", "percent": 50.0, "resets_at": "later"},
+    ]
+    assert snapshot.payload["extra_usage"] == {"engaged": False}
+    assert snapshot.payload["membership_level"] == "LEVEL_PRO"
+
+
+def test_kimi_spent_weekly_quota_engages_extra_usage() -> None:
+    snapshot = normalize_usage(
+        "kimi",
+        {"usage": {"limit": "200", "remaining": "0"}},
+    )
+    assert snapshot.binding_percent == 100
+    assert snapshot.credits_engaged
+    assert snapshot.payload["extra_usage"] == {"engaged": True}
+
+
+def test_kimi_empty_payload_has_no_binding() -> None:
+    snapshot = normalize_usage("kimi", {})
+    assert snapshot.binding_percent is None
+    assert not snapshot.credits_engaged
+
+
+def test_kimi_quota_derivation_is_defensive() -> None:
+    assert usage._kimi_quota(None, "weekly") is None
+    assert usage._kimi_quota({"limit": "0"}, "weekly") is None
+    assert usage._kimi_quota({"limit": "abc"}, "weekly") is None
+    assert usage._kimi_quota(
+        {"limit": "100", "remaining": "25", "resetTime": "later"},
+        "weekly",
+    ) == {"label": "weekly", "percent": 75.0, "resets_at": "later"}
+    assert usage._kimi_window_label(300) == "5-hour"
+    assert usage._kimi_window_label(90) == "90-minute"
+    assert usage._kimi_window_label(0) == "0-minute"
+    assert usage._kimi_quantity(True) == 0.0
+    assert usage._kimi_quantity(None) == 0.0
+    assert usage._kimi_quantity("nan") == 0.0
+    assert usage._kimi_quantity("5") == 5.0
+
+
+def test_kimi_credentials_resolve_config_key_then_oauth_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(usage.Path, "home", lambda: tmp_path)
+    assert usage._kimi_credential() is None
+    assert usage._probe_kimi().error == "credentials unavailable"
+
+    config = tmp_path / ".kimi-code" / "config.toml"
+    config.parent.mkdir()
+    config.write_text("not = [toml", encoding="utf-8")
+    assert usage._kimi_config_api_key() is None
+
+    config.write_text(
+        '[providers."managed:kimi-code"]\napi_key = 7\n',
+        encoding="utf-8",
+    )
+    assert usage._kimi_config_api_key() is None
+
+    config.write_text(
+        '[providers."managed:kimi-code"]\napi_key = "  "\n',
+        encoding="utf-8",
+    )
+    assert usage._kimi_config_api_key() is None
+
+    credentials = tmp_path / ".kimi-code" / "credentials" / "kimi-code.json"
+    credentials.parent.mkdir()
+    credentials.write_text("{not json", encoding="utf-8")
+    assert usage._kimi_oauth_token() is None
+    credentials.write_text("[1]", encoding="utf-8")
+    assert usage._kimi_oauth_token() is None
+    credentials.write_text(
+        json.dumps({"access_token": "  "}),
+        encoding="utf-8",
+    )
+    assert usage._kimi_oauth_token() is None
+    credentials.write_text(
+        json.dumps({"access_token": "oauth-token"}),
+        encoding="utf-8",
+    )
+    assert usage._kimi_credential() == "oauth-token"
+
+    config.write_text(
+        '[providers."managed:kimi-code"]\napi_key = "console-key"\n',
+        encoding="utf-8",
+    )
+    assert usage._kimi_config_api_key() == "console-key"
+    assert usage._kimi_credential() == "console-key"
+
+
+def test_kimi_probe_reports_http_errors_without_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(usage, "_kimi_credential", lambda: "credential")
+
+    def expired(
+        unused_url: str,
+        unused_headers: dict[str, str],
+    ) -> dict[str, object]:
+        del unused_url
+        del unused_headers
+        raise urllib.error.HTTPError(
+            "https://example.invalid",
+            401,
+            "expired",
+            {},
+            None,
+        )
+
+    monkeypatch.setattr(usage, "_json_get", expired)
+    assert usage._probe_kimi().error == "HTTP 401"
+
+    monkeypatch.setattr(
+        usage,
+        "_json_get",
+        lambda unused_url, unused_headers: {
+            "usage": {"limit": "100", "remaining": "80"},
+        },
+    )
+    snapshot = usage._probe_kimi()
+    assert snapshot.binding_percent == 20
+    assert not snapshot.credits_engaged

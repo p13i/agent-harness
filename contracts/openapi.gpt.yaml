@@ -1035,6 +1035,7 @@ components:
             enum:
               - claude
               - codex
+              - kimi
         permitted_efforts:
           type: array
           items:
@@ -1160,6 +1161,7 @@ components:
           enum:
             - claude
             - codex
+            - kimi
         model:
           type: string
         effort:
@@ -1605,6 +1607,7 @@ components:
           enum:
             - claude
             - codex
+            - kimi
     CreateProcessLease:
       type: object
       required:
@@ -1615,6 +1618,7 @@ components:
           enum:
             - claude
             - codex
+            - kimi
         session_id:
           type: string
           format: uuid

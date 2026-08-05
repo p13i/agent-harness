@@ -13,8 +13,9 @@ Three consequences of that choice, all deliberate:
 - ``--yolo`` is NOT passed. Kimi rejects it together with ``--prompt``.
 - The adapter reports itself unavailable to the scheduler because the
   one-shot CLI cannot map harness permission modes or emit bounded tool
-  and child-agent accounting. It remains packaged for protocol work and
-  provider-boundary tests, but is not in the default provider registry.
+  and child-agent accounting. It is registered in the default provider
+  registry so usage probing and discovery see it, but routing rejects it
+  as not ready until those gaps close.
 """
 
 from __future__ import annotations

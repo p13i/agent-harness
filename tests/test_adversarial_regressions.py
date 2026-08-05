@@ -353,13 +353,13 @@ def test_adapters_publish_the_canonical_process_group_identity() -> None:
     assert claude_adapter.process_identity() == (0, "")
 
 
-def test_default_service_registry_excludes_kimi_until_it_is_safety_mapped(
+def test_default_service_registry_keeps_kimi_unroutable_until_safety_mapped(
     tmp_path: Path,
 ) -> None:
     service = HarnessService(paths(tmp_path / "state"))
     try:
-        assert set(service.adapters) == {"claude", "codex"}
-        assert not kimi.KimiAdapter().status().ready
+        assert set(service.adapters) == {"claude", "codex", "kimi"}
+        assert not service.adapters["kimi"].status().ready
     finally:
         service.close()
 

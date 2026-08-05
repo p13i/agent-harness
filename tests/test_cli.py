@@ -1411,6 +1411,7 @@ def test_worker_closes_storage_after_session_worker_finishes(
     monkeypatch.setattr(cli, "BlobStore", Blobs)
     monkeypatch.setattr(cli, "ClaudeAdapter", Adapter)
     monkeypatch.setattr(cli, "CodexAdapter", Adapter)
+    monkeypatch.setattr(cli, "KimiAdapter", Adapter)
     monkeypatch.setattr(cli, "Scheduler", lambda *args: args)
     monkeypatch.setattr(cli, "SessionWorker", Worker)
 
@@ -1420,7 +1421,7 @@ def test_worker_closes_storage_after_session_worker_finishes(
     worker_call = observed[-3]
     assert isinstance(worker_call, tuple)
     assert worker_call[0] == "worker"
-    assert set(worker_call[1][3]) == {"claude", "codex"}
+    assert set(worker_call[1][3]) == {"claude", "codex", "kimi"}
 
 
 def test_doctor_reports_bundle_service_daemon_and_storage(

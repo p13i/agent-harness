@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import sys
+import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -17,6 +18,9 @@ from typing import Any
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Undocumented endpoint shared with my/tools/usage_monitor.gpt.py; an
+# outage here is endpoint drift, not spent quota.
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,7 @@ async def probe_all() -> dict[str, UsageSnapshot]:
     results = await asyncio.gather(
         _timed_probe("codex", _probe_codex),
         _timed_probe("claude", _probe_claude),
+        _timed_probe("kimi", _probe_kimi),
     )
     return {item.provider: item for item in results}
 
@@ -107,6 +112,10 @@ def normalize_usage(
         extra_active = bool(extra.get("is_enabled", False))
         if windows:
             credits_engaged = extra_active and max(windows) >= 100.0
+    if provider == "kimi":
+        for window in _kimi_windows(payload):
+            windows.append(float(window["percent"]))
+        credits_engaged = _kimi_extra_usage_engaged(_object(payload.get("usage")))
     binding_percent: float | None = None
     if windows:
         binding_percent = max(windows)
@@ -178,6 +187,38 @@ def _probe_claude() -> UsageSnapshot:
             error=_safe_error(error),
         )
     return normalize_usage("claude", payload)
+
+
+def _probe_kimi() -> UsageSnapshot:
+    # The OAuth token is short-lived and only the kimi CLI refreshes it,
+    # so a 401 is reported as the probe error; no refresh is attempted.
+    credential = _kimi_credential()
+    if not credential:
+        return UsageSnapshot(
+            provider="kimi",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="credentials unavailable",
+        )
+    try:
+        payload = _json_get(
+            KIMI_USAGE_URL,
+            {
+                "Authorization": "Bearer " + credential,
+                "Accept": "application/json",
+                "User-Agent": "kimi-code",
+            },
+        )
+    except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as error:
+        return UsageSnapshot(
+            provider="kimi",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error=_safe_error(error),
+        )
+    return normalize_usage("kimi", payload)
 
 
 def _json_get(url: str, headers: dict[str, str]) -> dict[str, Any]:
@@ -264,6 +305,45 @@ def _claude_file_token(path: Path) -> str | None:
     return token
 
 
+def _kimi_credential() -> str | None:
+    api_key = _kimi_config_api_key()
+    if api_key:
+        return api_key
+    return _kimi_oauth_token()
+
+
+def _kimi_config_api_key() -> str | None:
+    """Static Console API key from the kimi CLI config, when present."""
+    try:
+        config = tomllib.loads(
+            (Path.home() / ".kimi-code" / "config.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    providers = _object(config.get("providers"))
+    managed = _object(providers.get("managed:kimi-code"))
+    api_key = managed.get("api_key")
+    if not isinstance(api_key, str) or not api_key.strip():
+        return None
+    return api_key
+
+
+def _kimi_oauth_token() -> str | None:
+    try:
+        payload = json.loads(
+            (Path.home() / ".kimi-code" / "credentials" / "kimi-code.json")
+            .read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    token = _object(payload).get("access_token")
+    if not isinstance(token, str) or not token.strip():
+        return None
+    return token
+
+
 def _object(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -278,6 +358,75 @@ def _number(value: object) -> float | None:
         if math.isfinite(normalized) and normalized >= 0:
             return normalized
     return None
+
+
+def _kimi_quantity(value: object) -> float:
+    """Kimi reports ``limit`` and ``remaining`` as strings."""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        quantity = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(quantity):
+        return 0.0
+    return quantity
+
+
+def _kimi_window_label(minutes: float) -> str:
+    if minutes and minutes % 60 == 0:
+        return str(int(minutes // 60)) + "-hour"
+    return str(int(minutes)) + "-minute"
+
+
+def _kimi_quota(value: object, label: str) -> dict[str, Any] | None:
+    """Normalize one Kimi quota block, or None when unusable.
+
+    Kimi reports ``limit`` and ``remaining`` as strings and does NOT
+    report a ``used`` figure, so the percentage is derived.
+    """
+    block = _object(value)
+    if not block:
+        return None
+    limit = _kimi_quantity(block.get("limit"))
+    if limit <= 0:
+        return None
+    remaining = _kimi_quantity(block.get("remaining"))
+    return {
+        "label": label,
+        "percent": (limit - remaining) / limit * 100.0,
+        "resets_at": block.get("resetTime"),
+    }
+
+
+def _kimi_windows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    derived: list[dict[str, Any]] = []
+    limits = payload.get("limits")
+    # The rolling window arrives in limits[]; match it by duration
+    # rather than position, since the array is not order-guaranteed.
+    if isinstance(limits, list):
+        for entry in limits:
+            block = _object(entry)
+            window = _object(block.get("window"))
+            if window.get("timeUnit") != "TIME_UNIT_MINUTE":
+                continue
+            label = _kimi_window_label(_kimi_quantity(window.get("duration")))
+            quota = _kimi_quota(block.get("detail"), label)
+            if quota is not None:
+                derived.append(quota)
+    weekly = _kimi_quota(payload.get("usage"), "weekly")
+    if weekly is not None:
+        derived.append(weekly)
+    return derived
+
+
+def _kimi_extra_usage_engaged(usage: dict[str, Any]) -> bool:
+    # Kimi has no credits object; Extra Usage bills at roughly API
+    # rates once the weekly quota is spent, so an exhausted pool is
+    # reported as engaged credits.
+    limit = _kimi_quantity(usage.get("limit"))
+    remaining = _kimi_quantity(usage.get("remaining"))
+    return limit > 0 and remaining <= 0
 
 
 def _safe_error(error: BaseException) -> str:
@@ -328,6 +477,15 @@ def _public_payload(
             "spend_limit_reached": extra.get("spend_limit_reached"),
             "utilization": extra.get("utilization"),
         }
+    if provider == "kimi":
+        # Derived windows only; the raw string quantities stay out of
+        # status, audit, and diagnostic surfaces.
+        result["windows"] = _kimi_windows(payload)
+        result["extra_usage"] = {
+            "engaged": _kimi_extra_usage_engaged(_object(payload.get("usage"))),
+        }
+        membership = _object(_object(payload.get("user")).get("membership"))
+        result["membership_level"] = membership.get("level")
     return result
 
 

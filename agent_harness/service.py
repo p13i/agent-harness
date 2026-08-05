@@ -53,6 +53,7 @@ from agent_harness.projections import write_session_projections
 from agent_harness.proof import proof_snapshot
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
+from agent_harness.providers.kimi import KimiAdapter
 from agent_harness.reconciliation import (
     ReconciliationManager,
     validate_reconciliation_audit,
@@ -440,6 +441,7 @@ class HarnessService:
         self.adapters = {
             "claude": ClaudeAdapter(),
             "codex": CodexAdapter(),
+            "kimi": KimiAdapter(),
         }
         self.scheduler = Scheduler(self.store, self.adapters)
         self.reconciliations = ReconciliationManager(

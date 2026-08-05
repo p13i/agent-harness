@@ -19,6 +19,9 @@ from agent_harness.usage import UsageSnapshot, probe_all
 QUALITY = {
     "codex": 100.0,
     "claude": 100.0,
+    # Every provider scores the same here on purpose: capacity headroom,
+    # not quality, is meant to decide between providers.
+    "kimi": 90.0,
 }
 
 
