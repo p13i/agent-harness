@@ -215,6 +215,119 @@ async def test_api_projects_canonical_transcript(
         service.close()
 
 
+@pytest.mark.asyncio
+async def test_api_projects_session_timeline(
+    tmp_path: Path,
+) -> None:
+    service = HarnessService(
+        paths(tmp_path / "state"),
+        worker_manager=Workers(),
+    )
+    client = TestClient(TestServer(create_app(service, "test-token")))
+    await client.start_server()
+    headers = {"Authorization": "Bearer test-token"}
+    now = utc_now()
+    created = Session(
+        session_id=new_uuid(),
+        name="timeline",
+        workspace=str(tmp_path),
+        worktree=str(tmp_path),
+        lifecycle="running",
+        attention="idle",
+        permission_mode="approval",
+        active_provider="codex",
+        model="account-default",
+        effort="high",
+        goal_id="",
+        owner_host="test-host",
+        owner_epoch=1,
+        created_at=now,
+        updated_at=now,
+    )
+    service.store.create_session(created)
+    goal = create_goal(
+        created.session_id,
+        "ship the bounded stage",
+        budgets={"turns": 2},
+    )
+    service.store.create_goal(goal)
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="codex",
+        native_session_id="",
+        model="account-default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    service.store.create_attempt(attempt)
+    turn_id = service.store.start_turn(created.session_id, attempt.attempt_id)
+    service.store.record_routing(
+        created.session_id,
+        turn_id,
+        "codex",
+        "account-default",
+        "high",
+        {
+            "reason": "best headroom",
+            "ranked": [],
+            "rejected": [],
+            "credits_engaged": False,
+            "binding_percent": 12.5,
+            "binding_ceiling": 80.0,
+        },
+    )
+    service.store.finish_turn(turn_id, "complete")
+    service.store.add_guard_incident(
+        created.session_id,
+        new_uuid(),
+        attempt.attempt_id,
+        "stagnation",
+        "pause",
+        {"consumption": {}},
+    )
+    try:
+        response = await client.get(
+            "/v1/sessions/" + created.session_id + "/timeline",
+            headers=headers,
+        )
+        assert response.status == 200
+        body = await response.json()
+        timeline = body["timeline"]
+        assert timeline["schema"] == "p13i/agent-harness/timeline/v1"
+        assert timeline["session_id"] == created.session_id
+        assert len(timeline["turns"]) == 1
+        assert timeline["turns"][0]["provider"] == "codex"
+        assert timeline["turns"][0]["active_seconds"] >= 0.0
+        assert len(timeline["routing_decisions"]) == 1
+        decision = timeline["routing_decisions"][0]
+        assert decision["binding_percent"] == 12.5
+        assert decision["binding_ceiling"] == 80.0
+        consumption = timeline["budget"]["consumption"]
+        assert consumption["turns"] == 1
+        assert "active_seconds" in consumption
+        assert "wall_seconds" in consumption
+        assert timeline["deferrals"] == []
+        assert len(timeline["guard_incidents"]) == 1
+        assert body["rendered"].startswith("# Session timeline")
+
+        missing = await client.get(
+            "/v1/sessions/" + new_uuid() + "/timeline",
+            headers=headers,
+        )
+        assert missing.status == 404
+    finally:
+        refresh = service.scheduler._status_refresh
+        if refresh is not None:
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+        await client.close()
+        service.close()
+
+
 def machines_session_payload(
     workspace: Path,
     external_ref: dict[str, str],

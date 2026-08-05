@@ -330,6 +330,75 @@ def test_status_returns_durable_usage_before_slow_refresh(
     asyncio.run(scenario())
 
 
+def test_status_reports_active_sessions_and_last_probe_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_usage() -> dict[str, UsageSnapshot]:
+        await asyncio.sleep(60)
+        return {}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        running = session(tmp_path)
+        store.create_session(running)
+        store.update_session(
+            running.session_id,
+            active_provider="claude",
+        )
+        paused = session(tmp_path)
+        store.create_session(paused)
+        store.update_session(
+            paused.session_id,
+            active_provider="claude",
+            lifecycle="paused",
+        )
+        store.record_usage(
+            "claude",
+            None,
+            False,
+            {"payload": {}, "error": "probe timed out"},
+        )
+        monkeypatch.setattr(
+            "agent_harness.scheduler.probe_all",
+            slow_usage,
+        )
+        scheduler = Scheduler(store, {"claude": SlowAdapter()})
+        status = await scheduler.status(tmp_path)
+
+        # Paused sessions do not count toward the active total.
+        assert status["claude"]["active_sessions"] == 1
+        assert status["claude"]["last_error"] == "probe timed out"
+        assert status["claude"]["ready"] is True
+        assert "usage" in status["claude"]
+
+        failed = UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="HTTP 401",
+        )
+
+        async def failing_probe() -> dict[str, UsageSnapshot]:
+            return {"claude": failed}
+
+        monkeypatch.setattr(
+            "agent_harness.scheduler.probe_all",
+            failing_probe,
+        )
+        await scheduler.refresh_usage()
+        refreshed = await scheduler.status(tmp_path)
+        assert refreshed["claude"]["last_error"] == "HTTP 401"
+        refresh = scheduler._status_refresh
+        assert refresh is not None
+        refresh.cancel()
+        await asyncio.gather(refresh, return_exceptions=True)
+        store.close()
+
+    asyncio.run(scenario())
+
+
 def test_scheduler_refreshes_usage_and_falls_back_on_model_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

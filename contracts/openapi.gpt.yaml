@@ -266,6 +266,29 @@ paths:
           $ref: "#/components/responses/JsonResponse"
         "404":
           $ref: "#/components/responses/JsonResponse"
+  /v1/sessions/{session_id}/timeline:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getSessionTimeline
+      description: >-
+        Read-only observability projection of one session:
+        turns and provider attempts with per-turn active
+        seconds, routing decisions (provider, binding percent,
+        binding ceiling, ranked and rejected candidates), goal
+        budget consumption (turns, tokens, active versus wall
+        seconds), routing-unavailable deferrals, and guard
+        incidents. The projection is rebuilt from existing
+        storage rows on every request and never writes to the
+        hot path. The response carries the structured
+        projection plus a human-readable rendering.
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+        "400":
+          $ref: "#/components/responses/JsonResponse"
+        "404":
+          $ref: "#/components/responses/JsonResponse"
   /v1/sessions/{session_id}/usage:
     parameters:
       - $ref: "#/components/parameters/SessionId"

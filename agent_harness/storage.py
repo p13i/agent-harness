@@ -2487,6 +2487,31 @@ class StateStore:
             ).fetchall()
         return [_load_object(str(row["result_json"])) for row in rows]
 
+    def failed_command_results(
+        self,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT command_id, command_type, result_json,
+                    created_at, updated_at FROM commands
+                WHERE session_id = ? AND status = ?
+                ORDER BY created_at, command_id
+                """,
+                (session_id, CommandStatus.FAILED),
+            ).fetchall()
+        return [
+            {
+                "command_id": str(row["command_id"]),
+                "command_type": str(row["command_type"]),
+                "result": _load_object(str(row["result_json"])),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
     def create_attempt(self, attempt: ProviderAttempt) -> ProviderAttempt:
         with self.transaction() as connection:
             connection.execute(
@@ -7523,6 +7548,28 @@ class StateStore:
                 ),
             )
         return decision_id
+
+    def routing_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM routing_decisions
+                WHERE session_id = ? ORDER BY created_at, decision_id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "decision_id": str(row["decision_id"]),
+                "turn_id": str(row["turn_id"]),
+                "provider": str(row["provider"]),
+                "model": str(row["model"]),
+                "effort": str(row["effort"]),
+                "payload": _load_object(row["payload_json"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     def create_proof_snapshot(
         self,
