@@ -143,6 +143,14 @@ def parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOKEN_BUDGET,
     )
 
+    timeline = subcommands.add_parser("timeline")
+    timeline.add_argument("session_id")
+    timeline.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+    )
+
     fork = subcommands.add_parser("fork")
     fork.add_argument("session_id")
     fork.add_argument("--name", default="")
@@ -597,6 +605,14 @@ async def _run(arguments: argparse.Namespace) -> int:
         )
         result = await client.request("GET", path)
         if arguments.format == "markdown":
+            print(str(result.get("rendered", "")), end="")
+        else:
+            _print_json(result)
+        return 0
+    if arguments.command == "timeline":
+        path = "/v1/sessions/" + arguments.session_id + "/timeline"
+        result = await client.request("GET", path)
+        if arguments.format == "text":
             print(str(result.get("rendered", "")), end="")
         else:
             _print_json(result)

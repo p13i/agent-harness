@@ -1054,6 +1054,50 @@ def test_cli_transcript_formats_flags_and_validation(
             asyncio.run(cli._run(parsed))
 
 
+def test_cli_timeline_formats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths_seen: list[str] = []
+
+    class Client:
+        async def request(
+            self,
+            method,
+            path,
+            *,
+            payload=None,
+            idempotency_key="",
+        ):
+            del method, payload, idempotency_key
+            paths_seen.append(path)
+            return {
+                "timeline": {
+                    "schema": "p13i/agent-harness/timeline/v1",
+                },
+                "rendered": "# Session timeline\n",
+            }
+
+    async def fake_ensure_daemon(unused):
+        del unused
+        return Client()
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    base = ["--state-dir", str(tmp_path / "state")]
+    parsed = cli.parser().parse_args([*base, "timeline", "session-1"])
+    assert asyncio.run(cli._run(parsed)) == 0
+    assert capsys.readouterr().out == "# Session timeline\n"
+
+    parsed = cli.parser().parse_args(
+        [*base, "timeline", "session-1", "--format", "json"]
+    )
+    assert asyncio.run(cli._run(parsed)) == 0
+    assert "timeline/v1" in capsys.readouterr().out
+    assert paths_seen[0].endswith("/v1/sessions/session-1/timeline")
+    assert paths_seen[1].endswith("/v1/sessions/session-1/timeline")
+
+
 def test_cli_manages_installed_user_service(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

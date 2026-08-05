@@ -156,6 +156,10 @@ def create_app(
         "/v1/sessions/{session_id}/transcript",
         _transcript,
     )
+    app.router.add_get(
+        "/v1/sessions/{session_id}/timeline",
+        _timeline,
+    )
     app.router.add_get("/v1/sessions/{session_id}/proof", _proof)
     app.router.add_get("/v1/sessions/{session_id}/turns", _turns)
     app.router.add_get(
@@ -565,6 +569,11 @@ async def _transcript(request: web.Request) -> web.Response:
         tail_turns=tail,
         token_budget=token_budget,
     )
+    return web.json_response(value)
+
+
+async def _timeline(request: web.Request) -> web.Response:
+    value = _service(request).timeline(request.match_info["session_id"])
     return web.json_response(value)
 
 

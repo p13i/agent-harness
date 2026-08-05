@@ -331,6 +331,7 @@ class Scheduler:
         self._start_status_refresh(workspace)
         usage = dict(self._usage_cache)
         durable_usage = self.store.latest_usage()
+        active_counts = self.store.active_provider_counts()
         models = dict(self._model_cache)
         refreshing = self._status_refresh is not None
         if self._status_refresh is not None:
@@ -363,6 +364,11 @@ class Scheduler:
                 "ready": provider_status.ready,
                 "detail": provider_status.detail,
                 "capabilities": sorted(provider_status.capabilities),
+                "active_sessions": active_counts.get(provider, 0),
+                "last_error": _last_probe_error(
+                    snapshot,
+                    durable_usage.get(provider, {}),
+                ),
                 "usage": usage_value,
                 "usage_refreshing": refreshing,
                 "models": [
@@ -401,6 +407,18 @@ class Scheduler:
             self.refresh_usage(),
             self.models(workspace, refresh=True),
         )
+
+
+def _last_probe_error(
+    snapshot: UsageSnapshot | None,
+    durable: dict[str, Any],
+) -> str:
+    if snapshot is not None and snapshot.error:
+        return snapshot.error
+    stored = durable.get("payload", {})
+    if not isinstance(stored, dict):
+        return ""
+    return str(stored.get("error", ""))
 
 
 def _durable_usage(

@@ -45,6 +45,7 @@ py_test(
         "test_workspace.py",
         "test_support.py",
         "test_transcript.py",
+        "test_timeline.py",
         "unit_test_runner.py",
     ],
     data = ["//cmd:agent_harness.py"],

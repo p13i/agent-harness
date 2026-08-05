@@ -65,6 +65,7 @@ from agent_harness.handoff import (
     handoff_token_budget,
     model_context_window,
 )
+from agent_harness.timeline import project_timeline, render_timeline
 from agent_harness.transcript import (
     RenderPolicy,
     project_transcript,
@@ -970,6 +971,15 @@ class HarnessService:
         return {
             "transcript": transcript.as_dict(),
             "rendered": render(transcript, policy),
+        }
+
+    def timeline(self, session_id: str) -> dict[str, Any]:
+        require_uuid(session_id, "session_id")
+        self.store.get_session(session_id)
+        timeline = project_timeline(self.store, session_id)
+        return {
+            "timeline": timeline,
+            "rendered": render_timeline(timeline),
         }
 
     def proof(
