@@ -146,6 +146,12 @@ def parser() -> argparse.ArgumentParser:
     fork = subcommands.add_parser("fork")
     fork.add_argument("session_id")
     fork.add_argument("--name", default="")
+    fork.add_argument(
+        "--to",
+        dest="target_provider",
+        choices=("claude", "codex", "kimi"),
+        default="",
+    )
 
     checkpoint = subcommands.add_parser("checkpoint")
     checkpoint.add_argument("session_id")
@@ -596,10 +602,13 @@ async def _run(arguments: argparse.Namespace) -> int:
             _print_json(result)
         return 0
     if arguments.command == "fork":
+        fork_payload = {"name": arguments.name}
+        if arguments.target_provider:
+            fork_payload["target_provider"] = arguments.target_provider
         result = await client.request(
             "POST",
             "/v1/sessions/" + arguments.session_id + "/fork",
-            payload={"name": arguments.name},
+            payload=fork_payload,
         )
         _print_json(result)
         return 0

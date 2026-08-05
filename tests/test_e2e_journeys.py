@@ -57,6 +57,7 @@ from agent_harness.providers.base import (
 from agent_harness.reconciliation import ReconciliationManager, inspect_workspace
 from agent_harness.safety import SafetyConsumption, TurnGuard, limits_for
 from agent_harness.scheduler import Scheduler
+from agent_harness.service import HarnessService
 from agent_harness.storage import StateStore
 from agent_harness.usage import UsageSnapshot
 from agent_harness.worker import SessionWorker
@@ -2179,6 +2180,300 @@ async def test_e2e_capacity_exhaustion_fails_over_once(
         assert current.active_provider == "codex"
     finally:
         rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_provider_switch_prepends_handoff_envelope(
+    tmp_path: Path,
+) -> None:
+    codex = ScriptedAdapter("codex", fail_turns=1)
+    claude = ScriptedAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig.prime_capacity(claude=60.0, codex=10.0)
+    try:
+        receipt = await rig.message("Build the feature.")
+
+        assert receipt.status == "complete", receipt.result
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [item.provider for item in attempts] == ["codex", "claude"]
+        assert claude.native_inputs == [""]
+        prompt = claude.prompts[0]
+        assert prompt.startswith("# Session handoff")
+        assert "session-handoff/v1" in prompt
+        assert "Harness-generated context" in prompt
+        assert "- Source provider: `codex`" in prompt
+        assert "- Target provider: `claude`" in prompt
+        assert "Build the feature." in prompt
+        handoff_events = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "session.handoff"
+        ]
+        assert len(handoff_events) == 1
+        metadata = handoff_events[0].metadata
+        assert metadata["schema"] == "session-handoff/v1"
+        assert metadata["origin"] == "provider-switch"
+        assert metadata["source_provider"] == "codex"
+        assert metadata["target_provider"] == "claude"
+        blob_text = rig.blobs.get_text(metadata["blob_digest"])
+        assert prompt.startswith(blob_text + "\n\n")
+        assert (len(blob_text) + 3) // 4 == metadata["rendered_tokens"]
+        assert metadata["rendered_tokens"] <= metadata["token_budget"]
+        # The ScriptedAdapter claude model reports a 200_000 token window.
+        assert metadata["token_budget"] <= 200_000
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_claude_to_kimi_switch_carries_handoff_envelope(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude", fail_turns=1)
+    kimi = ScriptedAdapter("kimi")
+    rig = JourneyRig(tmp_path, claude=claude)
+    del rig.adapters["codex"]
+    rig.adapters["kimi"] = kimi
+    rig.scheduler._usage_cache = {
+        "claude": _usage("claude", 20.0),
+        "kimi": _usage("kimi", 20.0),
+    }
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    try:
+        receipt = await rig.message("Port the parser.")
+
+        assert receipt.status == "complete", receipt.result
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [item.provider for item in attempts] == ["claude", "kimi"]
+        assert kimi.native_inputs == [""]
+        prompt = kimi.prompts[0]
+        assert prompt.startswith("# Session handoff")
+        assert "- Source provider: `claude`" in prompt
+        assert "- Target provider: `kimi`" in prompt
+        assert "Port the parser." in prompt
+        metadata = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "session.handoff"
+        ][0].metadata
+        assert metadata["origin"] == "provider-switch"
+        assert metadata["target_provider"] == "kimi"
+        assert metadata["rendered_tokens"] <= metadata["token_budget"]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_same_provider_dispatch_carries_no_handoff_envelope(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.prime_capacity()
+    try:
+        first = await rig.message("Build the feature.", provider="claude")
+        second = await rig.message("Refine the feature.", provider="claude")
+
+        assert first.status == "complete", first.result
+        assert second.status == "complete", second.result
+        assert claude.native_inputs == ["", "claude-native-session"]
+        assert not claude.prompts[0].startswith("# Session handoff")
+        assert "session-handoff/v1" not in claude.prompts[0]
+        assert claude.prompts[1] == "Refine the feature."
+        events = rig.store.all_events(rig.session.session_id)
+        assert not [
+            event for event in events if event.event_type == "session.handoff"
+        ]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_handoff_envelope_stays_outside_guard_digests(
+    tmp_path: Path,
+) -> None:
+    codex = ScriptedAdapter("codex", fail_turns=1)
+    rig = JourneyRig(tmp_path, codex=codex)
+    rig.prime_capacity(claude=60.0, codex=10.0)
+    try:
+        receipt = await rig.message("Build the feature.")
+
+        assert receipt.status == "complete", receipt.result
+        events = rig.store.all_events(rig.session.session_id)
+        # The failover re-dispatch of the same command, envelope
+        # included, did not trip the repeated-dispatch guard.
+        assert not [event for event in events if event.event_type == "guard.tripped"]
+        fingerprints = [
+            event for event in events if event.event_type == "dispatch.fingerprint"
+        ]
+        assert len(fingerprints) == 1
+        # The envelope is harness-generated context: the guard's
+        # instruction digest still covers only the operator text.
+        assert fingerprints[0].metadata["instruction_digest"] == (
+            worker_module._text_digest("Build the feature.")
+        )
+        handoffs = [
+            event for event in events if event.event_type == "session.handoff"
+        ]
+        assert len(handoffs) == 1
+    finally:
+        rig.close()
+
+
+class _ForkWorkers:
+    def __init__(self) -> None:
+        self.ensured: list[str] = []
+
+    def ensure(self, session_id: str) -> None:
+        self.ensured.append(session_id)
+
+    def stop_all(self) -> None:
+        return
+
+
+@pytest.mark.asyncio
+async def test_e2e_fork_to_provider_seeds_and_delivers_handoff(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _repository(workspace)
+    harness_paths = paths(tmp_path / "state")
+    prepare_paths(harness_paths)
+    service = HarnessService(harness_paths, worker_manager=_ForkWorkers())
+    try:
+        source = service.create_session(
+            {
+                "workspace": str(workspace),
+                "name": "implementation",
+                "goal": "Ship the reviewed change.",
+            }
+        )
+        attempt = ProviderAttempt(
+            attempt_id=new_uuid(),
+            session_id=source.session_id,
+            provider="codex",
+            native_session_id="codex-native-session",
+            model="codex-default",
+            effort="high",
+            auth_mode="subscription",
+            status="complete",
+            started_at=utc_now(),
+            ended_at=utc_now(),
+        )
+        service.store.create_attempt(attempt)
+        turn_id = service.store.start_turn(
+            source.session_id,
+            attempt.attempt_id,
+        )
+        service.store.append_event(
+            source.session_id,
+            "user.message",
+            role="user",
+            text="implement the parser port",
+            status="complete",
+            turn_id=turn_id,
+        )
+        service.store.append_event(
+            source.session_id,
+            "agent.message",
+            role="assistant",
+            text="parser ported with tests",
+            status="complete",
+            turn_id=turn_id,
+        )
+        service.store.finish_turn(turn_id, "complete")
+        service.store.update_session(
+            source.session_id,
+            active_provider="codex",
+        )
+        with pytest.raises(ValueError, match="target provider"):
+            service.fork_session(
+                source.session_id,
+                {"target_provider": "unregistered"},
+            )
+
+        forked = service.fork_session(
+            source.session_id,
+            {"name": "review fork", "target_provider": "claude"},
+        )
+
+        assert forked.name == "review fork"
+        forked_events = service.store.all_events(forked.session_id)
+        fork_event = [
+            event for event in forked_events if event.event_type == "session.forked"
+        ][0]
+        assert fork_event.metadata["source_session_id"] == source.session_id
+        assert fork_event.metadata["target_provider"] == "claude"
+        lineage = service.store.fork_lineage(forked.session_id)
+        assert lineage["source_session_id"] == source.session_id
+        assert lineage["source_context_digest"]
+        seed = [
+            event for event in forked_events if event.event_type == "session.handoff"
+        ][0]
+        assert seed.metadata["origin"] == "fork-seed"
+        assert seed.metadata["target_provider"] == "claude"
+        seeded_text = service.blobs.get_text(seed.metadata["blob_digest"])
+        assert seeded_text.startswith("# Session handoff")
+        assert "session-handoff/v1" in seeded_text
+        assert "- Source provider: `codex`" in seeded_text
+        assert "- Target provider: `claude`" in seeded_text
+        assert "implement the parser port" in seeded_text
+        assert "parser ported with tests" in seeded_text
+
+        claude = ScriptedAdapter("claude")
+        adapters = {"claude": claude}
+        scheduler = Scheduler(service.store, adapters)
+        scheduler._usage_cache = {"claude": _usage("claude", 20.0)}
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        worker = SessionWorker(
+            service.store,
+            service.blobs,
+            scheduler,
+            adapters,
+            forked.session_id,
+        )
+        service.store.register_worker(
+            forked.session_id,
+            123,
+            worker.incarnation,
+        )
+        service.store.set_session_safety(forked.session_id, "interactive")
+        receipt = service.store.enqueue_command(
+            forked.session_id,
+            "message",
+            {"text": "Review the carried state."},
+            new_uuid(),
+        )
+        service.store.append_event(
+            forked.session_id,
+            "user.message",
+            role="user",
+            text="Review the carried state.",
+            status="accepted",
+            metadata={"command_id": receipt.command_id},
+        )
+        claimed = service.store.claim_command(forked.session_id)
+        assert claimed is not None
+        await worker._message(claimed)
+
+        prompt = claude.prompts[0]
+        assert claude.native_inputs == [""]
+        assert prompt.startswith(seeded_text + "\n\n")
+        assert "Review the carried state." in prompt
+        deliveries = [
+            event
+            for event in service.store.all_events(forked.session_id)
+            if event.event_type == "session.handoff"
+        ]
+        assert [event.metadata["origin"] for event in deliveries] == [
+            "fork-seed",
+            "fork-seed",
+        ]
+        assert deliveries[1].metadata["handoff_digest"] == (
+            seed.metadata["handoff_digest"]
+        )
+    finally:
+        service.close()
 
 
 @pytest.mark.asyncio

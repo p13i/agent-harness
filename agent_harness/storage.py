@@ -1690,6 +1690,22 @@ class StateStore:
             "source_context_digest": str(checkpoint["context_digest"]),
         }
 
+    def seeded_handoff(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT metadata_json FROM events
+                WHERE session_id = ? AND event_type = 'session.handoff'
+                ORDER BY sequence DESC
+                """,
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            metadata = _load_object(row["metadata_json"])
+            if str(metadata.get("origin", "")) == "fork-seed":
+                return metadata
+        return {}
+
     def context_history_summary(
         self,
         session_id: str,

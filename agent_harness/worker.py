@@ -16,6 +16,7 @@ from typing import Any
 from agent_harness.blobs import BlobStore
 from agent_harness.config import HarnessPaths
 from agent_harness.context import (
+    CompiledContext,
     compile_context,
     workspace_context_artifacts,
     workspace_instructions,
@@ -37,6 +38,14 @@ from agent_harness.goals import (
     goal_consumption,
     make_evidence,
 )
+from agent_harness.handoff import (
+    HANDOFF_SCHEMA,
+    ORIGIN_FORK_SEED,
+    ORIGIN_PROVIDER_SWITCH,
+    handoff_envelope,
+    handoff_token_budget,
+    model_context_window,
+)
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import (
     Attention,
@@ -48,6 +57,7 @@ from agent_harness.models import (
     GoalStatus,
     Lifecycle,
     ProviderAttempt,
+    RoutingDecision,
     Session,
 )
 from agent_harness.process_control import terminate_recorded_process_group
@@ -74,6 +84,7 @@ from agent_harness.safety import (
 from agent_harness.scheduler import Scheduler
 from agent_harness.storage import StateStore
 from agent_harness.sync import publish_session
+from agent_harness.transcript import RenderPolicy, project_transcript, render
 from agent_harness.workspace import checkpoint_workspace, workspace_summary
 from agent_harness.workspace_state import inspect_workspace
 
@@ -814,6 +825,15 @@ class SessionWorker:
         ):
             unavailable_native_session_id = native_session_id
             native_session_id = ""
+        handoff_block = ""
+        handoff_metadata: dict[str, Any] = {}
+        if not native_session_id:
+            handoff_block, handoff_metadata = await self._handoff_context(
+                session,
+                decision,
+                guard.limits,
+                context,
+            )
         prompt = text
         context_digest = ""
         context_payload_digest = ""
@@ -822,7 +842,9 @@ class SessionWorker:
             "generation_digest"
         ]
         if not native_session_id or session.active_provider != decision.provider:
-            prompt = context.text + "\n\n# Next instruction\n\n" + text
+            prompt = (
+                handoff_block + context.text + "\n\n# Next instruction\n\n" + text
+            )
             context_payload_digest = hashlib.sha256(
                 context.text.encode("utf-8")
             ).hexdigest()
@@ -911,6 +933,14 @@ class SessionWorker:
             },
             turn_id=turn_id,
         )
+        if handoff_metadata:
+            self.store.append_event(
+                self.session_id,
+                "session.handoff",
+                status="complete",
+                metadata=handoff_metadata,
+                turn_id=turn_id,
+            )
         if unavailable_native_session_id:
             self.store.append_event(
                 self.session_id,
@@ -1990,6 +2020,79 @@ class SessionWorker:
             if attempt.native_session_id:
                 return attempt.native_session_id
         return ""
+
+    async def _handoff_context(
+        self,
+        session: Session,
+        decision: RoutingDecision,
+        limits: SafetyLimits,
+        context: CompiledContext,
+    ) -> tuple[str, dict[str, Any]]:
+        """Harness-generated handoff envelope for a provider switch.
+
+        The envelope is prepended to the compiled context only; it is
+        never folded into the operator instruction or the digests the
+        repeated-dispatch guard and attestation paths compute.
+        """
+        attempts = self.store.attempts(self.session_id)
+        if attempts:
+            source_provider = session.active_provider
+            if not source_provider:
+                source_provider = attempts[-1].provider
+            models = await self.scheduler.models(Path(session.worktree))
+            token_budget = handoff_token_budget(
+                model_context_window(
+                    models.get(decision.provider, ()),
+                    decision.model,
+                ),
+                limits.max_output_tokens,
+                context.estimated_tokens,
+            )
+            transcript = project_transcript(
+                self.store,
+                self.session_id,
+                blobs=self.blobs,
+            )
+            block = handoff_envelope(
+                session_id=self.session_id,
+                source_provider=source_provider,
+                target_provider=decision.provider,
+                target_model=decision.model,
+                transcript_digest=transcript.digest,
+                rendered=render(transcript, RenderPolicy(token_budget=token_budget)),
+            )
+            metadata = {
+                "schema": HANDOFF_SCHEMA,
+                "origin": ORIGIN_PROVIDER_SWITCH,
+                "source_provider": source_provider,
+                "target_provider": decision.provider,
+                "target_model": decision.model,
+                "transcript_digest": transcript.digest,
+                "handoff_digest": hashlib.sha256(
+                    block.encode("utf-8")
+                ).hexdigest(),
+                "blob_digest": self.blobs.put_text(block),
+                "token_budget": token_budget,
+                "rendered_tokens": (len(block) + 3) // 4,
+            }
+            return block + "\n\n", metadata
+        seeded = self.store.seeded_handoff(self.session_id)
+        if seeded:
+            block = self.blobs.get_text(str(seeded["blob_digest"]))
+            metadata = {
+                "schema": HANDOFF_SCHEMA,
+                "origin": ORIGIN_FORK_SEED,
+                "source_session_id": str(seeded.get("source_session_id", "")),
+                "source_provider": str(seeded.get("source_provider", "")),
+                "target_provider": str(seeded.get("target_provider", "")),
+                "transcript_digest": str(seeded.get("transcript_digest", "")),
+                "handoff_digest": hashlib.sha256(
+                    block.encode("utf-8")
+                ).hexdigest(),
+                "blob_digest": str(seeded["blob_digest"]),
+            }
+            return block + "\n\n", metadata
+        return "", {}
 
     def _guard_repeated_dispatch(
         self,

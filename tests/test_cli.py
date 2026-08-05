@@ -856,6 +856,7 @@ def test_cli_dispatches_every_session_control(
             "10",
         ],
         [*base, "fork", "session-1", "--name", "fork"],
+        [*base, "fork", "session-1", "--name", "review", "--to", "kimi"],
         [*base, "checkpoint", "session-1"],
         [*base, "archive", "session-1"],
         [*base, "unarchive", "session-1"],

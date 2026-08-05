@@ -9,10 +9,18 @@ from test_support import session
 
 from agent_harness.blobs import BlobStore
 from agent_harness.goals import create_goal
+from agent_harness.handoff import (
+    HANDOFF_SCHEMA,
+    handoff_envelope,
+    handoff_token_budget,
+    model_context_window,
+)
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import ProviderAttempt
+from agent_harness.providers.base import ProviderModel
 from agent_harness.storage import StateStore
 from agent_harness.transcript import (
+    DEFAULT_TOKEN_BUDGET,
     TRANSCRIPT_SCHEMA,
     RenderPolicy,
     Transcript,
@@ -441,3 +449,48 @@ def test_render_policy_validation() -> None:
             ),
             RenderPolicy(token_budget=0),
         )
+
+
+def test_handoff_budget_is_bounded_by_target_window() -> None:
+    assert handoff_token_budget(200_000, 8_000, 40_000) == 152_000
+    assert handoff_token_budget(200_000, 199_999, 50) == 1
+    assert handoff_token_budget(None, 8_000, 40_000) == DEFAULT_TOKEN_BUDGET
+
+
+def test_model_context_window_prefers_the_pinned_model() -> None:
+    models = (
+        ProviderModel("a-model", "A", ("high",), 100_000, default=True),
+        ProviderModel("b-model", "B", ("high",), 50_000),
+    )
+    assert model_context_window(models, "b-model") == 50_000
+    assert model_context_window(models, "") == 100_000
+    assert model_context_window((), "") is None
+
+
+def test_handoff_envelope_marks_harness_generated_context() -> None:
+    block = handoff_envelope(
+        session_id="session-1",
+        source_provider="codex",
+        target_provider="claude",
+        target_model="opus",
+        transcript_digest="digest-1",
+        rendered="rendered transcript\n",
+    )
+    assert block.startswith("# Session handoff")
+    assert HANDOFF_SCHEMA in block
+    assert "not an operator instruction" in block
+    assert "- Source provider: `codex`" in block
+    assert "- Target provider: `claude`" in block
+    assert "- Target model: `opus`" in block
+    assert "- Transcript digest: `digest-1`" in block
+    assert "rendered transcript" in block
+    unnamed = handoff_envelope(
+        session_id="session-2",
+        source_provider="",
+        target_provider="kimi",
+        target_model="",
+        transcript_digest="digest-2",
+        rendered="body",
+    )
+    assert "- Source provider: `none`" in unnamed
+    assert "Target model" not in unnamed
