@@ -58,6 +58,12 @@ from agent_harness.reconciliation import (
     ReconciliationManager,
     validate_reconciliation_audit,
 )
+from agent_harness.transcript import (
+    RenderPolicy,
+    project_transcript,
+    render,
+    validate_render_policy,
+)
 from agent_harness.runtime import launcher_command
 from agent_harness.safety import (
     UNATTENDED,
@@ -933,6 +939,31 @@ class HarnessService:
         turn_id: str,
     ) -> dict[str, Any]:
         return session_turn(self.store, session_id, turn_id)
+
+    def transcript(
+        self,
+        session_id: str,
+        *,
+        tail_turns: int,
+        token_budget: int,
+    ) -> dict[str, Any]:
+        require_uuid(session_id, "session_id")
+        self.store.get_session(session_id)
+        policy = validate_render_policy(
+            RenderPolicy(
+                token_budget=token_budget,
+                tail_turns=tail_turns,
+            )
+        )
+        transcript = project_transcript(
+            self.store,
+            session_id,
+            blobs=self.blobs,
+        )
+        return {
+            "transcript": transcript.as_dict(),
+            "rendered": render(transcript, policy),
+        }
 
     def proof(
         self,

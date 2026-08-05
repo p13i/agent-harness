@@ -22,7 +22,7 @@ from agent_harness.config import CONTROL_BUILD_ID, CONTROL_PROTOCOL_VERSION, pat
 from agent_harness.errors import ConflictError, NotFoundError, SafetyGuardError
 from agent_harness.goals import create_goal, goal_contract_digest, make_evidence
 from agent_harness.ids import new_uuid, utc_now
-from agent_harness.models import ProviderAttempt
+from agent_harness.models import ProviderAttempt, Session
 from agent_harness.orchestration import command_envelope_digest, normalized_digest
 from agent_harness.reconciliation import inspect_workspace
 from agent_harness.service import HarnessService
@@ -102,6 +102,110 @@ async def test_api_records_and_replays_operator_usage_attestation(
             json=payload,
         )
         assert rejected.status == 400
+    finally:
+        refresh = service.scheduler._status_refresh
+        if refresh is not None:
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+        await client.close()
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_api_projects_canonical_transcript(
+    tmp_path: Path,
+) -> None:
+    service = HarnessService(
+        paths(tmp_path / "state"),
+        worker_manager=Workers(),
+    )
+    client = TestClient(TestServer(create_app(service, "test-token")))
+    await client.start_server()
+    headers = {"Authorization": "Bearer test-token"}
+    now = utc_now()
+    created = Session(
+        session_id=new_uuid(),
+        name="transcript",
+        workspace=str(tmp_path),
+        worktree=str(tmp_path),
+        lifecycle="running",
+        attention="idle",
+        permission_mode="approval",
+        active_provider="",
+        model="",
+        effort="",
+        goal_id="",
+        owner_host="test-host",
+        owner_epoch=1,
+        created_at=now,
+        updated_at=now,
+    )
+    service.store.create_session(created)
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="claude",
+        native_session_id="",
+        model="account-default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    service.store.create_attempt(attempt)
+    turn_id = service.store.start_turn(created.session_id, attempt.attempt_id)
+    service.store.append_event(
+        created.session_id,
+        "user.message",
+        role="user",
+        text="fix the flaky test",
+        turn_id=turn_id,
+    )
+    service.store.append_event(
+        created.session_id,
+        "agent.message",
+        role="assistant",
+        text="on it",
+        turn_id=turn_id,
+    )
+    service.store.finish_turn(turn_id, "complete")
+    try:
+        response = await client.get(
+            "/v1/sessions/" + created.session_id + "/transcript",
+            headers=headers,
+        )
+        assert response.status == 200
+        body = await response.json()
+        transcript = body["transcript"]
+        assert transcript["schema"] == ("p13i/agent-harness/transcript/v1")
+        assert [entry["role"] for entry in transcript["entries"]] == [
+            "user",
+            "assistant",
+        ]
+        assert transcript["entries"][0]["provider"] == "claude"
+        assert len(transcript["digest"]) == 64
+        assert body["rendered"].startswith("# Session transcript")
+
+        tailored = await client.get(
+            "/v1/sessions/"
+            + created.session_id
+            + "/transcript?tail=0&token_budget=64",
+            headers=headers,
+        )
+        assert tailored.status == 200
+
+        invalid = await client.get(
+            "/v1/sessions/" + created.session_id + "/transcript?tail=-1",
+            headers=headers,
+        )
+        assert invalid.status == 400
+
+        missing = await client.get(
+            "/v1/sessions/" + new_uuid() + "/transcript",
+            headers=headers,
+        )
+        assert missing.status == 404
     finally:
         refresh = service.scheduler._status_refresh
         if refresh is not None:

@@ -34,6 +34,12 @@ from agent_harness.scheduler import Scheduler
 from agent_harness.service_manager import SystemdUserService, UnitConfiguration
 from agent_harness.storage import StateStore
 from agent_harness.sync import publish_all, read_sync_status
+from agent_harness.transcript import (
+    DEFAULT_TAIL_TURNS,
+    DEFAULT_TOKEN_BUDGET,
+    RenderPolicy,
+    validate_render_policy,
+)
 from agent_harness.tui import run_tui
 from agent_harness.usage import provider_auth_ready
 from agent_harness.worker import SessionWorker
@@ -122,6 +128,20 @@ def parser() -> argparse.ArgumentParser:
     events.add_argument("session_id")
     events.add_argument("--after", type=int, default=0)
     events.add_argument("--limit", type=int, default=1000)
+
+    transcript = subcommands.add_parser("transcript")
+    transcript.add_argument("session_id")
+    transcript.add_argument(
+        "--format",
+        choices=("json", "markdown"),
+        default="markdown",
+    )
+    transcript.add_argument("--tail", type=int, default=DEFAULT_TAIL_TURNS)
+    transcript.add_argument(
+        "--token-budget",
+        type=int,
+        default=DEFAULT_TOKEN_BUDGET,
+    )
 
     fork = subcommands.add_parser("fork")
     fork.add_argument("session_id")
@@ -553,6 +573,27 @@ async def _run(arguments: argparse.Namespace) -> int:
             + str(arguments.limit)
         )
         _print_json(await client.request("GET", path))
+        return 0
+    if arguments.command == "transcript":
+        policy = validate_render_policy(
+            RenderPolicy(
+                token_budget=arguments.token_budget,
+                tail_turns=arguments.tail,
+            )
+        )
+        path = (
+            "/v1/sessions/"
+            + arguments.session_id
+            + "/transcript?tail="
+            + str(policy.tail_turns)
+            + "&token_budget="
+            + str(policy.token_budget)
+        )
+        result = await client.request("GET", path)
+        if arguments.format == "markdown":
+            print(str(result.get("rendered", "")), end="")
+        else:
+            _print_json(result)
         return 0
     if arguments.command == "fork":
         result = await client.request(
