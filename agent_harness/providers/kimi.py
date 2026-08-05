@@ -11,11 +11,12 @@ Three consequences of that choice, all deliberate:
 - ``steer`` stays the base class's no-op. The active one-shot process can
   still be interrupted and is contained in an isolated process group.
 - ``--yolo`` is NOT passed. Kimi rejects it together with ``--prompt``.
-- The adapter reports itself unavailable to the scheduler because the
-  one-shot CLI cannot map harness permission modes or emit bounded tool
-  and child-agent accounting. It is registered in the default provider
-  registry so usage probing and discovery see it, but routing rejects it
-  as not ready until those gaps close.
+- Restrictive harness permission modes stay unmappable (only ``full``
+  is accepted), the stream carries no bounded tool accounting, and a
+  positive child-agent limit cannot be metered, so ``run_turn`` raises
+  for those. A zero child-agent limit is accepted: containment comes
+  from deny rules for the Agent/AgentSwarm tools in the host's
+  ``~/.kimi-code/config.toml`` rather than from the harness gate.
 """
 
 from __future__ import annotations
@@ -85,12 +86,14 @@ class KimiAdapter(ProviderAdapter):
     ) -> ProviderResult:
         # Kimi Code exposes no reasoning-effort control. Its one-shot
         # prompt surface also cannot map restrictive harness permission
-        # modes or enforce child-agent admission.
+        # modes or meter a positive child-agent limit; a zero limit is
+        # accepted because containment then comes from the host config's
+        # Agent/AgentSwarm deny rules.
         del effort, approval_handler
         if permission_mode != "full":
             raise RuntimeError("Kimi cannot map the requested permission mode")
-        if child_launch_gate is not None:
-            raise RuntimeError("Kimi cannot enforce the child-agent limit")
+        if child_launch_gate is not None and child_launch_gate.limit != 0:
+            raise RuntimeError("Kimi cannot meter a positive child-agent limit")
 
         if pre_prompt_gate is not None:
             await pre_prompt_gate()
@@ -206,16 +209,19 @@ class KimiAdapter(ProviderAdapter):
 
     def status(self) -> ProviderStatus:
         npx_available = shutil.which("npx") is not None
-        ready = False
+        ready = npx_available
         detail = "npx was not found"
         if npx_available:
-            detail = "one-shot Kimi lacks permission and tool accounting"
+            detail = (
+                "one-shot run; full permission mode only, tool usage "
+                "unaccounted, child agents contained by host config denies"
+            )
         return ProviderStatus(
             provider=self.provider_id,
             ready=ready,
             detail=detail,
-            # The unavailable adapter advertises only behavior its
-            # stream can observe. No steering exists on a one-shot run.
+            # The one-shot adapter advertises only behavior its stream
+            # can observe. No steering exists on a one-shot run.
             capabilities=frozenset(
                 {
                     "resume",

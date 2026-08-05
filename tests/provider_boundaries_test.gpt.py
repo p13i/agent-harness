@@ -2323,9 +2323,9 @@ def test_kimi_launch_argv_omits_yolo_and_pins_the_package() -> None:
 def test_kimi_status_and_models(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(kimi.shutil, "which", lambda _name: "/usr/bin/npx")
     status = kimi.KimiAdapter().status()
-    assert not status.ready
+    assert status.ready
     assert status.provider == "kimi"
-    assert "permission and tool accounting" in status.detail
+    assert "tool usage unaccounted" in status.detail
     # A one-shot run has no live turn to steer and cannot prompt for
     # approval, so neither capability is claimed.
     assert "approval" not in status.capabilities
@@ -2406,6 +2406,82 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
     asyncio.run(scenario())
 
     assert [e.event_type for e in seen] == ["agent.message", "turn.completed"]
+
+
+def test_kimi_run_turn_gates_on_a_positive_child_limit(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lines = [b'{"role":"assistant","content":"ok"}\n']
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                for line in lines:
+                    yield line
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class Process:
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*_argv, **_kwargs):
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def handler(_event: ProviderEvent) -> None:
+        return None
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        adapter = kimi.KimiAdapter()
+        # A zero limit is accepted: containment comes from the host
+        # config's Agent/AgentSwarm deny rules, not the harness gate.
+        result = await adapter.run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="",
+            permission_mode="full",
+            model="kimi-code/k3",
+            effort="",
+            event_handler=handler,
+            approval_handler=approvals,
+            child_launch_gate=ChildLaunchGate(
+                database=tmp_path,
+                command_id="cmd",
+                limit=0,
+            ),
+        )
+        assert result.status == "complete"
+        with pytest.raises(RuntimeError, match="positive child-agent limit"):
+            await adapter.run_turn(
+                workspace=tmp_path,
+                prompt="do it",
+                native_session_id="",
+                permission_mode="full",
+                model="kimi-code/k3",
+                effort="",
+                event_handler=handler,
+                approval_handler=approvals,
+                child_launch_gate=ChildLaunchGate(
+                    database=tmp_path,
+                    command_id="cmd",
+                    limit=2,
+                ),
+            )
+
+    asyncio.run(scenario())
 
 
 # A nonzero exit is the only failure signal a one-shot run emits, so the

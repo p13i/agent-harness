@@ -353,13 +353,15 @@ def test_adapters_publish_the_canonical_process_group_identity() -> None:
     assert claude_adapter.process_identity() == (0, "")
 
 
-def test_default_service_registry_keeps_kimi_unroutable_until_safety_mapped(
+def test_default_service_registry_admits_kimi_with_config_containment(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(kimi.shutil, "which", lambda _name: "/usr/bin/npx")
     service = HarnessService(paths(tmp_path / "state"))
     try:
         assert set(service.adapters) == {"claude", "codex", "kimi"}
-        assert not service.adapters["kimi"].status().ready
+        assert service.adapters["kimi"].status().ready
     finally:
         service.close()
 
@@ -645,7 +647,7 @@ async def test_kimi_accepts_neutral_hooks_and_uses_process_containment(
             child_launch_gate=ChildLaunchGate(
                 tmp_path / "state.sqlite3",
                 "command",
-                0,
+                2,
             ),
         )
 
