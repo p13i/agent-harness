@@ -2349,6 +2349,41 @@ class StateStore:
             ).fetchone()
         return int(row["count"])
 
+    def countable_turn_count(self, session_id: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM turns
+                WHERE session_id = ? AND status != 'no-progress'
+                """,
+                (session_id,),
+            ).fetchone()
+        return int(row["count"])
+
+    def active_turn_seconds(
+        self,
+        session_id: str,
+        now: datetime.datetime,
+    ) -> float:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT started_at, completed_at FROM turns
+                WHERE session_id = ? AND status != 'no-progress'
+                """,
+                (session_id,),
+            ).fetchall()
+        total = 0.0
+        for row in rows:
+            started = _turn_timestamp(str(row["started_at"]))
+            completed_text = str(row["completed_at"])
+            if completed_text:
+                completed = _turn_timestamp(completed_text)
+            else:
+                completed = now
+            total += max(0.0, (completed - started).total_seconds())
+        return total
+
     def presentation_turn_rows(
         self,
         session_id: str,
@@ -8442,6 +8477,13 @@ def _sqlite_contention(error: sqlite3.OperationalError) -> bool:
 
 def _dump(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _turn_timestamp(value: str) -> datetime.datetime:
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.UTC)
+    return parsed.astimezone(datetime.UTC)
 
 
 def _require_object(value: object, field: str) -> dict[str, Any]:

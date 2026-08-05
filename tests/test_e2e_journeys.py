@@ -265,6 +265,59 @@ class ScriptedAdapter(ProviderAdapter):
         return (self.process_pid, self.process_start)
 
 
+class ZeroProgressAdapter(ScriptedAdapter):
+    def __init__(self, provider: str, *, write_file: bool = False) -> None:
+        super().__init__(provider)
+        self.write_file = write_file
+
+    async def run_turn(
+        self,
+        *,
+        workspace: Path,
+        prompt: str,
+        native_session_id: str,
+        permission_mode: str,
+        model: str,
+        effort: str,
+        event_handler: EventHandler,
+        approval_handler: ApprovalHandler,
+        child_launch_gate: ChildLaunchGate | None = None,
+        pre_prompt_gate: PrePromptGate | None = None,
+    ) -> ProviderResult:
+        del permission_mode
+        del model
+        del approval_handler
+        if pre_prompt_gate is not None:
+            await pre_prompt_gate()
+        self.prompts.append(prompt)
+        self.efforts.append(effort)
+        if child_launch_gate is None:
+            self.child_agent_limits.append(None)
+        else:
+            self.child_agent_limits.append(child_launch_gate.limit)
+        await event_handler(
+            ProviderEvent(
+                "provider.prompt.accepted",
+                status="accepted",
+                native_session_id=(self.provider_id + "-native-session"),
+            )
+        )
+        if self.write_file:
+            (workspace / "zero-progress-output.txt").write_text(
+                "written without narration\n"
+            )
+        resolved_session_id = native_session_id
+        if not resolved_session_id:
+            resolved_session_id = self.provider_id + "-native-session"
+        return ProviderResult(
+            provider=self.provider_id,
+            native_session_id=resolved_session_id,
+            native_turn_id=self.provider_id + "-turn",
+            status="complete",
+            usage={"total_tokens": 1},
+        )
+
+
 class JourneyRig:
     def __init__(
         self,
@@ -5249,3 +5302,70 @@ def _repository(path: Path) -> None:
         ["git", "-C", str(path), "commit", "-qm", "initial"],
         check=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_zero_output_zero_change_turn_is_no_progress(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path, claude=ZeroProgressAdapter("claude"))
+    try:
+        rig.store.create_goal(
+            create_goal(
+                rig.session.session_id,
+                "Survive a dead turn.",
+                budgets={"turns": 1},
+            )
+        )
+        rig.prime_capacity()
+        receipt = await rig.message("Work silently.", provider="claude")
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_PROVIDER_NO_PROGRESS"
+        turn_rows = rig.store.presentation_turn_rows(rig.session.session_id)
+        assert [row["turn_status"] for row in turn_rows] == ["no-progress"]
+        assert rig.store.turn_count(rig.session.session_id) == 1
+        assert rig.store.countable_turn_count(rig.session.session_id) == 0
+        assert rig.worker._exhausted_budget() == ""
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_output_without_workspace_change_completes_and_counts(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(tmp_path, claude=ScriptedAdapter("claude"))
+    try:
+        rig.prime_capacity()
+        receipt = await rig.message(
+            "Decline with an explanation.",
+            provider="claude",
+        )
+
+        assert receipt.status == "complete"
+        turn_rows = rig.store.presentation_turn_rows(rig.session.session_id)
+        assert [row["turn_status"] for row in turn_rows] == ["complete"]
+        assert rig.store.countable_turn_count(rig.session.session_id) == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_change_without_output_completes_and_counts(
+    tmp_path: Path,
+) -> None:
+    rig = JourneyRig(
+        tmp_path,
+        claude=ZeroProgressAdapter("claude", write_file=True),
+    )
+    try:
+        rig.prime_capacity()
+        receipt = await rig.message("Write without narration.", provider="claude")
+
+        assert receipt.status == "complete"
+        turn_rows = rig.store.presentation_turn_rows(rig.session.session_id)
+        assert [row["turn_status"] for row in turn_rows] == ["complete"]
+        assert rig.store.countable_turn_count(rig.session.session_id) == 1
+    finally:
+        rig.close()
