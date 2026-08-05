@@ -30,6 +30,7 @@ from agent_harness.service import HarnessService
 from agent_harness.storage import SCHEMA_VERSION
 from agent_harness.sync import publish_all, read_sync_status
 from agent_harness.terminal import terminal_socket
+from agent_harness.transcript import DEFAULT_TAIL_TURNS, DEFAULT_TOKEN_BUDGET
 
 STREAM_HEARTBEAT_LIMIT = 3600
 
@@ -151,6 +152,10 @@ def create_app(
         _set_ui_state,
     )
     app.router.add_get("/v1/sessions/{session_id}/events", _events)
+    app.router.add_get(
+        "/v1/sessions/{session_id}/transcript",
+        _transcript,
+    )
     app.router.add_get("/v1/sessions/{session_id}/proof", _proof)
     app.router.add_get("/v1/sessions/{session_id}/turns", _turns)
     app.router.add_get(
@@ -548,6 +553,19 @@ async def _events(request: web.Request) -> web.Response:
         limit=limit,
     )
     return web.json_response({"events": [item.as_dict() for item in events]})
+
+
+async def _transcript(request: web.Request) -> web.Response:
+    tail = _integer(request.query.get("tail", str(DEFAULT_TAIL_TURNS)))
+    token_budget = _integer(
+        request.query.get("token_budget", str(DEFAULT_TOKEN_BUDGET))
+    )
+    value = _service(request).transcript(
+        request.match_info["session_id"],
+        tail_turns=tail,
+        token_budget=token_budget,
+    )
+    return web.json_response(value)
 
 
 async def _proof(request: web.Request) -> web.Response:

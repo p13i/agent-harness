@@ -990,6 +990,69 @@ def test_cli_rejects_invalid_event_and_evidence_values(
     assert cli._command_exit({"status": "complete"}) == 0
 
 
+def test_cli_transcript_formats_flags_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths_seen: list[str] = []
+
+    class Client:
+        async def request(
+            self,
+            method,
+            path,
+            *,
+            payload=None,
+            idempotency_key="",
+        ):
+            del method, payload, idempotency_key
+            paths_seen.append(path)
+            return {
+                "transcript": {
+                    "schema": "p13i/agent-harness/transcript/v1",
+                },
+                "rendered": "# Session transcript\n",
+            }
+
+    async def fake_ensure_daemon(unused):
+        del unused
+        return Client()
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    base = ["--state-dir", str(tmp_path / "state")]
+    parsed = cli.parser().parse_args([*base, "transcript", "session-1"])
+    assert asyncio.run(cli._run(parsed)) == 0
+    assert capsys.readouterr().out == "# Session transcript\n"
+
+    parsed = cli.parser().parse_args(
+        [
+            *base,
+            "transcript",
+            "session-1",
+            "--format",
+            "json",
+            "--tail",
+            "2",
+            "--token-budget",
+            "512",
+        ]
+    )
+    assert asyncio.run(cli._run(parsed)) == 0
+    assert "transcript/v1" in capsys.readouterr().out
+    assert paths_seen[0].endswith("/transcript?tail=4&token_budget=8192")
+    assert paths_seen[1].endswith("/transcript?tail=2&token_budget=512")
+
+    invalid = [
+        [*base, "transcript", "session-1", "--tail", "-1"],
+        [*base, "transcript", "session-1", "--token-budget", "0"],
+    ]
+    for arguments in invalid:
+        parsed = cli.parser().parse_args(arguments)
+        with pytest.raises(ValueError):
+            asyncio.run(cli._run(parsed))
+
+
 def test_cli_manages_installed_user_service(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

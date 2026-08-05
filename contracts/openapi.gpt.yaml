@@ -227,6 +227,45 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TurnDetail"
+  /v1/sessions/{session_id}/transcript:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getSessionTranscript
+      description: >-
+        Canonical provider-neutral transcript projection of
+        the durable event log with blob dereference, per-turn
+        provider attribution, a schema version, and a content
+        digest, plus a budget-aware rendering that keeps the
+        goal block, original instructions, and the tail turns
+        verbatim while eliding the middle to entry digests.
+        The projection is rebuilt from the event log on every
+        request; events remain the source of truth.
+      parameters:
+        - name: tail
+          in: query
+          description: >-
+            Number of trailing turns rendered verbatim.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 64
+        - name: token_budget
+          in: query
+          description: >-
+            Deterministic rendering budget measured in
+            estimated tokens (four characters per token).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000000
+      responses:
+        "200":
+          $ref: "#/components/responses/JsonResponse"
+        "400":
+          $ref: "#/components/responses/JsonResponse"
+        "404":
+          $ref: "#/components/responses/JsonResponse"
   /v1/sessions/{session_id}/usage:
     parameters:
       - $ref: "#/components/parameters/SessionId"
