@@ -33,6 +33,7 @@ py_test(
         "test_cli.py",
         "test_goals.py",
         "test_normalize.py",
+        "test_policy.py",
         "test_presentation.py",
         "test_projections.py",
         "test_routing.py",

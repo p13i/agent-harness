@@ -50,7 +50,10 @@ def route(
         provider = manual_provider
         if not provider:
             provider = "automatic routing"
-        raise ProviderUnavailableError(provider)
+        raise ProviderUnavailableError(
+            provider,
+            rejected=tuple(rejected),
+        )
 
     max_quality = max(item[0].quality for item in accepted)
     quality_floor = max_quality - QUALITY_WINDOW

@@ -24,6 +24,8 @@ from agent_harness.context import (
 from agent_harness.errors import (
     HarnessError,
     NotFoundError,
+    PolicyBlockedError,
+    PolicyDeferredError,
     ProviderExhaustedError,
     ProviderUnavailableError,
     ReconciliationRequiredError,
@@ -59,6 +61,21 @@ from agent_harness.models import (
     ProviderAttempt,
     RoutingDecision,
     Session,
+)
+from agent_harness.policy import (
+    ALLOW,
+    BLOCK,
+    DEFER,
+    LEVEL_COMMAND,
+    LEVEL_GOAL,
+    RULE_APPROVAL_REQUIRED,
+    RULE_SERVER_POLICY,
+    PolicyDecision,
+    PolicyEvaluator,
+    implementation_providers,
+    is_review_workload,
+    limit_decisions,
+    load_server_policy,
 )
 from agent_harness.process_control import terminate_recorded_process_group
 from agent_harness.providers.base import (
@@ -201,6 +218,7 @@ class SessionWorker:
         adapters: dict[str, ProviderAdapter],
         session_id: str,
         paths: HarnessPaths | None = None,
+        policy_approval_handler: Any = None,
     ) -> None:
         self.store = store
         self.blobs = blobs
@@ -208,6 +226,7 @@ class SessionWorker:
         self.adapters = adapters
         self.session_id = session_id
         self.paths = paths
+        self._policy_approval_handler = policy_approval_handler
         self.incarnation = new_uuid()
         self._stopping = False
         self._active_adapter: ProviderAdapter | None = None
@@ -460,6 +479,32 @@ class SessionWorker:
                 result,
             )
             return
+        evaluator: PolicyEvaluator | None = None
+        try:
+            state_dir = None
+            if self.paths is not None:
+                state_dir = self.paths.state_dir
+            evaluator = PolicyEvaluator(load_server_policy(state_dir))
+        except ValueError as error:
+            self._emit_policy_decisions(
+                [
+                    PolicyDecision(
+                        outcome=BLOCK,
+                        rule=RULE_SERVER_POLICY,
+                        reason=str(error),
+                        command_id=command.command_id,
+                    )
+                ]
+            )
+            self.store.resolve_command(
+                command.command_id,
+                CommandStatus.FAILED,
+                {
+                    "code": "E_POLICY_INVALID",
+                    "message": str(error),
+                },
+            )
+            return
         existing_envelope: dict[str, Any] | None = None
         try:
             existing_envelope = self.store.command_envelope(command.command_id)
@@ -497,12 +542,37 @@ class SessionWorker:
             extension = self.store.consume_session_extensions(self.session_id)
             limits = apply_extension(limits, extension)
             try:
+                limits, server_decisions = evaluator.apply_server_limits(
+                    limits,
+                    command_id=command.command_id,
+                )
                 metered_budget = _optional_number(payload.get("metered_budget"))
+                goal_base = limits
                 limits = self._goal_limited_limits(
                     limits,
                     metered_budget=metered_budget,
                 )
+                goal_decisions = limit_decisions(
+                    LEVEL_GOAL,
+                    goal_base,
+                    limits,
+                    command_id=command.command_id,
+                )
+                command_base = limits
                 limits = tighten_limits(limits, payload.get("safety_limits"))
+                command_decisions = limit_decisions(
+                    LEVEL_COMMAND,
+                    command_base,
+                    limits,
+                    command_id=command.command_id,
+                )
+                self._emit_policy_decisions(
+                    [
+                        *server_decisions,
+                        *goal_decisions,
+                        *command_decisions,
+                    ]
+                )
             except ValueError as error:
                 self.store.resolve_command(
                     command.command_id,
@@ -585,7 +655,33 @@ class SessionWorker:
                 payload,
                 text,
                 guard,
+                evaluator,
             )
+        except PolicyDeferredError as error:
+            self.store.append_event(
+                self.session_id,
+                "policy.paused",
+                status="paused",
+                metadata={
+                    "command_id": command.command_id,
+                    "rule": error.rule,
+                    "reason": error.reason,
+                    "provider": error.provider,
+                },
+            )
+            self.store.update_session(
+                self.session_id,
+                lifecycle=Lifecycle.PAUSED,
+                attention=Attention.NEEDS_INPUT,
+            )
+            self.store.update_command_envelope(
+                command.command_id,
+                state="paused",
+                consumption=guard.consumption.as_dict(),
+                guard_reason="policy-deferred:" + error.rule,
+            )
+            self.store.requeue_command(command.command_id)
+            return
         except ReconciliationRequiredError as error:
             self.store.update_session(
                 self.session_id,
@@ -650,6 +746,7 @@ class SessionWorker:
         payload: dict[str, Any],
         text: str,
         guard: TurnGuard,
+        evaluator: PolicyEvaluator | None = None,
     ) -> dict[str, Any]:
         excluded: set[str] = set()
         first_error: HarnessError | None = None
@@ -664,6 +761,7 @@ class SessionWorker:
                     frozenset(excluded),
                     guard,
                     recovery_stage,
+                    evaluator,
                     enforce_concurrency=True,
                 )
             except SafetyGuardError as error:
@@ -745,6 +843,7 @@ class SessionWorker:
         excluded: frozenset[str],
         guard: TurnGuard,
         recovery_stage: int,
+        evaluator: PolicyEvaluator | None = None,
         *,
         enforce_concurrency: bool,
     ) -> dict[str, Any]:
@@ -795,9 +894,20 @@ class SessionWorker:
             routing_provider = str(fault_probe.get("provider", ""))
         elif recovery_stage == 0 and service_fault_probe:
             routing_provider = str(service_fault_probe.get("provider", ""))
+        workload_value = str(payload.get("workload", "implementation"))
+        implementing: frozenset[str] = frozenset()
+        if (
+            evaluator is not None
+            and evaluator.review_provider_must_differ
+            and is_review_workload(workload_value)
+        ):
+            implementing = implementation_providers(
+                self.store.attempts(self.session_id),
+                self.store.routing_decisions(self.session_id),
+            )
         decision = await self.scheduler.choose(
             session,
-            workload=str(payload.get("workload", "implementation")),
+            workload=workload_value,
             required_capabilities=frozenset(
                 str(item) for item in payload.get("required_capabilities", [])
             ),
@@ -815,6 +925,14 @@ class SessionWorker:
             permitted_providers=permitted_providers,
             permitted_efforts=permitted_efforts,
             max_concurrency=max_concurrency,
+            policy=evaluator,
+            implementation_providers=implementing,
+        )
+        await self._enforce_dispatch_approval(
+            decision,
+            evaluator,
+            command_id,
+            guard.limits.profile,
         )
         adapter = self.adapters[decision.provider]
         native_session_id = self._native_session(decision.provider)
@@ -1736,6 +1854,164 @@ class SessionWorker:
             blob_digest=digest,
             turn_id=turn_id,
         )
+
+    def _emit_policy_decisions(
+        self,
+        decisions: list[PolicyDecision],
+        *,
+        turn_id: str = "",
+    ) -> None:
+        for decision in decisions:
+            self.store.append_event(
+                self.session_id,
+                "policy.decision",
+                status=decision.outcome,
+                metadata=decision.as_dict(),
+                turn_id=turn_id,
+            )
+
+    async def _enforce_dispatch_approval(
+        self,
+        decision: RoutingDecision,
+        evaluator: PolicyEvaluator | None,
+        command_id: str,
+        profile: str,
+    ) -> None:
+        if evaluator is None:
+            return
+        if not evaluator.require_approval:
+            return
+        capabilities = self.adapters[decision.provider].status().capabilities
+        if "approval" not in capabilities:
+            reason = (
+                "provider "
+                + decision.provider
+                + " cannot prompt for the policy-required dispatch approval"
+            )
+            self._emit_policy_decisions(
+                [
+                    PolicyDecision(
+                        outcome=BLOCK,
+                        rule=RULE_APPROVAL_REQUIRED,
+                        reason=reason,
+                        provider=decision.provider,
+                        command_id=command_id,
+                    )
+                ]
+            )
+            raise PolicyBlockedError(
+                RULE_APPROVAL_REQUIRED,
+                reason,
+                provider=decision.provider,
+            )
+        if profile != "interactive":
+            reason = (
+                "the policy-required dispatch approval needs an interactive "
+                "operator; deferring instead of blocking on a human"
+            )
+            self._emit_policy_decisions(
+                [
+                    PolicyDecision(
+                        outcome=DEFER,
+                        rule=RULE_APPROVAL_REQUIRED,
+                        reason=reason,
+                        provider=decision.provider,
+                        command_id=command_id,
+                    )
+                ]
+            )
+            raise PolicyDeferredError(
+                RULE_APPROVAL_REQUIRED,
+                reason,
+                provider=decision.provider,
+            )
+        approved = await self._request_policy_approval(decision, command_id)
+        if approved:
+            self._emit_policy_decisions(
+                [
+                    PolicyDecision(
+                        outcome=ALLOW,
+                        rule=RULE_APPROVAL_REQUIRED,
+                        reason="the operator approved the dispatch",
+                        provider=decision.provider,
+                        command_id=command_id,
+                    )
+                ]
+            )
+            return
+        reason = "the operator declined the policy-required dispatch approval"
+        self._emit_policy_decisions(
+            [
+                PolicyDecision(
+                    outcome=BLOCK,
+                    rule=RULE_APPROVAL_REQUIRED,
+                    reason=reason,
+                    provider=decision.provider,
+                    command_id=command_id,
+                )
+            ]
+        )
+        raise PolicyBlockedError(
+            RULE_APPROVAL_REQUIRED,
+            reason,
+            provider=decision.provider,
+        )
+
+    async def _request_policy_approval(
+        self,
+        decision: RoutingDecision,
+        command_id: str,
+    ) -> bool:
+        if self._policy_approval_handler is not None:
+            return bool(await self._policy_approval_handler(decision))
+        approval_id = self.store.create_approval(
+            self.session_id,
+            "",
+            new_uuid(),
+            "policy/dispatch",
+            "Policy requires approval to dispatch "
+            + decision.provider
+            + "/"
+            + decision.model
+            + " at "
+            + decision.effort
+            + " effort",
+            [
+                {"id": "accept", "label": "Dispatch"},
+                {"id": "decline", "label": "Hold"},
+            ],
+        )
+        self.store.update_session(
+            self.session_id,
+            attention=Attention.NEEDS_INPUT,
+        )
+        self.store.append_event(
+            self.session_id,
+            "approval.requested",
+            status="pending",
+            metadata={
+                "approval_id": approval_id,
+                "method": "policy/dispatch",
+                "command_id": command_id,
+            },
+        )
+        for unused in range(APPROVAL_POLL_LIMIT):
+            del unused
+            resolved = self.store.approval_decision(approval_id)
+            if resolved is not None:
+                self.store.update_session(
+                    self.session_id,
+                    attention=Attention.WORKING,
+                )
+                selected = str(
+                    resolved.get(
+                        "decision",
+                        resolved.get("choice", resolved.get("choice_id", "")),
+                    )
+                ).casefold()
+                return selected in {"accept", "allow", "approve", "approved", "yes"}
+            await asyncio.sleep(1.0)
+        return False
 
     async def _approval(
         self,

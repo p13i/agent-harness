@@ -2183,6 +2183,25 @@ class StateStore:
             raise NotFoundError("command")
         return _command(row)
 
+    def requeue_command(self, command_id: str) -> None:
+        """Park a claimed command back to queued for a policy deferral."""
+
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE commands SET status = ?, updated_at = ?
+                WHERE command_id = ? AND status = ?
+                """,
+                (
+                    CommandStatus.QUEUED,
+                    utc_now(),
+                    command_id,
+                    CommandStatus.DISPATCHING,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("command is not dispatching")
+
     def command_failed_before_provider_boundary(self, command_id: str) -> bool:
         with self._lock:
             command = self._connection.execute(
