@@ -58,6 +58,13 @@ from agent_harness.reconciliation import (
     ReconciliationManager,
     validate_reconciliation_audit,
 )
+from agent_harness.handoff import (
+    HANDOFF_SCHEMA,
+    ORIGIN_FORK_SEED,
+    handoff_envelope,
+    handoff_token_budget,
+    model_context_window,
+)
 from agent_harness.transcript import (
     RenderPolicy,
     project_transcript,
@@ -2288,6 +2295,9 @@ class HarnessService:
         session_id: str,
         payload: dict[str, Any],
     ) -> Session:
+        target_provider = str(payload.get("target_provider", "")).strip()
+        if target_provider and target_provider not in self.adapters:
+            raise ValueError("fork target provider is unsupported")
         source = self.store.get_session(session_id)
         checkpoint = self.checkpoint(session_id)
         goal = self.store.goal_for_session(session_id)
@@ -2328,17 +2338,74 @@ class HarnessService:
                 checkpoints[-1],
                 self.blobs,
             )
+        fork_metadata: dict[str, Any] = {
+            "source_session_id": session_id,
+            "source_sequence": self.store.last_sequence(session_id),
+            "source_checkpoint_id": str(checkpoint.get("checkpoint_id", "")),
+        }
+        if target_provider:
+            fork_metadata["target_provider"] = target_provider
         self.store.append_event(
             forked.session_id,
             "session.forked",
             status="complete",
+            metadata=fork_metadata,
+        )
+        if target_provider:
+            self._seed_fork_handoff(source, forked, target_provider)
+        return self.store.get_session(forked.session_id)
+
+    def _seed_fork_handoff(
+        self,
+        source: Session,
+        forked: Session,
+        target_provider: str,
+    ) -> None:
+        """Seed a provider-targeted fork with a handoff envelope.
+
+        The forked session's first dispatch delivers the seeded
+        envelope ahead of the compiled context, in addition to the
+        inherited lineage blob.
+        """
+        transcript = project_transcript(
+            self.store,
+            source.session_id,
+            blobs=self.blobs,
+        )
+        token_budget = handoff_token_budget(
+            model_context_window(
+                self.scheduler.cached_models(target_provider),
+                "",
+            ),
+            0,
+            0,
+        )
+        block = handoff_envelope(
+            session_id=forked.session_id,
+            source_provider=source.active_provider,
+            target_provider=target_provider,
+            target_model="",
+            transcript_digest=transcript.digest,
+            rendered=render(transcript, RenderPolicy(token_budget=token_budget)),
+        )
+        self.store.append_event(
+            forked.session_id,
+            "session.handoff",
+            status="complete",
             metadata={
-                "source_session_id": session_id,
-                "source_sequence": self.store.last_sequence(session_id),
-                "source_checkpoint_id": str(checkpoint.get("checkpoint_id", "")),
+                "schema": HANDOFF_SCHEMA,
+                "origin": ORIGIN_FORK_SEED,
+                "source_session_id": source.session_id,
+                "source_provider": source.active_provider,
+                "target_provider": target_provider,
+                "transcript_digest": transcript.digest,
+                "handoff_digest": hashlib.sha256(
+                    block.encode("utf-8")
+                ).hexdigest(),
+                "blob_digest": self.blobs.put_text(block),
+                "token_budget": token_budget,
             },
         )
-        return self.store.get_session(forked.session_id)
 
     async def preview_route(
         self,

@@ -172,6 +172,10 @@ class Scheduler:
             return await self.refresh_usage()
         return self._usage_cache
 
+    def cached_models(self, provider: str) -> tuple[ProviderModel, ...]:
+        """Last models listing for one provider, empty when never probed."""
+        return self._model_cache.get(provider, ())
+
     async def models(
         self,
         workspace: Path,

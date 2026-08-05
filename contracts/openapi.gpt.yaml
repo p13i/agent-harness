@@ -510,7 +510,11 @@ paths:
     post:
       operationId: forkSession
       requestBody:
-        $ref: "#/components/requestBodies/JsonObject"
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkRequest"
       responses:
         "201":
           $ref: "#/components/responses/JsonResponse"
@@ -824,6 +828,26 @@ components:
           minLength: 1
           maxLength: 65536
           description: Required only for steer.
+    ForkRequest:
+      type: object
+      additionalProperties: true
+      description: >-
+        Session fork payload. When target_provider names a
+        registered provider, the forked session is seeded
+        with a session-handoff/v1 envelope rendered from the
+        source transcript, in addition to the inherited
+        lineage blob.
+      properties:
+        name:
+          type: string
+        external_ref:
+          type: object
+        target_provider:
+          type: string
+          enum:
+            - claude
+            - codex
+            - kimi
     PresentationAttempt:
       type: object
       additionalProperties: false
