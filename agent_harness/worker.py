@@ -926,6 +926,7 @@ class SessionWorker:
             )
         resolved_native_session_id = native_session_id
         context_delivery_accepted = False
+        activity_event_count = 0
         bash_commands: dict[str, str] = {}
         failed_command_results: list[dict[str, Any]] = []
         service_fault_active = (
@@ -939,7 +940,17 @@ class SessionWorker:
         async def event_handler(event: ProviderEvent) -> None:
             nonlocal resolved_native_session_id
             nonlocal context_delivery_accepted
+            nonlocal activity_event_count
             nonlocal service_fault_ready
+            if (
+                event.event_type.startswith("tool.")
+                or event.event_type.startswith("file.change.")
+                or (
+                    event.event_type.startswith("agent.message")
+                    and event.text.strip()
+                )
+            ):
+                activity_event_count += 1
             if (
                 not context_delivery_accepted
                 and event.event_type == "provider.prompt.accepted"
@@ -1564,6 +1575,24 @@ class SessionWorker:
                 "E_PROVIDER_AMBIGUOUS_MUTATION",
             )
             raise ReconciliationRequiredError(reconciliation_id)
+        if (
+            result.status == "complete"
+            and activity_event_count == 0
+            and completed_material_digest == material_digest
+        ):
+            self.store.update_attempt(
+                attempt_id,
+                status="failed",
+                native_session_id=result.native_session_id,
+            )
+            self.store.finish_turn(turn_id, "no-progress")
+            self.store.complete_dispatch(attempt_id, "failed")
+            raise HarnessError(
+                "E_PROVIDER_NO_PROGRESS",
+                decision.provider
+                + " completed the turn with no output and no workspace change",
+                status=502,
+            )
         if result.status != "complete":
             terminal_status = "failed"
             if result.status == "cancelled":
@@ -2213,8 +2242,12 @@ class SessionWorker:
         return goal_consumption(
             goal,
             [],
-            self.store.turn_count(self.session_id),
+            self.store.countable_turn_count(self.session_id),
             safety_consumptions=consumptions,
+            active_seconds=self.store.active_turn_seconds(
+                self.session_id,
+                datetime.datetime.now(datetime.UTC),
+            ),
         )
 
     def _goal_limited_limits(

@@ -4255,3 +4255,63 @@ def test_resolved_reconciliation_projection_declines_unprovable_work(
     store.close()
     stopped.store.close()
     missing_attempt.store.close()
+
+
+def test_active_turn_seconds_and_countable_turn_count(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="codex",
+        native_session_id="",
+        model="account-default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    store.create_attempt(attempt)
+    completed_turn = store.start_turn(created.session_id, attempt.attempt_id)
+    store.finish_turn(completed_turn, "complete")
+    running_turn = store.start_turn(created.session_id, attempt.attempt_id)
+    dead_turn = store.start_turn(created.session_id, attempt.attempt_id)
+    store.finish_turn(dead_turn, "no-progress")
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE turns SET started_at = ?, completed_at = ?
+            WHERE turn_id = ?
+            """,
+            (
+                "2026-08-05T10:00:00+00:00",
+                "2026-08-05T10:00:30+00:00",
+                completed_turn,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE turns SET started_at = ?, completed_at = ''
+            WHERE turn_id = ?
+            """,
+            ("2026-08-05T10:05:00+00:00", running_turn),
+        )
+        connection.execute(
+            """
+            UPDATE turns SET started_at = ?, completed_at = ?
+            WHERE turn_id = ?
+            """,
+            (
+                "2026-08-05T10:10:00+00:00",
+                "2026-08-05T10:12:00+00:00",
+                dead_turn,
+            ),
+        )
+
+    now = datetime.datetime(2026, 8, 5, 10, 6, 0, tzinfo=datetime.UTC)
+    assert store.turn_count(created.session_id) == 3
+    assert store.countable_turn_count(created.session_id) == 2
+    assert store.active_turn_seconds(created.session_id, now) == 90.0
+    store.close()

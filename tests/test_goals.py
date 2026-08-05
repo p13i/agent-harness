@@ -1,3 +1,4 @@
+import datetime
 from dataclasses import replace
 
 import pytest
@@ -415,3 +416,40 @@ def test_goal_predicates_and_numeric_helpers_reject_false_matches() -> None:
         == 3
     )
     assert _number(True) is None
+
+
+def test_goal_seconds_bill_active_turn_time() -> None:
+    goal = create_goal(
+        new_uuid(),
+        "bounded work",
+        budgets={"seconds": 60},
+    )
+    created = _timestamp(goal.created_at)
+    observed = created + datetime.timedelta(seconds=400)
+    consumption = goal_consumption(
+        goal,
+        [],
+        1,
+        active_seconds=30.0,
+        observed_at=observed.isoformat(),
+    )
+
+    assert consumption.elapsed_seconds == 30.0
+    assert consumption.wall_seconds == 400.0
+    assert exhausted_budget(goal, consumption) == ""
+    saturated = goal_consumption(
+        goal,
+        [],
+        1,
+        active_seconds=60.0,
+        observed_at=observed.isoformat(),
+    )
+    assert exhausted_budget(goal, saturated) == "seconds"
+    wall_clock = goal_consumption(
+        goal,
+        [],
+        1,
+        observed_at=observed.isoformat(),
+    )
+    assert wall_clock.elapsed_seconds == 400.0
+    assert wall_clock.wall_seconds == 400.0

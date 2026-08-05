@@ -36,6 +36,7 @@ class GoalConsumption:
     child_agents: float
     dollars: float
     elapsed_seconds: float
+    wall_seconds: float = 0.0
 
 
 def goal_contract(goal: Goal) -> dict[str, Any]:
@@ -370,6 +371,7 @@ def goal_consumption(
     turn_count: int,
     *,
     safety_consumptions: list[dict[str, Any]] | None = None,
+    active_seconds: float | None = None,
     observed_at: str | None = None,
 ) -> GoalConsumption:
     tokens = 0.0
@@ -406,7 +408,10 @@ def goal_consumption(
     if observed_at:
         now = _timestamp(observed_at)
     created = _timestamp(goal.created_at)
-    elapsed = max(0.0, (now - created).total_seconds())
+    wall = max(0.0, (now - created).total_seconds())
+    elapsed = wall
+    if active_seconds is not None:
+        elapsed = max(0.0, active_seconds)
     return GoalConsumption(
         turns=turn_count,
         tokens=tokens,
@@ -417,6 +422,7 @@ def goal_consumption(
         child_agents=child_agents,
         dollars=dollars,
         elapsed_seconds=elapsed,
+        wall_seconds=wall,
     )
 
 
