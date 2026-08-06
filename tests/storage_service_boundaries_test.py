@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 import sys
@@ -922,6 +923,10 @@ def test_session_creation_recovers_a_durable_intent_after_losing_a_race(
     service = _service(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    subprocess.run(
+        ["git", "-C", str(workspace), "init", "-q"],
+        check=True,
+    )
     removed: list[tuple[Path, Path, str]] = []
     attempts = 0
 

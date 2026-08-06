@@ -442,6 +442,39 @@ def _validate_service_fault_probe(
         raise ValueError("proof service fault probe authorization is not precommitted")
 
 
+def _validate_workspace_reachable(workspace: Path) -> None:
+    if workspace.is_relative_to(Path("/tmp")) or workspace.is_relative_to(
+        Path("/private/tmp")
+    ):
+        raise HarnessError(
+            "E_WORKSPACE_UNREACHABLE",
+            "workspace "
+            + str(workspace)
+            + " is under /tmp, but the daemon runs with systemd"
+            " PrivateTmp=true, so its /tmp is a private namespace and the"
+            " workspace can never be reached daemon-side",
+            status=400,
+        )
+    if not workspace.is_dir():
+        raise HarnessError(
+            "E_WORKSPACE_UNREACHABLE",
+            "workspace " + str(workspace) + " does not exist on this host",
+            status=400,
+        )
+    completed = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0 or completed.stdout.strip() != "true":
+        raise HarnessError(
+            "E_WORKSPACE_UNREACHABLE",
+            "workspace " + str(workspace) + " is not inside a git repository",
+            status=400,
+        )
+
+
 class HarnessService:
     def __init__(
         self,
@@ -725,6 +758,7 @@ class HarnessService:
         if goal is not None:
             goal = replace(goal, session_id=session_id)
         inherited_ui_state = self._workspace_ui_state(str(workspace))
+        _validate_workspace_reachable(workspace)
         worktree = create_worktree(
             workspace,
             self.paths.worktrees,

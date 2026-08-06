@@ -6,6 +6,7 @@ import pytest
 from test_support import session
 
 import agent_harness.workspace as workspace_module
+import agent_harness.workspace_state as workspace_state_module
 from agent_harness.blobs import BlobStore
 from agent_harness.errors import HarnessError
 from agent_harness.workspace import (
@@ -107,6 +108,35 @@ def test_workspace_rejects_collisions_mismatches_and_git_failures(
         _git_bytes(outside, "diff")
     with pytest.raises(HarnessError):
         _git_input(source, b"not a patch", "apply", "-")
+
+
+def test_git_errors_surface_redacted_stderr(tmp_path: Path) -> None:
+    outside = tmp_path / "not-a-repository"
+    outside.mkdir()
+    with pytest.raises(HarnessError) as raised:
+        _git(outside, "rev-parse", "--show-toplevel")
+    assert raised.value.detail.code == "E_GIT"
+    assert "fatal:" in str(raised.value)
+
+    with pytest.raises(HarnessError) as raised_bytes:
+        _git_bytes(outside, "rev-parse", "HEAD")
+    assert "fatal:" in str(raised_bytes.value)
+
+    with pytest.raises(HarnessError) as raised_state:
+        workspace_state_module._git(outside, "rev-parse", "HEAD")
+    assert "fatal:" in str(raised_state.value)
+
+
+def test_git_stderr_tail_is_bounded_and_redacted() -> None:
+    completed = subprocess.CompletedProcess(
+        args=["git"],
+        returncode=128,
+        stderr=b"fatal: padding " + b"x" * 500 + b" token=ghp_" + b"a" * 30,
+    )
+    tail = workspace_module.git_stderr_tail(completed)
+    assert len(tail) <= 400
+    assert "ghp_" not in tail
+    assert "[REDACTED]" in tail
 
 
 def test_create_worktree_removes_its_worktree_when_the_ref_fails(
