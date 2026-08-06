@@ -189,6 +189,34 @@ class Scheduler:
             return await self.refresh_usage()
         return self._usage_cache
 
+    async def _admission_usage(
+        self,
+        *,
+        binding_ceiling: float | None,
+        execution_profile: str,
+        excluded: frozenset[str],
+    ) -> dict[str, UsageSnapshot]:
+        # Dispatch admission probe-on-miss: when the cache serves a
+        # sample that cannot admit a ceiling-gated non-interactive
+        # dispatch (a provider binding is missing, as after a cold-start
+        # probe failure), refresh once and let the caller re-evaluate
+        # instead of rejecting on the missing sample. Bounded to one
+        # refresh per admission check: when the cache lookup already
+        # probed, its result stands even when the probe errored.
+        usage_at = self._usage_at
+        usage = await self.usage()
+        if self._usage_at != usage_at:
+            return usage
+        if binding_ceiling is None or execution_profile == INTERACTIVE:
+            return usage
+        for provider in self.adapters:
+            if provider in excluded:
+                continue
+            snapshot = usage.get(provider)
+            if snapshot is None or snapshot.binding_percent is None:
+                return await self.refresh_usage()
+        return usage
+
     def cached_models(self, provider: str) -> tuple[ProviderModel, ...]:
         """Last models listing for one provider, empty when never probed."""
         return self._model_cache.get(provider, ())
@@ -238,7 +266,11 @@ class Scheduler:
             raise ValueError("metered budget must be finite")
         if binding_ceiling is not None and not math.isfinite(binding_ceiling):
             raise ValueError("binding ceiling must be finite")
-        usage = await self.usage()
+        usage = await self._admission_usage(
+            binding_ceiling=binding_ceiling,
+            execution_profile=execution_profile,
+            excluded=excluded,
+        )
         durable_usage = self.store.latest_usage()
         models = await self.models(Path(session.worktree))
         counts = self.store.active_provider_counts()
