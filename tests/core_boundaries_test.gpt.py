@@ -296,18 +296,23 @@ def test_worker_supervision_bounds_spawn_failures_and_recovers_after_window(
         "monotonic",
         lambda: clock["value"],
     )
+    monkeypatch.setattr(
+        service_module,
+        "_workspace_reachable",
+        lambda unused_workspace: True,
+    )
     manager = WorkerManager(harness_paths)
 
     for offset in range(4):
         clock["value"] = float(offset)
-        report = manager.supervise(["session"])
+        report = manager.supervise([("session", str(tmp_path / "workspace"))])
 
     assert len(attempts) == 3
     assert report["status"] == "failed"
     assert report["unrecovered"][0]["reason"] == "worker-restart-limit"
 
     clock["value"] = 64.0
-    recovered = manager.supervise(["session"])
+    recovered = manager.supervise([("session", str(tmp_path / "workspace"))])
     assert len(attempts) == 4
     assert recovered["status"] == "ok"
     assert recovered["running_sessions"] == ["session"]
@@ -371,6 +376,11 @@ def test_recovery_blocked_lease_suppresses_supervision_until_release(
         service_module.time,
         "monotonic",
         lambda: clock["value"],
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_workspace_reachable",
+        lambda unused_workspace: True,
     )
     manager = WorkerManager(service.paths)
     manager._processes[session.session_id] = Process(1)  # type: ignore[assignment]
@@ -452,6 +462,167 @@ def test_recovery_blocked_lease_suppresses_supervision_until_release(
             len([event for event in events if event.event_type == "worker.supervised"])
             == 1
         )
+    finally:
+        service.close()
+
+
+def test_workspace_reachable_probe_requires_a_git_repository(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    assert service_module._workspace_reachable(str(missing)) is False
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert service_module._workspace_reachable(str(plain)) is False
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(
+        ["git", "-C", str(repository), "init", "-q"],
+        check=True,
+    )
+    assert service_module._workspace_reachable(str(repository)) is True
+
+
+def test_worker_supervision_probes_workspace_before_spawning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness_paths = paths(tmp_path / "state")
+    prepare_paths(harness_paths)
+    starts: list[list[str]] = []
+
+    class Process:
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, unused_value: int) -> None:
+            del unused_value
+
+    def popen(command: list[str], **unused_values: object) -> Process:
+        del unused_values
+        starts.append(command)
+        return Process()
+
+    monkeypatch.setattr(
+        service_module,
+        "launcher_command",
+        lambda: ["agent-harness"],
+    )
+    monkeypatch.setattr(service_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        service_module,
+        "_workspace_reachable",
+        lambda workspace: workspace == "reachable",
+    )
+    manager = WorkerManager(harness_paths)
+
+    report = manager.supervise(
+        [("reachable", "reachable"), ("unreachable", "unreachable")]
+    )
+
+    assert len(starts) == 1
+    assert report["running_sessions"] == ["reachable"]
+    assert report["restarted_sessions"] == []
+    assert report["unrecovered"] == [
+        {
+            "session_id": "unreachable",
+            "reason": "workspace-unreachable",
+            "workspace": "unreachable",
+            "consecutive_unreachable": 1,
+        }
+    ]
+    assert report["status"] == "failed"
+
+
+def test_unreachable_workspace_parks_and_resumes_with_attention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    session = _create_direct(service, tmp_path)
+    reachable = {"value": False}
+    starts: list[list[str]] = []
+
+    class Process:
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, unused_value: int) -> None:
+            del unused_value
+
+    def popen(command: list[str], **unused_values: object) -> Process:
+        del unused_values
+        starts.append(command)
+        return Process()
+
+    monkeypatch.setattr(
+        service_module,
+        "launcher_command",
+        lambda: ["agent-harness"],
+    )
+    monkeypatch.setattr(service_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        service_module,
+        "_workspace_reachable",
+        lambda unused_workspace: reachable["value"],
+    )
+    manager = WorkerManager(service.paths)
+    service.workers = manager
+    try:
+        report = {}
+        for unused_tick in range(service_module.UNREACHABLE_PARK_TICKS):
+            del unused_tick
+            report = service.supervise_workers()
+        assert starts == []
+        assert report["unrecovered"] == [
+            {
+                "session_id": session.session_id,
+                "reason": "workspace-unreachable",
+                "workspace": session.workspace,
+                "consecutive_unreachable": service_module.UNREACHABLE_PARK_TICKS,
+            }
+        ]
+        parked = service.store.get_session(session.session_id)
+        assert parked.attention == Attention.NEEDS_INPUT
+        unreachable_events = [
+            event
+            for event in service.store.all_events(session.session_id)
+            if event.event_type == "session.unreachable"
+        ]
+        assert len(unreachable_events) == 1
+        assert unreachable_events[0].metadata["workspace"] == (session.workspace)
+        assert unreachable_events[0].metadata["host"] == service_module.host_id()
+
+        for unused_tick in range(3):
+            del unused_tick
+            settled = service.supervise_workers()
+        assert settled["status"] == "ok"
+        assert settled["expected_sessions"] == []
+        assert starts == []
+        unreachable_events = [
+            event
+            for event in service.store.all_events(session.session_id)
+            if event.event_type == "session.unreachable"
+        ]
+        assert len(unreachable_events) == 1
+
+        service.store.update_session(
+            session.session_id,
+            attention=Attention.IDLE,
+        )
+        resumed = service.supervise_workers()
+        assert resumed["expected_sessions"] == [session.session_id]
+        assert resumed["unrecovered"][0]["reason"] == ("workspace-unreachable")
+        assert resumed["unrecovered"][0]["consecutive_unreachable"] == 1
+        assert starts == []
+
+        reachable["value"] = True
+        recovered = service.supervise_workers()
+        assert recovered["status"] == "ok"
+        assert recovered["running_sessions"] == [session.session_id]
+        assert len(starts) == 1
     finally:
         service.close()
 

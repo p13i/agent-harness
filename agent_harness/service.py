@@ -93,6 +93,10 @@ from agent_harness.workspace import (
 
 CONTROL_COMMAND_TYPES = frozenset({"interrupt", "pause", "resume", "steer", "stop"})
 MAX_STEER_TEXT_LENGTH = 65_536
+# Consecutive supervision ticks reporting an unreachable workspace
+# before the service parks the session (attention=needs-input plus one
+# session.unreachable event) and stops scheduling a worker for it.
+UNREACHABLE_PARK_TICKS = 3
 
 
 class WorkerManager:
@@ -103,6 +107,7 @@ class WorkerManager:
         self.paths = paths
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._restart_history: dict[str, list[float]] = {}
+        self._unreachable_ticks: dict[str, int] = {}
         self._last_supervision: dict[str, Any] = {
             "status": "initializing",
             "expected_sessions": [],
@@ -134,20 +139,37 @@ class WorkerManager:
             )
         self._processes[session_id] = process
 
-    def supervise(self, session_ids: list[str]) -> dict[str, Any]:
+    def supervise(self, sessions: list[tuple[str, str]]) -> dict[str, Any]:
         now = time.monotonic()
-        expected = sorted(set(session_ids))
+        expected_pairs = sorted(set(sessions))
+        expected = [pair[0] for pair in expected_pairs]
+        for stale in set(self._unreachable_ticks) - set(expected):
+            self._unreachable_ticks.pop(stale, None)
         running: list[str] = []
         restarted: list[str] = []
         unrecovered: list[dict[str, Any]] = []
-        for session_id in expected:
+        for session_id, workspace in expected_pairs:
             process = self._processes.get(session_id)
             if process is not None and process.poll() is None:
                 running.append(session_id)
+                self._unreachable_ticks.pop(session_id, None)
                 continue
             restarting = process is not None
             if process is not None:
                 self._processes.pop(session_id, None)
+            if not _workspace_reachable(workspace):
+                ticks = self._unreachable_ticks.get(session_id, 0) + 1
+                self._unreachable_ticks[session_id] = ticks
+                unrecovered.append(
+                    {
+                        "session_id": session_id,
+                        "reason": "workspace-unreachable",
+                        "workspace": workspace,
+                        "consecutive_unreachable": ticks,
+                    }
+                )
+                continue
+            self._unreachable_ticks.pop(session_id, None)
             history = self._restart_history.get(session_id, [])
             history = [
                 observed_at
@@ -475,6 +497,22 @@ def _validate_workspace_reachable(workspace: Path) -> None:
         )
 
 
+def _workspace_reachable(workspace: str) -> bool:
+    """Cheap local probe: the path exists and is inside a git repository."""
+    path = Path(workspace)
+    if not path.is_dir():
+        return False
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
 class HarnessService:
     def __init__(
         self,
@@ -519,7 +557,9 @@ class HarnessService:
         blocked_recoveries = self._blocked_worker_recoveries()
         supervise = getattr(self.workers, "supervise", None)
         if callable(supervise):
-            self._worker_supervision = supervise(session_ids)
+            self._worker_supervision = supervise(
+                self._worker_session_pairs(session_ids)
+            )
             self._record_blocked_worker_recoveries(blocked_recoveries)
             return
         for session_id in session_ids:
@@ -555,7 +595,52 @@ class HarnessService:
                 status="restarted",
                 metadata={"session_id": item},
             )
+        self._park_unreachable_workers()
         return dict(self._worker_supervision)
+
+    def _park_unreachable_workers(self) -> None:
+        unrecovered = self._worker_supervision.get("unrecovered", [])
+        if not isinstance(unrecovered, list):
+            return
+        for item in unrecovered:
+            if not isinstance(item, dict):
+                continue
+            if item.get("reason") != "workspace-unreachable":
+                continue
+            ticks = item.get("consecutive_unreachable", 0)
+            if not isinstance(ticks, int) or ticks < UNREACHABLE_PARK_TICKS:
+                continue
+            session_id = str(item.get("session_id", ""))
+            if not session_id:
+                continue
+            session = self.store.get_session(session_id)
+            if self._parked_unreachable(session):
+                continue
+            self.store.update_session(
+                session_id,
+                attention=Attention.NEEDS_INPUT,
+            )
+            self.store.append_event(
+                session_id,
+                "session.unreachable",
+                status="needs-input",
+                metadata={
+                    "workspace": str(item.get("workspace", "")),
+                    "host": host_id(),
+                    "consecutive_unreachable": ticks,
+                },
+            )
+
+    def _parked_unreachable(self, session: Session) -> bool:
+        if session.attention != Attention.NEEDS_INPUT:
+            return False
+        return self._has_unreachable_event(session.session_id)
+
+    def _has_unreachable_event(self, session_id: str) -> bool:
+        for event in self.store.all_events(session_id):
+            if event.event_type == "session.unreachable":
+                return True
+        return False
 
     def worker_supervision(self) -> dict[str, Any]:
         if self._worker_supervision["status"] == "initializing":
@@ -599,8 +684,20 @@ class HarnessService:
                 continue
             if session.session_id in blocked_sessions:
                 continue
+            if self._parked_unreachable(session):
+                continue
             session_ids.append(session.session_id)
         return sorted(session_ids)
+
+    def _worker_session_pairs(
+        self,
+        session_ids: list[str],
+    ) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for session_id in session_ids:
+            session = self.store.get_session(session_id)
+            pairs.append((session.session_id, session.workspace))
+        return pairs
 
     def _blocked_worker_recoveries(self) -> list[dict[str, Any]]:
         return [
