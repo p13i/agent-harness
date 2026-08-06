@@ -804,6 +804,215 @@ def test_scheduler_fails_closed_on_unusable_budgets_and_usage(
     asyncio.run(scenario())
 
 
+def test_unattended_dispatch_probes_once_on_a_missing_usage_sample(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    healthy = UsageSnapshot(
+        provider="codex",
+        binding_percent=12.0,
+        credits_engaged=False,
+        payload={},
+    )
+    probes = 0
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        nonlocal probes
+        probes += 1
+        return {"codex": healthy}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        # Post-restart cold cache: a startup probe already failed, so the
+        # cache serves a missing sample inside the 60-second reuse window.
+        scheduler._usage_cache = {
+            "codex": UsageSnapshot(
+                provider="codex",
+                binding_percent=None,
+                credits_engaged=False,
+                payload={},
+                error="probe timed out",
+            )
+        }
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        scheduler._model_cache = {
+            "codex": (
+                ProviderModel(
+                    "frontier",
+                    "Frontier",
+                    ("low",),
+                    100,
+                    default=True,
+                ),
+            )
+        }
+        current = session(tmp_path)
+        decision = await scheduler.choose(
+            current,
+            workload="implementation",
+            required_capabilities=frozenset(),
+            binding_ceiling=90,
+            execution_profile="unattended",
+        )
+        assert decision.provider == "codex"
+        assert decision.binding_percent == 12.0
+        assert probes == 1
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_unattended_dispatch_routes_on_an_empty_usage_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    healthy = UsageSnapshot(
+        provider="codex",
+        binding_percent=12.0,
+        credits_engaged=False,
+        payload={},
+    )
+    probes = 0
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        nonlocal probes
+        probes += 1
+        return {"codex": healthy}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        scheduler._model_cache = {
+            "codex": (
+                ProviderModel(
+                    "frontier",
+                    "Frontier",
+                    ("low",),
+                    100,
+                    default=True,
+                ),
+            )
+        }
+        current = session(tmp_path)
+        decision = await scheduler.choose(
+            current,
+            workload="implementation",
+            required_capabilities=frozenset(),
+            binding_ceiling=90,
+            execution_profile="unattended",
+        )
+        assert decision.provider == "codex"
+        # The initial probe already refreshed; admission must not probe twice.
+        assert probes == 1
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_unattended_dispatch_rejects_a_saturated_fleet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saturated = UsageSnapshot(
+        provider="codex",
+        binding_percent=95.0,
+        credits_engaged=False,
+        payload={},
+    )
+    probes = 0
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        nonlocal probes
+        probes += 1
+        return {"codex": saturated}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        scheduler._model_cache = {
+            "codex": (
+                ProviderModel(
+                    "frontier",
+                    "Frontier",
+                    ("low",),
+                    100,
+                    default=True,
+                ),
+            )
+        }
+        current = session(tmp_path)
+        with pytest.raises(ProviderUnavailableError) as captured:
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                binding_ceiling=90,
+                execution_profile="unattended",
+            )
+        assert captured.value.detail.code == "E_PROVIDER_UNAVAILABLE"
+        assert "automatic routing is unavailable" in str(captured.value)
+        assert probes == 1
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_unattended_dispatch_rejects_when_the_probe_keeps_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = UsageSnapshot(
+        provider="codex",
+        binding_percent=None,
+        credits_engaged=False,
+        payload={},
+        error="HTTP 503",
+    )
+    probes = 0
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        nonlocal probes
+        probes += 1
+        return {"codex": failed}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        scheduler._usage_cache = {"codex": failed}
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        scheduler._model_cache = {
+            "codex": (
+                ProviderModel(
+                    "frontier",
+                    "Frontier",
+                    ("low",),
+                    100,
+                    default=True,
+                ),
+            )
+        }
+        current = session(tmp_path)
+        with pytest.raises(ProviderUnavailableError) as captured:
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                binding_ceiling=90,
+                execution_profile="unattended",
+            )
+        assert captured.value.detail.code == "E_PROVIDER_UNAVAILABLE"
+        # One bounded refresh per admission check, never a tight loop.
+        assert probes == 1
+        store.close()
+
+    asyncio.run(scenario())
+
+
 def test_scheduler_reuses_active_status_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
