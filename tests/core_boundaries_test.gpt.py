@@ -6,6 +6,7 @@ import asyncio
 import copy
 import io
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -551,6 +552,95 @@ def test_service_creation_configuration_and_archive_boundaries(
             first.session_id,
             False,
         ).archived
+    finally:
+        service.close()
+
+
+def test_create_session_rejects_unreachable_workspaces(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        with pytest.raises(HarnessError) as missing:
+            service.create_session({"workspace": str(tmp_path / "missing")})
+        assert missing.value.detail.code == "E_WORKSPACE_UNREACHABLE"
+        assert "does not exist" in str(missing.value)
+
+        with pytest.raises(HarnessError) as temporary:
+            service.create_session(
+                {"workspace": "/tmp/agent-harness-unreachable-test"}
+            )
+        assert temporary.value.detail.code == "E_WORKSPACE_UNREACHABLE"
+        assert "PrivateTmp" in str(temporary.value)
+
+        not_a_repository = tmp_path / "not-a-repository"
+        not_a_repository.mkdir()
+        with pytest.raises(HarnessError) as nongit:
+            service.create_session({"workspace": str(not_a_repository)})
+        assert nongit.value.detail.code == "E_WORKSPACE_UNREACHABLE"
+        assert "not inside a git repository" in str(nongit.value)
+
+        created = _create_direct(service, tmp_path / "valid")
+        assert created.session_id
+    finally:
+        service.close()
+
+
+def test_worker_startup_logs_ordered_stages(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service = _service(tmp_path)
+    try:
+        created = _create_direct(service, tmp_path / "startup")
+        workspace = tmp_path / "startup" / "workspace"
+        (workspace / "file.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(workspace), "add", "file.txt"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+            check=True,
+        )
+        service.store.update_session(
+            created.session_id,
+            lifecycle=Lifecycle.STOPPED,
+        )
+        worker = SessionWorker(
+            service.store,
+            service.blobs,
+            Scheduler(service.store, {}),
+            {},
+            created.session_id,
+        )
+
+        asyncio.run(worker.run())
+
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0].startswith("worker.started ")
+        assert "pid=" + str(os.getpid()) in lines[0]
+        assert "session_id=" + created.session_id in lines[0]
+        assert "incarnation=" + worker.incarnation in lines[0]
+        stages = [
+            line for line in lines if line.startswith("worker.stage ")
+        ]
+        assert stages == [
+            "worker.stage session-load",
+            "worker.stage recovery",
+            "worker.stage claim-loop",
+        ]
     finally:
         service.close()
 

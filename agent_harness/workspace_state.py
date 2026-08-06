@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 from agent_harness.errors import HarnessError
-from agent_harness.workspace import workspace_summary
+from agent_harness.workspace import git_stderr_tail, workspace_summary
 
 
 def inspect_workspace(workspace: Path) -> tuple[str, str]:
@@ -116,9 +116,13 @@ def _git(workspace: Path, *arguments: str) -> bytes:
         check=False,
     )
     if completed.returncode != 0:
+        detail = git_stderr_tail(completed)
+        message = "Git operation failed during workspace inspection"
+        if detail:
+            message = message + ": " + detail
         raise HarnessError(
             "E_GIT",
-            "Git operation failed during workspace inspection",
+            message,
             status=409,
         )
     return completed.stdout

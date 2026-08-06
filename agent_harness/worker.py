@@ -209,6 +209,10 @@ def _failed_command_evidence(
     return tuple(result)
 
 
+def _startup_stage(stage: str) -> None:
+    print("worker.stage " + stage, flush=True)
+
+
 class SessionWorker:
     def __init__(
         self,
@@ -233,8 +237,16 @@ class SessionWorker:
         self._active_command_id = ""
         self._active_turn_id = ""
         self._worker_heartbeat_at = 0.0
+        print(
+            "worker.started"
+            " pid=" + str(os.getpid())
+            + " session_id=" + self.session_id
+            + " incarnation=" + self.incarnation,
+            flush=True,
+        )
 
     async def run(self) -> None:
+        _startup_stage("session-load")
         prior_leases = [
             lease
             for lease in self.store.active_process_leases()
@@ -247,6 +259,7 @@ class SessionWorker:
         )
         self._worker_heartbeat_at = time.monotonic()
         try:
+            _startup_stage("recovery")
             for lease in prior_leases:
                 try:
                     termination = await terminate_recorded_process_group(
@@ -306,6 +319,7 @@ class SessionWorker:
                     status="requeued",
                     metadata=recovery.as_dict(),
                 )
+            _startup_stage("claim-loop")
             await self._loop()
         finally:
             self.store.remove_worker(self.session_id, self.incarnation)

@@ -14,6 +14,18 @@ from agent_harness.blobs import BlobStore
 from agent_harness.errors import HarnessError
 from agent_harness.ids import new_uuid, utc_now
 from agent_harness.models import Checkpoint, Session
+from agent_harness.providers.normalize import sanitize
+
+_GIT_STDERR_TAIL_LIMIT = 400
+
+
+def git_stderr_tail(completed: subprocess.CompletedProcess) -> str:
+    stderr = completed.stderr
+    if stderr is None:
+        return ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    return sanitize(stderr.strip())[-_GIT_STDERR_TAIL_LIMIT:]
 
 
 def git_root(workspace: Path) -> Path:
@@ -410,9 +422,13 @@ def _git(workspace: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         check=False,
     )
     if completed.returncode != 0:
+        detail = git_stderr_tail(completed)
+        message = "Git operation failed"
+        if detail:
+            message = message + ": " + detail
         raise HarnessError(
             "E_GIT",
-            "Git operation failed",
+            message,
             status=409,
         )
     return completed
@@ -425,7 +441,11 @@ def _git_bytes(workspace: Path, *arguments: str) -> bytes:
         check=False,
     )
     if completed.returncode != 0:
-        raise HarnessError("E_GIT", "Git operation failed", status=409)
+        detail = git_stderr_tail(completed)
+        message = "Git operation failed"
+        if detail:
+            message = message + ": " + detail
+        raise HarnessError("E_GIT", message, status=409)
     return completed.stdout
 
 
@@ -437,8 +457,12 @@ def _git_input(workspace: Path, content: bytes, *arguments: str) -> None:
         check=False,
     )
     if completed.returncode != 0:
+        detail = git_stderr_tail(completed)
+        message = "checkpoint patch does not apply cleanly"
+        if detail:
+            message = message + ": " + detail
         raise HarnessError(
             "E_GIT_APPLY",
-            "checkpoint patch does not apply cleanly",
+            message,
             status=409,
         )
