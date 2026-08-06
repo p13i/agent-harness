@@ -3340,6 +3340,118 @@ async def test_e2e_unattended_admission_requires_fresh_headroom(
 
 
 @pytest.mark.asyncio
+async def test_e2e_retryable_provider_failure_keeps_session_claimable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    try:
+        original_failover = rig.worker._execute_with_failover
+        attempts: list[str] = []
+
+        async def failover(
+            command_id: str,
+            payload: dict[str, Any],
+            text: str,
+            guard: Any,
+            evaluator: Any = None,
+        ) -> dict[str, Any]:
+            attempts.append(command_id)
+            if len(attempts) == 1:
+                raise ProviderUnavailableError(
+                    "claude",
+                    detail="fleet saturated",
+                )
+            return await original_failover(
+                command_id,
+                payload,
+                text,
+                guard,
+                evaluator,
+            )
+
+        monkeypatch.setattr(rig.worker, "_execute_with_failover", failover)
+
+        receipt = await rig.message("Trigger a transient capacity failure.")
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_PROVIDER_UNAVAILABLE"
+        assert receipt.result["retryable"] is True
+        failed_events = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "turn.failed"
+        ]
+        assert len(failed_events) == 1
+        assert failed_events[0].metadata["code"] == "E_PROVIDER_UNAVAILABLE"
+        assert failed_events[0].metadata["retryable"] is True
+        current = rig.store.get_session(rig.session.session_id)
+        assert current.lifecycle == "running"
+        assert current.attention == "idle"
+
+        # The claim loop must pick up a queued follow-up without an
+        # operator resume: drive the real worker loop to claim it.
+        follow_up = rig.enqueue_message("Continue after the transient failure.")
+        worker_task = asyncio.create_task(rig.worker.run())
+        try:
+            current = rig.store.get_command(follow_up.command_id)
+            for unused in range(1000):
+                del unused
+                current = rig.store.get_command(follow_up.command_id)
+                if current.status == "complete":
+                    break
+                await asyncio.sleep(0.01)
+            assert current.status == "complete", current.result
+        finally:
+            rig.worker._stopping = True
+            if not worker_task.done():
+                worker_task.cancel()
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_non_retryable_failure_still_pauses_for_operator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    try:
+
+        async def defect(
+            unused_command_id: str,
+            unused_payload: dict[str, Any],
+            unused_text: str,
+            unused_guard: Any,
+            unused_evaluator: Any = None,
+        ) -> dict[str, Any]:
+            del unused_command_id, unused_payload, unused_text
+            del unused_guard, unused_evaluator
+            raise HarnessError("E_DEFECT", "a genuine non-retryable defect")
+
+        monkeypatch.setattr(rig.worker, "_execute_with_failover", defect)
+
+        receipt = await rig.message("Trigger a genuine defect.")
+
+        assert receipt.status == "failed"
+        assert receipt.result["code"] == "E_DEFECT"
+        assert receipt.result["retryable"] is False
+        failed_events = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "turn.failed"
+        ]
+        assert len(failed_events) == 1
+        current = rig.store.get_session(rig.session.session_id)
+        assert current.lifecycle == "paused"
+        assert current.attention == "needs-input"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_hard_usage_limit_interrupts_without_recovery(
     tmp_path: Path,
 ) -> None:
