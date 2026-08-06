@@ -720,11 +720,22 @@ class SessionWorker:
                     "retryable": error.detail.retryable,
                 },
             )
-            self.store.update_session(
-                self.session_id,
-                lifecycle=Lifecycle.PAUSED,
-                attention=Attention.NEEDS_INPUT,
-            )
+            if error.detail.retryable:
+                # Transient infrastructure failure (for example provider
+                # capacity): the command resolves failed, but the session
+                # must stay claimable so queued commands are not stalled
+                # behind an operator resume.
+                self.store.update_session(
+                    self.session_id,
+                    lifecycle=Lifecycle.RUNNING,
+                    attention=Attention.IDLE,
+                )
+            else:
+                self.store.update_session(
+                    self.session_id,
+                    lifecycle=Lifecycle.PAUSED,
+                    attention=Attention.NEEDS_INPUT,
+                )
             self.store.update_command_envelope(
                 command.command_id,
                 state="paused",
