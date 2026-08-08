@@ -411,7 +411,19 @@ class CodexAdapter(ProviderAdapter):
                     if event.metadata is not None:
                         usage.update(event.metadata)
                 if event.event_type == "turn.completed":
-                    terminal_status["value"] = event.status
+                    # Normalize Codex "completed" (and aliases) to the
+                    # harness ProviderResult vocabulary "complete".
+                    event_status = str(event.status or "")
+                    if event_status in {
+                        "complete",
+                        "completed",
+                        "success",
+                        "ok",
+                        "",
+                    }:
+                        terminal_status["value"] = "complete"
+                    else:
+                        terminal_status["value"] = event_status
                     completed.set()
                 if event.event_type == "provider.error":
                     terminal_status["value"] = "failed"

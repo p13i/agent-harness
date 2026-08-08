@@ -90,7 +90,16 @@ def codex_notification(
         metadata: dict[str, Any] = {}
         turn_id = ""
         if isinstance(turn, dict):
-            status = str(turn.get("status", "complete"))
+            raw_status = str(turn.get("status", "complete"))
+            # Codex app-server uses "completed"; harness ProviderResult
+            # and worker completion require "complete".
+            if raw_status in {"complete", "completed", "success", "ok"}:
+                status = "complete"
+            else:
+                if raw_status:
+                    status = raw_status
+                else:
+                    status = "complete"
             turn_id = _optional_text(turn.get("id"))
             error = turn.get("error")
             if error is not None:
