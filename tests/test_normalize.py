@@ -418,3 +418,17 @@ def test_kimi_payload_falls_back_to_a_neutral_provider_event() -> None:
     assert [(item.event_type, item.text) for item in unknown_role] == [
         ("provider.event", "note")
     ]
+
+
+def test_grok_payload_maps_end_and_error() -> None:
+    from agent_harness.providers.normalize import grok_payload
+
+    end = grok_payload(
+        {"type": "end", "sessionId": "s1", "stopReason": "end_turn"}
+    )
+    assert end[0].event_type == "turn.completed"
+    assert end[0].native_session_id == "s1"
+
+    err = grok_payload({"type": "error", "message": "boom"})
+    assert err[0].event_type == "turn.failed"
+    assert err[0].text == "boom"

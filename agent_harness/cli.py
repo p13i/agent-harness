@@ -29,6 +29,7 @@ from agent_harness.migration import migrate_state
 from agent_harness.providers.base import trusted_executable
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
+from agent_harness.providers.grok import GrokAdapter
 from agent_harness.providers.kimi import KimiAdapter
 from agent_harness.scheduler import Scheduler
 from agent_harness.service_manager import SystemdUserService, UnitConfiguration
@@ -94,7 +95,9 @@ def parser() -> argparse.ArgumentParser:
     send = subcommands.add_parser("send")
     send.add_argument("session_id")
     send.add_argument("text")
-    send.add_argument("--provider", choices=("claude", "codex", "kimi"))
+    send.add_argument(
+        "--provider", choices=("claude", "codex", "kimi", "grok")
+    )
     send.add_argument("--model", default="")
     send.add_argument("--effort", default="")
     send.add_argument("--workload", default="implementation")
@@ -115,7 +118,9 @@ def parser() -> argparse.ArgumentParser:
     extend.add_argument("--reason", required=True)
     subcommands.add_parser("providers")
     attest_usage = subcommands.add_parser("attest-provider-usage")
-    attest_usage.add_argument("provider", choices=("claude", "codex", "kimi"))
+    attest_usage.add_argument(
+        "provider", choices=("claude", "codex", "kimi", "grok")
+    )
     attest_usage.add_argument("--binding-percent", type=float, required=True)
     attest_usage.add_argument("--valid-seconds", type=int, required=True)
     attest_usage.add_argument("--evidence-sha256", required=True)
@@ -157,7 +162,7 @@ def parser() -> argparse.ArgumentParser:
     fork.add_argument(
         "--to",
         dest="target_provider",
-        choices=("claude", "codex", "kimi"),
+        choices=("claude", "codex", "kimi", "grok"),
         default="",
     )
 
@@ -193,7 +198,9 @@ def parser() -> argparse.ArgumentParser:
 
     route = subcommands.add_parser("route")
     route.add_argument("session_id")
-    route.add_argument("--provider", choices=("claude", "codex", "kimi"))
+    route.add_argument(
+        "--provider", choices=("claude", "codex", "kimi", "grok")
+    )
     route.add_argument("--model", default="")
     route.add_argument("--effort", default="")
     route.add_argument("--workload", default="implementation")
@@ -772,6 +779,7 @@ async def _worker(harness_paths: Any, session_id: str) -> None:
         "claude": ClaudeAdapter(),
         "codex": CodexAdapter(),
         "kimi": KimiAdapter(),
+        "grok": GrokAdapter(),
     }
     scheduler = Scheduler(store, adapters)
     worker = SessionWorker(

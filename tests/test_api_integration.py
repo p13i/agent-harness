@@ -2929,7 +2929,7 @@ def test_goal_promotion_rejects_widened_or_malformed_contracts(
         )
         rejected(
             "cannot widen permitted providers",
-            permitted_providers=["claude", "codex", "kimi"],
+            permitted_providers=["claude", "codex", "kimi", "grok"],
         )
         rejected(
             "cannot widen permitted efforts",

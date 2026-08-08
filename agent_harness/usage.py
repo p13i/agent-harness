@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -46,6 +47,7 @@ async def probe_all() -> dict[str, UsageSnapshot]:
         _timed_probe("codex", _probe_codex),
         _timed_probe("claude", _probe_claude),
         _timed_probe("kimi", _probe_kimi),
+        _timed_probe("grok", _probe_grok),
     )
     return {item.provider: item for item in results}
 
@@ -58,6 +60,8 @@ def provider_auth_ready(provider: str) -> bool:
     if provider == "codex":
         token, account_id = _codex_credentials()
         return bool(token and account_id)
+    if provider == "grok":
+        return _grok_auth_present()
     raise ValueError("unknown provider: " + provider)
 
 
@@ -116,6 +120,13 @@ def normalize_usage(
         for window in _kimi_windows(payload):
             windows.append(float(window["percent"]))
         credits_engaged = _kimi_extra_usage_engaged(_object(payload.get("usage")))
+    if provider == "grok":
+        # Auth-readiness only: signed-in OAuth is treated as full headroom
+        # until a real rate-limit probe exists. Without a finite binding,
+        # unattended routing with a binding ceiling rejects the provider.
+        if payload.get("auth_ready"):
+            windows.append(0.0)
+        credits_engaged = False
     binding_percent: float | None = None
     if windows:
         binding_percent = max(windows)
@@ -219,6 +230,81 @@ def _probe_kimi() -> UsageSnapshot:
             error=_safe_error(error),
         )
     return normalize_usage("kimi", payload)
+
+
+def _probe_grok() -> UsageSnapshot:
+    """Auth-readiness probe for Grok Build OAuth credentials.
+
+    SpaceXAI does not yet expose a harness-facing rate-limit window API.
+    Unattended admission requires a finite binding percent when a
+    binding ceiling is set, so a present non-expired ``~/.grok/auth.json``
+    entry is reported as binding 0.0 (full headroom). This is not real
+    quota metering.
+    """
+    ready, detail = _grok_auth_detail()
+    if not ready:
+        return UsageSnapshot(
+            provider="grok",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error=detail or "credentials unavailable",
+        )
+    return normalize_usage(
+        "grok",
+        {
+            "auth_ready": True,
+            "auth_source": "oauth",
+            "detail": detail,
+        },
+    )
+
+
+def _grok_auth_present() -> bool:
+    ready, _detail = _grok_auth_detail()
+    return ready
+
+
+def _grok_auth_detail() -> tuple[bool, str]:
+    path = Path.home() / ".grok" / "auth.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return False, "credentials unavailable"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return False, "credentials unreadable"
+    if not isinstance(payload, dict) or not payload:
+        return False, "credentials unavailable"
+    now = _unix_now()
+    for _key, entry in payload.items():
+        block = _object(entry)
+        if not block:
+            continue
+        expires_at = block.get("expires_at")
+        if expires_at is None:
+            # Present entry without expiry still counts as signed-in.
+            return True, "oauth present"
+        expires = _number(expires_at)
+        if expires is None:
+            # Non-numeric expiry: treat as present if a refresh token exists.
+            if block.get("refresh_token") or block.get("key"):
+                return True, "oauth present"
+            continue
+        # expires_at may be seconds or milliseconds.
+        if expires > 1_000_000_000_000:
+            expires = expires / 1000.0
+        if expires > now:
+            return True, "oauth present"
+        if block.get("refresh_token"):
+            # Refreshable expired access token: still signed in.
+            return True, "oauth refreshable"
+    return False, "credentials expired"
+
+
+def _unix_now() -> float:
+    return time.time()
 
 
 def _json_get(url: str, headers: dict[str, str]) -> dict[str, Any]:
@@ -486,6 +572,10 @@ def _public_payload(
         }
         membership = _object(_object(payload.get("user")).get("membership"))
         result["membership_level"] = membership.get("level")
+    if provider == "grok":
+        result["auth_ready"] = bool(payload.get("auth_ready"))
+        result["auth_source"] = payload.get("auth_source")
+        result["detail"] = payload.get("detail")
     return result
 
 

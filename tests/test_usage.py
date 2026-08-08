@@ -58,7 +58,7 @@ def test_usage_probes_are_bounded_and_provider_complete(
 
     monkeypatch.setattr(usage, "_timed_probe", timed)
     results = asyncio.run(usage.probe_all())
-    assert set(results) == {"codex", "claude", "kimi"}
+    assert set(results) == {"codex", "claude", "kimi", "grok"}
     monkeypatch.setattr(usage, "_timed_probe", original_timed_probe)
 
     assert (
@@ -337,6 +337,43 @@ def test_provider_auth_readiness_reports_each_launch_credential(
 
     with pytest.raises(ValueError, match="unknown provider: kimi"):
         usage.provider_auth_ready("kimi")
+
+    monkeypatch.setattr(usage, "_grok_auth_present", lambda: True)
+    assert usage.provider_auth_ready("grok") is True
+    monkeypatch.setattr(usage, "_grok_auth_present", lambda: False)
+    assert usage.provider_auth_ready("grok") is False
+
+
+def test_grok_auth_ready_reports_full_headroom() -> None:
+    snapshot = normalize_usage(
+        "grok",
+        {"auth_ready": True, "auth_source": "oauth", "detail": "oauth present"},
+    )
+    assert snapshot.provider == "grok"
+    assert snapshot.binding_percent == 0.0
+    assert snapshot.credits_engaged is False
+    assert snapshot.payload["auth_ready"] is True
+
+
+def test_grok_probe_missing_auth(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    snapshot = usage._probe_grok()
+    assert snapshot.provider == "grok"
+    assert snapshot.binding_percent is None
+    assert "credentials" in snapshot.error
+
+
+def test_grok_probe_present_auth(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    auth_dir = tmp_path / ".grok"
+    auth_dir.mkdir()
+    (auth_dir / "auth.json").write_text(
+        '{"https://auth.x.ai::x": {"expires_at": 9999999999, "refresh_token": "r"}}',
+        encoding="utf-8",
+    )
+    snapshot = usage._probe_grok()
+    assert snapshot.binding_percent == 0.0
+    assert snapshot.error == ""
 
 
 def test_usage_normalization_omits_private_payloads() -> None:

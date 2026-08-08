@@ -69,7 +69,7 @@ from agent_harness.providers.base import (
 )
 from agent_harness.worker import SessionWorker
 
-SUPPORTED_PROVIDERS = frozenset({"claude", "codex", "kimi"})
+SUPPORTED_PROVIDERS = frozenset({"claude", "codex", "kimi", "grok"})
 
 
 class WorkerProbe:
@@ -2969,7 +2969,7 @@ def test_machines_goal_envelope_requires_every_typed_dimension() -> None:
             "permitted_providers": complete["permitted_providers"],
             "permitted_efforts": complete["permitted_efforts"],
             "budgets": budgets,
-            "supported_providers": frozenset({"claude", "codex", "kimi"}),
+            "supported_providers": frozenset({"claude", "codex", "kimi", "grok"}),
         }
         values.update(overrides)
         service_module._require_machines_goal_envelope(complete, **values)

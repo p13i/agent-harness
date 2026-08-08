@@ -306,10 +306,10 @@ DEFAULT_SLASH_COMMANDS = (
     SlashCommand(
         "/provider",
         "Choose a provider",
-        "/provider <auto|claude|codex|kimi>",
+        "/provider <auto|claude|codex|kimi|grok>",
         min_arguments=1,
         max_arguments=1,
-        first_argument_choices=("auto", "claude", "codex", "kimi"),
+        first_argument_choices=("auto", "claude", "codex", "kimi", "grok"),
     ),
     SlashCommand(
         "/model",

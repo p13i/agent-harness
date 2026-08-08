@@ -34,149 +34,172 @@
       "id": "durable-chat",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "streaming-output",
       "capability": "streaming",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "normalized"
+      "kimi": "normalized",
+      "grok": "normalized"
     },
     {
       "id": "tool-execution",
       "capability": "tools",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "tool-approvals-and-questions",
       "capability": "approval",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "permission-modes",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "native-session-resume",
       "capability": "resume",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "normalized"
+      "kimi": "normalized",
+      "grok": "normalized"
     },
     {
       "id": "provider-switch-resume",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "fork-and-checkpoint",
       "capability": "checkpoint",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "formal-goals-and-budgets",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "model-and-effort-selection",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "normalized"
     },
     {
       "id": "steering",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "subagents",
       "capability": "subagents",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "skills",
       "capability": "skills",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "plugins",
       "capability": "plugins",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "mcp",
       "capability": "mcp",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "hooks",
       "capability": "hooks",
       "claude": "normalized",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "images",
       "claude": "native-passthrough",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "codex-apps",
       "claude": "not-applicable",
       "codex": "normalized",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "slash-commands",
       "claude": "native-passthrough",
       "codex": "native-passthrough",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "provider-command-palette",
       "claude": "native-passthrough",
       "codex": "native-passthrough",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "provider-desktop-affordances",
       "claude": "native-passthrough",
       "codex": "native-passthrough",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "interactive-terminal",
       "claude": "native-passthrough",
       "codex": "native-passthrough",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     },
     {
       "id": "file-and-diff-inspection",
       "claude": "native-passthrough",
       "codex": "native-passthrough",
-      "kimi": "not-applicable"
+      "kimi": "not-applicable",
+      "grok": "not-applicable"
     }
   ],
   "escape_hatch": {
@@ -185,5 +208,10 @@
       "claude",
       "codex"
     ]
-  }
+  },
+  "grok": [
+    "resume",
+    "streaming",
+    "worktree"
+  ]
 }

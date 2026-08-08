@@ -1529,7 +1529,7 @@ def test_worker_closes_storage_after_session_worker_finishes(
     worker_call = observed[-3]
     assert isinstance(worker_call, tuple)
     assert worker_call[0] == "worker"
-    assert set(worker_call[1][3]) == {"claude", "codex", "kimi"}
+    assert set(worker_call[1][3]) == {"claude", "codex", "kimi", "grok"}
 
 
 def test_doctor_reports_bundle_service_daemon_and_storage(

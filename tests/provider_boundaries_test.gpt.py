@@ -22,7 +22,7 @@ from agent_harness.errors import (
     ProviderExhaustedError,
     ProviderUnavailableError,
 )
-from agent_harness.providers import base, claude, codex, kimi, normalize
+from agent_harness.providers import base, claude, codex, grok, kimi, normalize
 from agent_harness.providers.base import (
     ChildLaunchGate,
     ProviderAdapter,
@@ -2543,6 +2543,293 @@ def test_kimi_run_turn_reports_a_nonzero_exit_as_a_failed_turn(
 
     assert [(item.event_type, item.text) for item in seen] == [
         ("turn.failed", "kimi: config.invalid")
+    ]
+
+
+def test_grok_payload_normalizes_streaming_json() -> None:
+    events = normalize.grok_payload({"type": "text", "data": "ok"})
+    assert [(e.event_type, e.text) for e in events] == [("agent.message", "ok")]
+
+    events = normalize.grok_payload(
+        {
+            "type": "end",
+            "stopReason": "end_turn",
+            "sessionId": "session_g",
+            "usage": {"input_tokens": 1},
+        }
+    )
+    assert events[0].event_type == "turn.completed"
+    assert events[0].native_session_id == "session_g"
+    assert events[0].metadata is not None
+    assert events[0].metadata["usage"]["input_tokens"] == 1
+
+    events = normalize.grok_payload(
+        {"type": "error", "message": "not signed in"}
+    )
+    assert events[0].event_type == "turn.failed"
+    assert events[0].text == "not signed in"
+
+    assert (
+        normalize.grok_payload({"type": "available_commands", "tools": []})[
+            0
+        ].event_type
+        == "provider.event"
+    )
+
+
+def test_grok_launch_argv_is_headless_streaming_json() -> None:
+    argv = grok._launch_argv(
+        "/home/pramo/.grok/bin/grok",
+        prompt="do it",
+        model="grok-4.5",
+        effort="medium",
+        session_id="session_abc",
+    )
+    assert argv[0] == "/home/pramo/.grok/bin/grok"
+    assert "--always-approve" in argv
+    assert "--no-subagents" in argv
+    assert argv[argv.index("--output-format") + 1] == "streaming-json"
+    assert argv[argv.index("-m") + 1] == "grok-4.5"
+    assert argv[argv.index("--reasoning-effort") + 1] == "medium"
+    assert argv[argv.index("-r") + 1] == "session_abc"
+    assert argv[argv.index("-p") + 1] == "do it"
+    assert "-r" not in grok._launch_argv(
+        "/bin/grok",
+        prompt="x",
+        model="",
+        effort="",
+        session_id="",
+    )
+
+
+def test_grok_status_and_models(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        grok, "resolve_grok_binary", lambda: "/home/pramo/.grok/bin/grok"
+    )
+    status = grok.GrokAdapter().status()
+    assert status.ready
+    assert status.provider == "grok"
+    assert "auth-readiness" in status.detail
+    assert "approval" not in status.capabilities
+    assert "streaming" in status.capabilities
+    assert "tools" not in status.capabilities
+
+    monkeypatch.setattr(grok, "resolve_grok_binary", lambda: None)
+    assert not grok.GrokAdapter().status().ready
+
+    async def scenario() -> None:
+        models = await grok.GrokAdapter().models(tmp_path)
+        assert models[0].model_id == "grok-4.5"
+        assert models[0].default
+        assert "medium" in models[0].efforts
+
+    asyncio.run(scenario())
+
+
+def test_grok_run_turn_streams_and_reports_the_session(
+    monkeypatch, tmp_path
+) -> None:
+    lines = [
+        b'{"type":"text","data":"ok"}\n',
+        b'{"type":"end","stopReason":"end_turn","sessionId":"session_z"}\n',
+        b"not json\n",
+    ]
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                for line in lines:
+                    yield line
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class Process:
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 0
+
+    captured: list[list[str]] = []
+
+    async def fake_exec(*argv, **_kwargs):
+        captured.append(list(argv))
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        grok, "resolve_grok_binary", lambda: "/usr/local/bin/grok"
+    )
+
+    seen: list[ProviderEvent] = []
+
+    async def handler(event: ProviderEvent) -> None:
+        seen.append(event)
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        result = await grok.GrokAdapter().run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="",
+            permission_mode="full",
+            model="grok-4.5",
+            effort="medium",
+            event_handler=handler,
+            approval_handler=approvals,
+        )
+        assert result.status == "complete"
+        assert result.native_session_id == "session_z"
+
+    asyncio.run(scenario())
+
+    assert [e.event_type for e in seen] == ["agent.message", "turn.completed"]
+    assert captured[0][0] == "/usr/local/bin/grok"
+    assert "--always-approve" in captured[0]
+
+
+def test_grok_run_turn_gates_on_a_positive_child_limit(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lines = [b'{"type":"text","data":"ok"}\n']
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                for line in lines:
+                    yield line
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class Process:
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*_argv, **_kwargs):
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        grok, "resolve_grok_binary", lambda: "/usr/local/bin/grok"
+    )
+
+    async def handler(_event: ProviderEvent) -> None:
+        return None
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        adapter = grok.GrokAdapter()
+        result = await adapter.run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="",
+            permission_mode="full",
+            model="grok-4.5",
+            effort="low",
+            event_handler=handler,
+            approval_handler=approvals,
+            child_launch_gate=ChildLaunchGate(
+                database=tmp_path,
+                command_id="cmd",
+                limit=0,
+            ),
+        )
+        assert result.status == "complete"
+        with pytest.raises(RuntimeError, match="positive child-agent limit"):
+            await adapter.run_turn(
+                workspace=tmp_path,
+                prompt="do it",
+                native_session_id="",
+                permission_mode="full",
+                model="grok-4.5",
+                effort="low",
+                event_handler=handler,
+                approval_handler=approvals,
+                child_launch_gate=ChildLaunchGate(
+                    database=tmp_path,
+                    command_id="cmd",
+                    limit=2,
+                ),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_grok_run_turn_reports_a_nonzero_exit_as_a_failed_turn(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lines = [b"\n"]
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                for line in lines:
+                    yield line
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b"Not signed in.\n"
+
+    class Process:
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 2
+
+    async def fake_exec(*_argv, **_kwargs):
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        grok, "resolve_grok_binary", lambda: "/usr/local/bin/grok"
+    )
+
+    seen: list[ProviderEvent] = []
+
+    async def handler(event: ProviderEvent) -> None:
+        seen.append(event)
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        result = await grok.GrokAdapter().run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="session_prior",
+            permission_mode="full",
+            model="grok-4.5",
+            effort="low",
+            event_handler=handler,
+            approval_handler=approvals,
+        )
+        assert result.status == "failed"
+        assert result.native_session_id == "session_prior"
+
+    asyncio.run(scenario())
+
+    assert [(item.event_type, item.text) for item in seen] == [
+        ("turn.failed", "Not signed in.")
     ]
 
 

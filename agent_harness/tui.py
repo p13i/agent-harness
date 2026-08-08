@@ -2316,7 +2316,7 @@ class HarnessApp(App[None]):
             if value == "auto":
                 value = ""
             if command == "/provider":
-                if value not in {"", "claude", "codex", "kimi"}:
+                if value not in {"", "claude", "codex", "kimi", "grok"}:
                     self._write_notice("[red]Unknown provider[/red]")
                     return
                 self._provider_override = value

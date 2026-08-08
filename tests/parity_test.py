@@ -7,6 +7,7 @@ import agent_harness
 
 from agent_harness.providers.claude import ClaudeAdapter
 from agent_harness.providers.codex import CodexAdapter
+from agent_harness.providers.grok import GrokAdapter
 from agent_harness.providers.kimi import KimiAdapter
 
 
@@ -21,6 +22,7 @@ def main() -> int:
         "claude": ClaudeAdapter().status(),
         "codex": CodexAdapter().status(),
         "kimi": KimiAdapter().status(),
+        "grok": GrokAdapter().status(),
     }
     # "common" is the full-parity baseline kimi does not claim yet.
     for capability in contract["common"]:
@@ -35,6 +37,9 @@ def main() -> int:
     for capability in contract["kimi"]:
         if capability not in statuses["kimi"].capabilities:
             raise AssertionError("kimi lacks " + capability)
+    for capability in contract["grok"]:
+        if capability not in statuses["grok"].capabilities:
+            raise AssertionError("grok lacks " + capability)
     accepted = set(contract["statuses"])
     features = contract["features"]
     for feature in features:

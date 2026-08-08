@@ -32,7 +32,7 @@ from agent_harness.service import HarnessService
 from agent_harness.storage import StateStore
 from tests.test_support import session
 
-SUPPORTED_PROVIDERS = frozenset({"claude", "codex", "kimi"})
+SUPPORTED_PROVIDERS = frozenset({"claude", "codex", "kimi", "grok"})
 
 
 class WorkerProbe:
@@ -1386,7 +1386,7 @@ def test_machine_goal_envelope_rejects_unbounded_or_untyped_fields() -> None:
             permitted_providers=permitted_providers,
             permitted_efforts=permitted_efforts,
             budgets=current_budgets,
-            supported_providers=frozenset({"claude", "codex", "kimi"}),
+            supported_providers=frozenset({"claude", "codex", "kimi", "grok"}),
         )
 
     validate(payload)

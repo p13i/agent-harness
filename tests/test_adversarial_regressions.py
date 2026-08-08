@@ -360,7 +360,7 @@ def test_default_service_registry_admits_kimi_with_config_containment(
     monkeypatch.setattr(kimi.shutil, "which", lambda _name: "/usr/bin/npx")
     service = HarnessService(paths(tmp_path / "state"))
     try:
-        assert set(service.adapters) == {"claude", "codex", "kimi"}
+        assert set(service.adapters) == {"claude", "codex", "kimi", "grok"}
         assert service.adapters["kimi"].status().ready
     finally:
         service.close()

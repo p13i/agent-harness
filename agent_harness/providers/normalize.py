@@ -426,6 +426,98 @@ def _claude_stream_event(
     return [ProviderEvent("provider.event", raw=raw)]
 
 
+def grok_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
+    """Normalize one Grok Build ``--output-format streaming-json`` line.
+
+    Grok emits type-tagged NDJSON (``text``, ``thought``, ``tool_call``,
+    ``usage``, ``end``, ``error``, …). ``end`` always carries
+    ``sessionId`` for resume; ``error`` is terminal for the turn.
+    """
+    event_type = str(payload.get("type", ""))
+    session_id = _optional_text(
+        payload.get("sessionId") or payload.get("session_id")
+    )
+    if event_type == "text":
+        text = payload_text(payload.get("data"))
+        return [
+            ProviderEvent(
+                "agent.message",
+                text=text,
+                raw=payload,
+                native_session_id=session_id,
+            )
+        ]
+    if event_type == "thought":
+        text = payload_text(payload.get("data"))
+        return [
+            ProviderEvent(
+                "provider.event",
+                text=text,
+                raw=payload,
+                native_session_id=session_id,
+            )
+        ]
+    if event_type in {"tool_call", "tool_call_update"}:
+        return [
+            ProviderEvent(
+                "provider.event",
+                text=str(payload.get("toolName") or payload.get("title") or ""),
+                raw=payload,
+                native_session_id=session_id,
+                metadata={
+                    "grok_type": event_type,
+                    "tool_call_id": payload.get("toolCallId"),
+                    "status": payload.get("status"),
+                },
+            )
+        ]
+    if event_type == "usage":
+        usage = payload.get("usage")
+        metadata: dict[str, Any] = {}
+        if isinstance(usage, dict):
+            metadata["usage"] = usage
+        return [
+            ProviderEvent(
+                "provider.event",
+                raw=payload,
+                native_session_id=session_id,
+                metadata=metadata or None,
+            )
+        ]
+    if event_type == "end":
+        metadata = {}
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            metadata["usage"] = usage
+        return [
+            ProviderEvent(
+                "turn.completed",
+                status="complete",
+                raw=payload,
+                native_session_id=session_id,
+                metadata=metadata or None,
+            )
+        ]
+    if event_type == "error":
+        message = payload_text(payload.get("message") or payload.get("data"))
+        return [
+            ProviderEvent(
+                "turn.failed",
+                text=message,
+                status="failed",
+                raw=payload,
+                native_session_id=session_id,
+            )
+        ]
+    return [
+        ProviderEvent(
+            "provider.event",
+            raw=payload,
+            native_session_id=session_id,
+        )
+    ]
+
+
 def kimi_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
     """Normalize one Kimi Code ``--output-format stream-json`` line.
 

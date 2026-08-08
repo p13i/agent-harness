@@ -39,6 +39,7 @@ QUALITY = {
     # Every provider scores the same here on purpose: capacity headroom,
     # not quality, is meant to decide between providers.
     "kimi": 90.0,
+    "grok": 100.0,
 }
 
 
