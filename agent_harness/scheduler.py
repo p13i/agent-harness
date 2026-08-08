@@ -775,4 +775,20 @@ def _fallback_models(provider: str) -> tuple[ProviderModel, ...]:
     efforts = ("low", "medium", "high", "xhigh")
     if provider == "claude":
         return (ProviderModel("opus", "Opus", efforts, None, default=True),)
+    if provider == "codex":
+        # Avoid synthetic "default" when config.toml pins a real model;
+        # ChatGPT-backed Codex rejects model id default.
+        from agent_harness.providers.codex import codex_config_model
+
+        configured = codex_config_model()
+        if configured:
+            return (
+                ProviderModel(
+                    configured,
+                    configured + " (config.toml)",
+                    efforts,
+                    None,
+                    default=True,
+                ),
+            )
     return (ProviderModel("default", "Account default", efforts, None, default=True),)

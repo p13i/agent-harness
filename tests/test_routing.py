@@ -1081,6 +1081,7 @@ def test_scheduler_helpers_normalize_fallback_values() -> None:
     no_efforts = ProviderModel("none", "None", (), None)
     assert _select_effort(no_efforts, "") == ""
     assert _select_effort(no_efforts, "", frozenset({"high"})) is None
+    # Without a config.toml pin, codex still falls back to "default".
     assert _fallback_models("codex")[0].model_id == "default"
 
     stale = datetime.datetime.now(datetime.UTC)
@@ -1120,3 +1121,37 @@ def test_status_marks_high_binding_and_probe_errors_inadmissible(
         store.close()
 
     asyncio.run(scenario())
+
+
+def test_codex_config_model_and_merge(tmp_path: Path, monkeypatch) -> None:
+    from agent_harness.providers import codex as codex_mod
+    from agent_harness.providers.base import ProviderModel
+
+    monkeypatch.setattr(codex_mod.Path, "home", lambda: tmp_path)
+    assert codex_mod.codex_config_model() == ""
+    assert codex_mod.resolve_codex_model("default") == "default"
+    assert codex_mod.resolve_codex_model("") == ""
+
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "xhigh"\n',
+        encoding="utf-8",
+    )
+    assert codex_mod.codex_config_model() == "gpt-5.6-sol"
+    assert codex_mod.resolve_codex_model("default") == "gpt-5.6-sol"
+    assert codex_mod.resolve_codex_model("") == "gpt-5.6-sol"
+    assert codex_mod.resolve_codex_model("o3") == "o3"
+
+    only_default = (
+        ProviderModel("default", "Account default", ("high",), None, default=True),
+    )
+    merged = codex_mod._merge_codex_config_models(only_default)
+    assert merged[0].model_id == "gpt-5.6-sol"
+    assert merged[0].default is True
+    assert any(item.model_id == "default" for item in merged)
+
+    empty = codex_mod._merge_codex_config_models(())
+    assert empty[0].model_id == "gpt-5.6-sol"
+
+    assert _fallback_models("codex")[0].model_id == "gpt-5.6-sol"

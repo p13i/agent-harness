@@ -1384,11 +1384,29 @@ async def test_process_group_control_is_identity_bound_and_bounded(
             "changed",
         ),
     )
-    with pytest.raises(RuntimeError, match="start identity"):
-        await process_control_module.terminate_process_group(
-            process,  # type: ignore[arg-type]
-            identity,
-        )
+    # PID reuse after exit is already-exited, not a hard failure:
+    # multi-provider stage switches can exit and recycle the pid
+    # before terminate runs.
+    reused_waits: list[float] = []
+
+    async def record_reused_wait(
+        unused_process: object,
+        timeout: float,
+    ) -> None:
+        del unused_process
+        reused_waits.append(timeout)
+
+    monkeypatch.setattr(
+        process_control_module,
+        "_bounded_wait",
+        record_reused_wait,
+    )
+    await process_control_module.terminate_process_group(
+        process,  # type: ignore[arg-type]
+        identity,
+        kill_timeout=3.0,
+    )
+    assert reused_waits == [3.0]
     monkeypatch.setattr(
         process_control_module,
         "process_group_identity",

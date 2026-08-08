@@ -376,7 +376,7 @@ class CodexAdapter(ProviderAdapter):
                     )
         finally:
             await server.close()
-        return tuple(models)
+        return _merge_codex_config_models(tuple(models))
 
     async def run_turn(
         self,
@@ -411,7 +411,19 @@ class CodexAdapter(ProviderAdapter):
                     if event.metadata is not None:
                         usage.update(event.metadata)
                 if event.event_type == "turn.completed":
-                    terminal_status["value"] = event.status
+                    # Normalize Codex "completed" (and aliases) to the
+                    # harness ProviderResult vocabulary "complete".
+                    event_status = str(event.status or "")
+                    if event_status in {
+                        "complete",
+                        "completed",
+                        "success",
+                        "ok",
+                        "",
+                    }:
+                        terminal_status["value"] = "complete"
+                    else:
+                        terminal_status["value"] = event_status
                     completed.set()
                 if event.event_type == "provider.error":
                     terminal_status["value"] = "failed"
@@ -435,6 +447,10 @@ class CodexAdapter(ProviderAdapter):
             await server.start()
             if pre_prompt_gate is not None:
                 await pre_prompt_gate()
+            # ChatGPT-backed Codex rejects model id "default"
+            # (invalid_request_error). Resolve empty/default to the
+            # operator's ~/.codex/config.toml model when present.
+            model = resolve_codex_model(model)
             thread_params = {
                 "cwd": str(workspace),
                 "approvalPolicy": _approval_policy(permission_mode),
@@ -561,6 +577,97 @@ class CodexAdapter(ProviderAdapter):
     ) -> bool:
         del workspace
         return _has_native_session(native_session_id)
+
+
+def codex_config_model(home: Path | None = None) -> str:
+    """Return the non-default model pin from ~/.codex/config.toml.
+
+    ChatGPT-auth Codex rejects the synthetic model id ``default``.
+    Operators pin a real model in config.toml; the harness must
+    advertise and dispatch that id.
+    """
+    base = Path.home() if home is None else home
+    path = base / ".codex" / "config.toml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("model"):
+            continue
+        if "=" not in line:
+            continue
+        _, _, rest = line.partition("=")
+        value = rest.strip().strip('"').strip("'")
+        if value and value != "default":
+            return value
+    return ""
+
+
+def resolve_codex_model(model: str) -> str:
+    """Map empty/default model pins to the config.toml model when set."""
+    if model and model != "default":
+        return model
+    configured = codex_config_model()
+    if configured:
+        return configured
+    return model
+
+
+def _merge_codex_config_models(
+    listed: tuple[ProviderModel, ...],
+) -> tuple[ProviderModel, ...]:
+    """Ensure the config.toml model is advertised and preferred.
+
+    When app-server only returns ``default`` (or nothing), ChatGPT
+    accounts cannot run turns. Prefer the operator pin from config.toml
+    as the default entry while keeping any other listed models.
+    """
+    efforts = ("low", "medium", "high", "xhigh")
+    configured = codex_config_model()
+    if not listed:
+        if not configured:
+            return ()
+        return (
+            ProviderModel(
+                configured,
+                configured + " (config.toml)",
+                efforts,
+                None,
+                default=True,
+            ),
+        )
+    ids = {item.model_id for item in listed}
+    only_placeholder = ids <= {"default"}
+    if not configured:
+        return listed
+    if configured in ids and not only_placeholder:
+        return listed
+    prepend = ProviderModel(
+        configured,
+        configured + " (config.toml)",
+        efforts,
+        None,
+        default=True,
+    )
+    rest: list[ProviderModel] = []
+    for item in listed:
+        if item.model_id == configured:
+            continue
+        rest.append(
+            ProviderModel(
+                item.model_id,
+                item.display_name,
+                item.efforts,
+                item.context_window,
+                default=False if only_placeholder else item.default,
+                service_tiers=item.service_tiers,
+            )
+        )
+    return (prepend, *rest)
 
 
 def _approval_policy(permission_mode: str) -> str:
