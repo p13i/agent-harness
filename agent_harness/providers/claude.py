@@ -234,6 +234,7 @@ class ClaudeAdapter(ProviderAdapter):
         del workspace
         efforts = ("low", "medium", "high", "xhigh", "max")
         return (
+            ProviderModel("claude-fable-5", "Fable 5", efforts, None),
             ProviderModel("opus", "Opus", efforts, None),
             ProviderModel("sonnet", "Sonnet", efforts, None, default=True),
             ProviderModel("haiku", "Haiku", efforts, None),
