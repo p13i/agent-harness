@@ -41,9 +41,19 @@ async def terminate_process_group(
     if process.pid != identity.pid:
         raise RuntimeError("process identity changed before termination")
     if process.returncode is None:
-        current = process_group_identity(identity.pid)
+        try:
+            current = process_group_identity(identity.pid)
+        except ProcessLookupError:
+            # Leader already gone; wait for the asyncio handle only.
+            await _bounded_wait(process, kill_timeout)
+            return
         if current != identity:
-            raise RuntimeError("process start identity changed before termination")
+            # PID was reused after the original leader exited. Signaling
+            # the new process would be unsafe; treat as already-exited
+            # (same outcome as terminate_recorded_process_group's
+            # identity-changed path).
+            await _bounded_wait(process, kill_timeout)
+            return
     if grace_timeout > 0 and await _wait_group_exit(identity.pgid, grace_timeout):
         await _bounded_wait(process, kill_timeout)
         return
