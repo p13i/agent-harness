@@ -2655,9 +2655,11 @@ def test_grok_run_turn_streams_and_reports_the_session(
             return 0
 
     captured: list[list[str]] = []
+    launch_options: list[dict[str, Any]] = []
 
-    async def fake_exec(*argv, **_kwargs):
+    async def fake_exec(*argv, **kwargs):
         captured.append(list(argv))
+        launch_options.append(dict(kwargs))
         return Process()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -2692,6 +2694,7 @@ def test_grok_run_turn_streams_and_reports_the_session(
     assert [e.event_type for e in seen] == ["agent.message", "turn.completed"]
     assert captured[0][0] == "/usr/local/bin/grok"
     assert "--always-approve" in captured[0]
+    assert launch_options[0]["limit"] == 16 * 1024 * 1024
 
 
 def test_grok_run_turn_gates_on_a_positive_child_limit(

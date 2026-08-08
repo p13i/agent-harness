@@ -42,6 +42,7 @@ from agent_harness.process_control import terminate_process_group
 
 # Argv payloads above this size use --prompt-file instead of -p.
 _PROMPT_ARGV_LIMIT = 8192
+_SUBPROCESS_STREAM_LIMIT = 16 * 1024 * 1024
 
 _DEFAULT_EFFORTS = ("low", "medium", "high", "xhigh")
 
@@ -149,6 +150,7 @@ class GrokAdapter(ProviderAdapter):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            limit=_SUBPROCESS_STREAM_LIMIT,
         )
         pid = int(getattr(process, "pid", 0) or 0)
         if pid > 0:
