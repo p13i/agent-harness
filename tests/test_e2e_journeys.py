@@ -2226,6 +2226,45 @@ async def test_e2e_provider_switch_prepends_handoff_envelope(
 
 
 @pytest.mark.asyncio
+async def test_e2e_provider_switch_compacts_to_the_command_context_limit(
+    tmp_path: Path,
+) -> None:
+    claude = ScriptedAdapter("claude")
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    rig.prime_capacity()
+    try:
+        first = await rig.message("Implement the bounded change.", provider="codex")
+        assert first.status == "complete", first.result
+        rig.store.append_event(
+            rig.session.session_id,
+            "agent.message",
+            role="assistant",
+            text="implementation evidence " * 2_000,
+            status="complete",
+        )
+
+        receipt = await rig.message(
+            "Review the bounded change.",
+            provider="claude",
+            safety_limits={
+                "max_context_tokens": 2_000,
+                "max_output_tokens": 512,
+                "max_total_tokens": 3_000,
+            },
+        )
+
+        assert receipt.status == "complete", receipt.result
+        prompt = claude.prompts[-1]
+        assert prompt.startswith("# Session handoff")
+        assert (len(prompt) + 3) // 4 <= 2_000
+        events = rig.store.all_events(rig.session.session_id)
+        assert not [event for event in events if event.event_type == "guard.tripped"]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_claude_to_kimi_switch_carries_handoff_envelope(
     tmp_path: Path,
 ) -> None:
@@ -2419,6 +2458,19 @@ async def test_e2e_fork_to_provider_seeds_and_delivers_handoff(
         assert "- Target provider: `claude`" in seeded_text
         assert "implement the parser port" in seeded_text
         assert "parser ported with tests" in seeded_text
+        oversized_seed_text = seeded_text + "\n" + "review evidence " * 5_000
+        oversized_seed_blob = service.blobs.put_text(oversized_seed_text)
+        oversized_seed = dict(seed.metadata)
+        oversized_seed["blob_digest"] = oversized_seed_blob
+        oversized_seed["handoff_digest"] = worker_module._text_digest(
+            oversized_seed_text
+        )
+        service.store.append_event(
+            forked.session_id,
+            "session.handoff",
+            status="complete",
+            metadata=oversized_seed,
+        )
 
         claude = ScriptedAdapter("claude")
         adapters = {"claude": claude}
@@ -2441,7 +2493,14 @@ async def test_e2e_fork_to_provider_seeds_and_delivers_handoff(
         receipt = service.store.enqueue_command(
             forked.session_id,
             "message",
-            {"text": "Review the carried state."},
+            {
+                "text": "Review the carried state.",
+                "safety_limits": {
+                    "max_context_tokens": 2_000,
+                    "max_output_tokens": 512,
+                    "max_total_tokens": 3_000,
+                },
+            },
             new_uuid(),
         )
         service.store.append_event(
@@ -2458,8 +2517,9 @@ async def test_e2e_fork_to_provider_seeds_and_delivers_handoff(
 
         prompt = claude.prompts[0]
         assert claude.native_inputs == [""]
-        assert prompt.startswith(seeded_text + "\n\n")
+        assert prompt.startswith("# Session handoff")
         assert "Review the carried state." in prompt
+        assert (len(prompt) + 3) // 4 <= 2_000
         deliveries = [
             event
             for event in service.store.all_events(forked.session_id)
@@ -2468,9 +2528,13 @@ async def test_e2e_fork_to_provider_seeds_and_delivers_handoff(
         assert [event.metadata["origin"] for event in deliveries] == [
             "fork-seed",
             "fork-seed",
+            "fork-seed",
         ]
-        assert deliveries[1].metadata["handoff_digest"] == (
-            seed.metadata["handoff_digest"]
+        assert deliveries[2].metadata["source_blob_digest"] == (
+            oversized_seed_blob
+        )
+        assert deliveries[2].metadata["handoff_digest"] != (
+            oversized_seed["handoff_digest"]
         )
     finally:
         service.close()

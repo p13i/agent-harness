@@ -18,6 +18,7 @@ from agent_harness.config import HarnessPaths
 from agent_harness.context import (
     CompiledContext,
     compile_context,
+    estimate_tokens,
     workspace_context_artifacts,
     workspace_instructions,
 )
@@ -101,13 +102,35 @@ from agent_harness.safety import (
 from agent_harness.scheduler import Scheduler
 from agent_harness.storage import StateStore
 from agent_harness.sync import publish_session
-from agent_harness.transcript import RenderPolicy, project_transcript, render
+from agent_harness.transcript import (
+    DEFAULT_TOKEN_BUDGET,
+    RenderPolicy,
+    project_transcript,
+    render,
+)
 from agent_harness.workspace import checkpoint_workspace, workspace_summary
 from agent_harness.workspace_state import inspect_workspace
 
 CONTROL_COMMANDS = frozenset({"interrupt", "pause", "resume", "stop", "steer"})
 APPROVAL_POLL_LIMIT = 3600
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
+def _handoff_prompt_reserve(max_context_tokens: int) -> int:
+    return max(1, min(DEFAULT_TOKEN_BUDGET, max_context_tokens // 8))
+
+
+def _bounded_handoff_text(text: str, token_budget: int) -> str:
+    if token_budget <= 0:
+        return ""
+    character_budget = token_budget * 4
+    if len(text) <= character_budget:
+        return text
+    marker = "\n\n[Handoff transcript compacted to fit the command budget.]\n"
+    if len(marker) >= character_budget:
+        return text[:character_budget]
+    retained = text[: character_budget - len(marker)].rstrip()
+    return retained + marker
 
 
 def _observe_bash_command_result(
@@ -877,7 +900,24 @@ class SessionWorker:
         turn_permission_mode = str(
             payload.get("permission_mode", session.permission_mode)
         )
-        context = self._compile_context(session, guard.limits, command_id)
+        next_instruction = "\n\n# Next instruction\n\n" + text
+        instruction_tokens = estimate_tokens(next_instruction)
+        remaining_context_tokens = max(
+            0,
+            guard.limits.max_context_tokens
+            - guard.consumption.context_tokens,
+        )
+        context_limit = max(
+            1,
+            remaining_context_tokens
+            - instruction_tokens
+            - _handoff_prompt_reserve(remaining_context_tokens),
+        )
+        context_limits = replace(
+            guard.limits,
+            max_context_tokens=context_limit,
+        )
+        context = self._compile_context(session, context_limits, command_id)
         turn_ref = payload.get("turn_ref")
         if not isinstance(turn_ref, dict):
             turn_ref = {}
@@ -974,8 +1014,9 @@ class SessionWorker:
             handoff_block, handoff_metadata = await self._handoff_context(
                 session,
                 decision,
-                guard.limits,
+                guard,
                 context,
+                instruction_tokens,
             )
         prompt = text
         context_digest = ""
@@ -985,9 +1026,7 @@ class SessionWorker:
             "generation_digest"
         ]
         if not native_session_id or session.active_provider != decision.provider:
-            prompt = (
-                handoff_block + context.text + "\n\n# Next instruction\n\n" + text
-            )
+            prompt = handoff_block + context.text + next_instruction
             context_payload_digest = hashlib.sha256(
                 context.text.encode("utf-8")
             ).hexdigest()
@@ -2326,8 +2365,9 @@ class SessionWorker:
         self,
         session: Session,
         decision: RoutingDecision,
-        limits: SafetyLimits,
+        guard: TurnGuard,
         context: CompiledContext,
+        instruction_tokens: int,
     ) -> tuple[str, dict[str, Any]]:
         """Harness-generated handoff envelope for a provider switch.
 
@@ -2335,24 +2375,53 @@ class SessionWorker:
         never folded into the operator instruction or the digests the
         repeated-dispatch guard and attestation paths compute.
         """
+        limits = guard.limits
+        models = await self.scheduler.models(Path(session.worktree))
+        target_window = model_context_window(
+            models.get(decision.provider, ()),
+            decision.model,
+        )
+        committed_tokens = context.estimated_tokens + instruction_tokens
+        guard_context_budget = max(
+            0,
+            limits.max_context_tokens
+            - guard.consumption.context_tokens
+            - committed_tokens,
+        )
+        model_context_budget = handoff_token_budget(
+            target_window,
+            limits.max_output_tokens,
+            committed_tokens,
+        )
+        handoff_budget = min(guard_context_budget, model_context_budget)
+        separator_tokens = estimate_tokens("\n\n")
         attempts = self.store.attempts(self.session_id)
         if attempts:
             source_provider = session.active_provider
             if not source_provider:
                 source_provider = attempts[-1].provider
-            models = await self.scheduler.models(Path(session.worktree))
-            token_budget = handoff_token_budget(
-                model_context_window(
-                    models.get(decision.provider, ()),
-                    decision.model,
-                ),
-                limits.max_output_tokens,
-                context.estimated_tokens,
-            )
             transcript = project_transcript(
                 self.store,
                 self.session_id,
                 blobs=self.blobs,
+            )
+            empty_block = handoff_envelope(
+                session_id=self.session_id,
+                source_provider=source_provider,
+                target_provider=decision.provider,
+                target_model=decision.model,
+                transcript_digest=transcript.digest,
+                rendered="",
+            )
+            envelope_tokens = estimate_tokens(empty_block)
+            if handoff_budget <= envelope_tokens + separator_tokens:
+                return "", {}
+            render_budget = max(
+                1,
+                handoff_budget
+                - envelope_tokens
+                - separator_tokens
+                - 2,
             )
             block = handoff_envelope(
                 session_id=self.session_id,
@@ -2360,7 +2429,10 @@ class SessionWorker:
                 target_provider=decision.provider,
                 target_model=decision.model,
                 transcript_digest=transcript.digest,
-                rendered=render(transcript, RenderPolicy(token_budget=token_budget)),
+                rendered=render(
+                    transcript,
+                    RenderPolicy(token_budget=render_budget),
+                ),
             )
             metadata = {
                 "schema": HANDOFF_SCHEMA,
@@ -2373,13 +2445,20 @@ class SessionWorker:
                     block.encode("utf-8")
                 ).hexdigest(),
                 "blob_digest": self.blobs.put_text(block),
-                "token_budget": token_budget,
+                "token_budget": handoff_budget,
                 "rendered_tokens": (len(block) + 3) // 4,
             }
             return block + "\n\n", metadata
         seeded = self.store.seeded_handoff(self.session_id)
         if seeded:
-            block = self.blobs.get_text(str(seeded["blob_digest"]))
+            source_blob_digest = str(seeded["blob_digest"])
+            block = self.blobs.get_text(source_blob_digest)
+            block = _bounded_handoff_text(
+                block,
+                max(0, handoff_budget - separator_tokens),
+            )
+            if not block:
+                return "", {}
             metadata = {
                 "schema": HANDOFF_SCHEMA,
                 "origin": ORIGIN_FORK_SEED,
@@ -2390,7 +2469,10 @@ class SessionWorker:
                 "handoff_digest": hashlib.sha256(
                     block.encode("utf-8")
                 ).hexdigest(),
-                "blob_digest": str(seeded["blob_digest"]),
+                "blob_digest": self.blobs.put_text(block),
+                "source_blob_digest": source_blob_digest,
+                "token_budget": handoff_budget,
+                "rendered_tokens": estimate_tokens(block),
             }
             return block + "\n\n", metadata
         return "", {}
