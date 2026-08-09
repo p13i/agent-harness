@@ -355,7 +355,18 @@ class Scheduler:
             usage_sample = durable_usage.get(provider_id, {})
             safety_ready = status.ready
             if binding_ceiling is not None:
-                if binding is None and execution_profile != INTERACTIVE:
+                # Automatic routing stays fail-closed when binding
+                # telemetry is missing: an unknown sample must never
+                # be read as headroom. An explicitly pinned provider
+                # is a named capacity choice, so an unevaluable
+                # ceiling alone cannot refuse it. Known saturation
+                # still blocks the pin in the branch below.
+                pinned = provider == provider_id
+                if (
+                    binding is None
+                    and execution_profile != INTERACTIVE
+                    and not pinned
+                ):
                     safety_ready = False
                     gate_notes[provider_id] = (
                         RULE_BINDING_CEILING,

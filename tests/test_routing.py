@@ -1013,6 +1013,129 @@ def test_unattended_dispatch_rejects_when_the_probe_keeps_failing(
     asyncio.run(scenario())
 
 
+def test_unattended_pinned_provider_proceeds_when_binding_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Sibling of the automatic-routing case above: the same missing
+    # sample must keep failing closed there and admit the pin here.
+    failed = UsageSnapshot(
+        provider="codex",
+        binding_percent=None,
+        credits_engaged=False,
+        payload={},
+        error="HTTP 429",
+    )
+    probes = 0
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        nonlocal probes
+        probes += 1
+        return {"codex": failed}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        scheduler._usage_cache = {"codex": failed}
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        scheduler._model_cache = {
+            "codex": (
+                ProviderModel(
+                    "frontier",
+                    "Frontier",
+                    ("low", "medium"),
+                    100,
+                    default=True,
+                ),
+            )
+        }
+        current = session(tmp_path)
+        decision = await scheduler.choose(
+            current,
+            workload="implementation",
+            required_capabilities=frozenset({"tools"}),
+            provider="codex",
+            model="frontier",
+            effort="medium",
+            binding_ceiling=90,
+            execution_profile="unattended",
+        )
+        assert decision.provider == "codex"
+        assert decision.model == "frontier"
+        assert decision.effort == "medium"
+        # Missing telemetry stays missing in the routing record: it is
+        # never rewritten as headroom the harness did not observe.
+        assert decision.binding_percent is None
+        assert decision.ranked[0]["binding_percent"] is None
+        # One bounded refresh per admission check, never a tight loop.
+        assert probes == 1
+        # Every other gate still decides on its own evidence.
+        with pytest.raises(ProviderUnavailableError) as captured:
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset({"checkpoint"}),
+                provider="codex",
+                binding_ceiling=90,
+                execution_profile="unattended",
+            )
+        assert captured.value.rejected[0]["reason"] == (
+            "required capabilities are unavailable"
+        )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_unattended_pinned_provider_rejects_known_saturation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saturated = UsageSnapshot(
+        provider="codex",
+        binding_percent=95.0,
+        credits_engaged=False,
+        payload={},
+    )
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        return {"codex": saturated}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        scheduler = Scheduler(store, {"codex": FailingModelAdapter()})
+        scheduler._model_cache = {
+            "codex": (
+                ProviderModel(
+                    "frontier",
+                    "Frontier",
+                    ("low",),
+                    100,
+                    default=True,
+                ),
+            )
+        }
+        current = session(tmp_path)
+        with pytest.raises(ProviderUnavailableError) as captured:
+            await scheduler.choose(
+                current,
+                workload="implementation",
+                required_capabilities=frozenset(),
+                provider="codex",
+                binding_ceiling=90,
+                execution_profile="unattended",
+            )
+        # Same adapter, same models, same pin as the case above: only
+        # the known saturated sample differs, and the ceiling gate
+        # withholds readiness for it.
+        assert captured.value.rejected[0]["reason"] == "provider is not ready"
+        store.close()
+
+    asyncio.run(scenario())
+
+
 def test_scheduler_reuses_active_status_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

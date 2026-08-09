@@ -3404,6 +3404,63 @@ async def test_e2e_unattended_admission_requires_fresh_headroom(
 
 
 @pytest.mark.asyncio
+async def test_e2e_unattended_pinned_provider_dispatches_without_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rate_limited = {
+        "claude": UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="HTTP 429",
+        ),
+        "codex": UsageSnapshot(
+            provider="codex",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="HTTP 429",
+        ),
+    }
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        return rate_limited
+
+    monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+    rig = JourneyRig(tmp_path)
+    rig.store.set_session_safety(
+        rig.session.session_id,
+        "unattended",
+    )
+    rig.scheduler._usage_cache = dict(rate_limited)
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    try:
+        receipt = await rig.message(
+            "Run the unattended builder step.",
+            provider="claude",
+            model="claude-default",
+            effort="medium",
+        )
+
+        assert receipt.status == "complete", receipt.result
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [item.provider for item in attempts] == ["claude"]
+        assert attempts[0].model == "claude-default"
+        assert attempts[0].effort == "medium"
+        assert len(rig.adapters["claude"].prompts) == 1
+        assert not rig.adapters["codex"].prompts
+        routed = rig.store.routing_decisions(rig.session.session_id)
+        assert routed[0]["payload"]["binding_percent"] is None
+        proof = proof_snapshot(rig.store, rig.session.session_id)
+        assert proof["routing"][0]["binding_percent"] is None
+        assert proof["routing"][0]["admissible_at_route"] is False
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_retryable_provider_failure_keeps_session_claimable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
