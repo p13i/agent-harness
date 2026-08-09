@@ -195,13 +195,14 @@ class ReconciliationManager:
         if resuming_resolution and record.resolution != selected:
             raise ConflictError("reconciliation resolution is already in progress")
         if not resuming_resolution:
-            current_digest, unused_summary = await asyncio.to_thread(
-                inspect_workspace,
-                Path(session.worktree),
-            )
-            del unused_summary
-            if current_digest != observed_workspace_digest:
-                raise ConflictError("workspace changed after inspection")
+            if selected != ReconciliationDecision.STOP:
+                current_digest, unused_summary = await asyncio.to_thread(
+                    inspect_workspace,
+                    Path(session.worktree),
+                )
+                del unused_summary
+                if current_digest != observed_workspace_digest:
+                    raise ConflictError("workspace changed after inspection")
             if selected == ReconciliationDecision.RESTORE_PRE_TURN:
                 _require_restore_permission(
                     session.permission_mode,

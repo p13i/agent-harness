@@ -5257,6 +5257,17 @@ async def test_e2e_reconciliation_accepts_current_or_stops(
     )
     del unused_command
     try:
+        stop_workspace = Path(stop_rig.session.worktree)
+        (stop_workspace / "file.txt").write_text(
+            "changed after inspection\n",
+            encoding="utf-8",
+        )
+        (stop_workspace / "changed-after-inspection.txt").write_text(
+            "retain this material\n",
+            encoding="utf-8",
+        )
+        changed_digest = inspect_workspace(stop_workspace)[0]
+        assert changed_digest != stop_record.current_workspace_digest
         stopped = await stop_manager.resolve(
             stop_record.reconciliation_id,
             ReconciliationDecision.STOP,
@@ -5270,12 +5281,22 @@ async def test_e2e_reconciliation_accepts_current_or_stops(
         assert stopped_replay == stopped
         assert stopped.resolution == "stop"
         assert (
+            stopped.current_workspace_digest == stop_record.current_workspace_digest
+        )
+        assert stopped.audit["observed_workspace_digest"] == (
+            stop_record.current_workspace_digest
+        )
+        assert (
             stop_rig.store.get_session(stop_rig.session.session_id).lifecycle
             == "stopped"
         )
-        assert (Path(stop_rig.session.worktree) / "file.txt").read_text(
+        assert inspect_workspace(stop_workspace)[0] == changed_digest
+        assert (stop_workspace / "file.txt").read_text(encoding="utf-8") == (
+            "changed after inspection\n"
+        )
+        assert (stop_workspace / "changed-after-inspection.txt").read_text(
             encoding="utf-8"
-        ) == "ambiguous effect\n"
+        ) == "retain this material\n"
         with pytest.raises(ValueError):
             await stop_manager.resolve(
                 stop_record.reconciliation_id,
