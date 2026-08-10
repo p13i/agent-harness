@@ -82,7 +82,7 @@ from agent_harness.safety import (
     validate_profile,
 )
 from agent_harness.scheduler import Scheduler
-from agent_harness.storage import StateStore
+from agent_harness.storage import DISPATCH_TRANSITION_ANCHOR_KINDS, StateStore
 from agent_harness.transfer import load_machine_keys, open_transfer, seal_transfer
 from agent_harness.workspace import (
     checkpoint_workspace,
@@ -2160,11 +2160,7 @@ class HarnessService:
             )
             if not prior_command_type or len(prior_command_type) > 64:
                 raise ValueError("dispatch transition prior command type is invalid")
-            if prior_anchor_kind not in {
-                "provider-result",
-                "control-command",
-                "resolved-reconciliation",
-            }:
+            if prior_anchor_kind not in DISPATCH_TRANSITION_ANCHOR_KINDS:
                 raise ValueError("dispatch transition anchor kind is invalid")
             if prior_anchor_kind == "resolved-reconciliation":
                 require_uuid(

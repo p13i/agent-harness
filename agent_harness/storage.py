@@ -60,6 +60,14 @@ PROOF_SNAPSHOT_RETENTION_HOURS = 336
 TRANSITION_CONTROL_COMMANDS = frozenset(
     {"interrupt", "pause", "resume", "stop", "steer"}
 )
+DISPATCH_TRANSITION_ANCHOR_KINDS = frozenset(
+    {
+        "provider-result",
+        "control-command",
+        "resolved-reconciliation",
+        "terminal-checkpoint",
+    }
+)
 
 PORTABLE_SESSION_TABLES = (
     "sessions",
@@ -9016,6 +9024,117 @@ def _external_ref(
     }
 
 
+def _is_material_digest(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    return all(character in "0123456789abcdef" for character in value)
+
+
+def _dispatch_transition_terminal_checkpoint(
+    connection: sqlite3.Connection,
+    prior: sqlite3.Row,
+    result: dict[str, Any],
+    latest_checkpoint_id: str,
+    live_material_digest: str,
+) -> None:
+    """Validate a provider-terminal guard stop that certified a checkpoint.
+
+    An unattended guard can stop a provider after the turn already produced
+    a clean, certified checkpoint. The effect is not ambiguous, so no
+    reconciliation exists to anchor the next stage. This proves the soft
+    success instead: the failed command must claim provider terminality, own
+    the exact latest checkpoint and live material, hold exactly one failed
+    post-boundary dispatch and turn, and bypass no reconciliation.
+    """
+    command_id = str(prior["command_id"])
+    session_id = str(prior["session_id"])
+    if str(result.get("checkpoint_id", "")) != latest_checkpoint_id:
+        raise ConflictError("dispatch transition terminal checkpoint is not latest")
+    result_material = str(result.get("workspace_material_digest", ""))
+    if not _is_material_digest(result_material):
+        raise ConflictError("dispatch transition terminal material is invalid")
+    if result_material != live_material_digest:
+        raise ConflictError("dispatch transition terminal material is not current")
+    pending = connection.execute(
+        "SELECT COUNT(*) AS count FROM reconciliations WHERE command_id = ?",
+        (command_id,),
+    ).fetchone()
+    if pending is not None and int(pending["count"]) > 0:
+        raise ConflictError("dispatch transition terminal result has a reconciliation")
+    dispatches = connection.execute(
+        """
+        SELECT attempt_id, session_id, turn_id, state
+        FROM command_dispatches WHERE command_id = ? AND crossed_boundary = 1
+        ORDER BY created_at, attempt_id
+        """,
+        (command_id,),
+    ).fetchall()
+    if len(dispatches) != 1:
+        raise ConflictError("dispatch transition terminal boundary is not exact")
+    dispatch = dispatches[0]
+    if str(dispatch["session_id"]) != session_id:
+        raise ConflictError("dispatch transition terminal dispatch session changed")
+    if str(dispatch["state"]) != "failed":
+        raise ConflictError("dispatch transition terminal dispatch is not failed")
+    turn_id = str(dispatch["turn_id"])
+    turn = connection.execute(
+        "SELECT session_id, status FROM turns WHERE turn_id = ?",
+        (turn_id,),
+    ).fetchone()
+    if turn is None or str(turn["session_id"]) != session_id:
+        raise ConflictError("dispatch transition terminal turn is unknown")
+    if str(turn["status"]) != "failed":
+        raise ConflictError("dispatch transition terminal turn is not failed")
+    guard_events = connection.execute(
+        """
+        SELECT metadata_json FROM events
+        WHERE session_id = ? AND event_type = 'guard.tripped' AND turn_id = ?
+        ORDER BY sequence
+        """,
+        (session_id, turn_id),
+    ).fetchall()
+    matching_guards = [
+        item
+        for item in guard_events
+        if _dispatch_transition_terminal_receipt(item) == {
+            "command_id": command_id,
+            "attempt_id": str(dispatch["attempt_id"]),
+            "checkpoint_id": latest_checkpoint_id,
+            "provider_terminal": True,
+        }
+    ]
+    if len(matching_guards) != 1:
+        raise ConflictError("dispatch transition terminal guard receipt changed")
+    checkpoint_events = connection.execute(
+        """
+        SELECT metadata_json FROM events
+        WHERE session_id = ? AND event_type = 'checkpoint.created' AND turn_id = ?
+        ORDER BY sequence
+        """,
+        (session_id, turn_id),
+    ).fetchall()
+    matching_checkpoints = [
+        item
+        for item in checkpoint_events
+        if str(_load_object(str(item["metadata_json"])).get("checkpoint_id", ""))
+        == latest_checkpoint_id
+    ]
+    if len(matching_checkpoints) != 1:
+        raise ConflictError("dispatch transition terminal checkpoint receipt changed")
+
+
+def _dispatch_transition_terminal_receipt(
+    row: sqlite3.Row | dict[str, Any],
+) -> dict[str, Any]:
+    metadata = _load_object(str(row["metadata_json"]))
+    return {
+        "command_id": str(metadata.get("command_id", "")),
+        "attempt_id": str(metadata.get("attempt_id", "")),
+        "checkpoint_id": str(metadata.get("checkpoint_id", "")),
+        "provider_terminal": metadata.get("provider_terminal"),
+    }
+
+
 def _dispatch_transition_anchor(
     connection: sqlite3.Connection,
     prior: sqlite3.Row,
@@ -9039,6 +9158,19 @@ def _dispatch_transition_anchor(
         command_type in TRANSITION_CONTROL_COMMANDS
     ):
         anchor_kind = "control-command"
+    elif (
+        status == CommandStatus.FAILED
+        and result.get("code") == "E_SAFETY_GUARD"
+        and result.get("provider_terminal") is True
+    ):
+        _dispatch_transition_terminal_checkpoint(
+            connection,
+            prior,
+            result,
+            latest_checkpoint_id,
+            live_material_digest,
+        )
+        anchor_kind = "terminal-checkpoint"
     elif status == CommandStatus.FAILED and result.get("code") in {
         "E_NEEDS_RECONCILIATION",
         "E_SAFETY_GUARD",

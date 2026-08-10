@@ -1487,6 +1487,7 @@ components:
             - provider-result
             - control-command
             - resolved-reconciliation
+            - terminal-checkpoint
         prior_reconciliation_id:
           oneOf:
             - type: string

@@ -780,14 +780,27 @@ class SessionWorker:
                 consumption=guard.consumption.as_dict(),
                 guard_reason=getattr(error, "reason", ""),
             )
+            failed_result = {
+                "code": error.detail.code,
+                "message": error.detail.message,
+                "retryable": error.detail.retryable,
+            }
+            terminal_checkpoint_id = str(
+                getattr(error, "terminal_checkpoint_id", "")
+            )
+            terminal_material_digest = str(
+                getattr(error, "terminal_material_digest", "")
+            )
+            if terminal_checkpoint_id and terminal_material_digest:
+                failed_result["provider_terminal"] = True
+                failed_result["checkpoint_id"] = terminal_checkpoint_id
+                failed_result["workspace_material_digest"] = (
+                    terminal_material_digest
+                )
             self.store.resolve_command(
                 command.command_id,
                 CommandStatus.FAILED,
-                {
-                    "code": error.detail.code,
-                    "message": error.detail.message,
-                    "retryable": error.detail.retryable,
-                },
+                failed_result,
             )
             return
         self.store.complete_command_execution(
@@ -1773,6 +1786,8 @@ class SessionWorker:
             terminal_error = SafetyGuardError(
                 terminal_guard_reason,
                 decision.provider,
+                terminal_checkpoint_id=checkpoint.checkpoint_id,
+                terminal_material_digest=completed_material_digest,
             )
             if result.ambiguous_mutation:
                 reconciliation_id = await self._pause_for_ambiguous_dispatch(

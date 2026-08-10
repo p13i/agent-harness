@@ -109,6 +109,8 @@ class SafetyGuardError(HarnessError):
         provider: str,
         *,
         recoverable: bool = False,
+        terminal_checkpoint_id: str = "",
+        terminal_material_digest: str = "",
     ) -> None:
         super().__init__(
             "E_SAFETY_GUARD",
@@ -119,6 +121,11 @@ class SafetyGuardError(HarnessError):
         self.reason = reason
         self.provider = provider
         self.recoverable = recoverable
+        # A guard that stops an unambiguous, already-certified turn leaves the
+        # provider terminal. The checkpoint and material identity travel with
+        # the error so the command result can record that soft success.
+        self.terminal_checkpoint_id = terminal_checkpoint_id
+        self.terminal_material_digest = terminal_material_digest
 
 
 class PolicyBlockedError(HarnessError):

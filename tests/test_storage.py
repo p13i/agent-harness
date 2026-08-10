@@ -45,6 +45,7 @@ from agent_harness.sync import (
     sync_repository,
 )
 from agent_harness.workspace import create_worktree
+from agent_harness.workspace_state import inspect_workspace
 
 
 def test_proof_snapshots_retain_bound_ids_and_fail_closed_at_quota(
@@ -1929,6 +1930,402 @@ def test_dispatch_transition_anchor_projects_fail_closed_reasons(
     assert anchor["eligible"] is False
     assert anchor["reason"] == ("dispatch transition prior command is not eligible")
     store.close()
+
+
+class TerminalGuardState:
+    """A failed unattended guard stop that left a certified checkpoint."""
+
+    def __init__(
+        self,
+        store: StateStore,
+        created: Any,
+        workspace: Path,
+        command_id: str,
+        attempt_id: str,
+        turn_id: str,
+        checkpoint: Checkpoint,
+        material_digest: str,
+    ) -> None:
+        self.store = store
+        self.session = created
+        self.workspace = workspace
+        self.command_id = command_id
+        self.attempt_id = attempt_id
+        self.turn_id = turn_id
+        self.checkpoint = checkpoint
+        self.material_digest = material_digest
+
+    def anchor(self) -> dict[str, Any]:
+        return self.store.dispatch_transition_anchor(self.session.session_id)
+
+    def reason(self) -> str:
+        return str(self.anchor()["reason"])
+
+    def set_result(self, **overrides: Any) -> None:
+        result = {
+            "code": "E_SAFETY_GUARD",
+            "message": "execution safety guard stopped kimi: context-window",
+            "retryable": False,
+            "provider_terminal": True,
+            "checkpoint_id": self.checkpoint.checkpoint_id,
+            "workspace_material_digest": self.material_digest,
+        }
+        result.update(overrides)
+        self.store.resolve_command(
+            self.command_id,
+            CommandStatus.FAILED,
+            result,
+        )
+
+    def execute(self, statement: str, parameters: tuple[Any, ...]) -> None:
+        with self.store.transaction() as connection:
+            connection.execute(statement, parameters)
+
+
+def _terminal_guard_state(root: Path, name: str) -> TerminalGuardState:
+    workspace = root / (name + "-workspace")
+    _workspace_repository(workspace)
+    store = StateStore(root / (name + ".sqlite3"))
+    created = replace(
+        session(workspace),
+        external_ref={
+            "orchestrator": "p13i/machines/cs-builder",
+            "job_id": name,
+        },
+    )
+    store.create_session(created)
+    store.create_goal(
+        create_goal(
+            created.session_id,
+            "Hand a terminal builder checkpoint to the review stage.",
+            constraints=("dispatch-generation-transition-epoch:test-epoch",),
+        )
+    )
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "implement the stage", "provider": "kimi"},
+        name + "-implement",
+    )
+    assert store.claim_command(created.session_id) is not None
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="kimi",
+        native_session_id="kimi-native",
+        model="default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    store.create_attempt(attempt)
+    turn_id = store.start_turn(created.session_id, attempt.attempt_id)
+    pre_dispatch = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=store.last_sequence(created.session_id),
+        provider="kimi",
+        native_session_id="kimi-native",
+        base_commit=_git(workspace, "rev-parse", "HEAD"),
+        patch_digest="pre-patch",
+        untracked_digest="pre-untracked",
+        context_digest="pre-context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(pre_dispatch)
+    store.record_dispatch_checkpoint(
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        pre_dispatch.checkpoint_id,
+    )
+    store.mark_provider_boundary(attempt.attempt_id)
+    (workspace / "implemented.txt").write_text(
+        "productive implementation\n",
+        encoding="utf-8",
+    )
+    material_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    certified = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=pre_dispatch.sequence + 1,
+        provider="kimi",
+        native_session_id="kimi-native",
+        base_commit=_git(workspace, "rev-parse", "HEAD"),
+        patch_digest="certified-patch",
+        untracked_digest="certified-untracked",
+        context_digest="certified-context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(certified)
+    store.append_event(
+        created.session_id,
+        "checkpoint.created",
+        status="complete",
+        metadata=certified.as_dict(),
+        turn_id=turn_id,
+    )
+    store.append_event(
+        created.session_id,
+        "guard.tripped",
+        status="failed",
+        metadata={
+            "command_id": command.command_id,
+            "attempt_id": attempt.attempt_id,
+            "reason": "context-window",
+            "action": "pause",
+            "snapshot": {},
+            "provider_terminal": True,
+            "checkpoint_id": certified.checkpoint_id,
+        },
+        turn_id=turn_id,
+    )
+    store.update_attempt(attempt.attempt_id, status="failed")
+    store.finish_turn(turn_id, "failed")
+    store.complete_dispatch(attempt.attempt_id, "failed")
+    store.update_session(
+        created.session_id,
+        lifecycle="paused",
+        attention="needs-input",
+    )
+    state = TerminalGuardState(
+        store,
+        created,
+        workspace,
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        certified,
+        material_digest,
+    )
+    state.set_result()
+    return state
+
+
+def test_terminal_checkpoint_anchor_certifies_a_provider_terminal_guard_stop(
+    tmp_path: Path,
+) -> None:
+    state = _terminal_guard_state(tmp_path, "terminal-anchor")
+    anchor = state.anchor()
+
+    assert anchor["eligible"] is True
+    assert anchor["reason"] == ""
+    assert anchor["prior_anchor_kind"] == "terminal-checkpoint"
+    assert anchor["prior_command_type"] == "message"
+    assert anchor["prior_command_id"] == state.command_id
+    assert anchor["prior_command_status"] == CommandStatus.FAILED
+    assert anchor["prior_checkpoint_id"] == state.checkpoint.checkpoint_id
+    assert anchor["prior_material_digest"] == state.material_digest
+    assert anchor["prior_reconciliation_id"] == ""
+    assert anchor["prior_reconciliation_resolution"] == ""
+    assert state.store.pending_reconciliations(state.session.session_id) == []
+    state.store.close()
+
+
+def test_terminal_checkpoint_anchor_rejects_every_unproven_boundary(
+    tmp_path: Path,
+) -> None:
+    state = _terminal_guard_state(tmp_path, "terminal-boundary")
+
+    state.set_result(checkpoint_id=new_uuid())
+    assert state.reason() == ("dispatch transition terminal checkpoint is not latest")
+    state.set_result(workspace_material_digest="short")
+    assert state.reason() == "dispatch transition terminal material is invalid"
+    state.set_result(workspace_material_digest="f" * 64)
+    assert state.reason() == ("dispatch transition terminal material is not current")
+    state.set_result(code="E_NEEDS_RECONCILIATION")
+    assert state.reason() == "dispatch transition requires exactly one reconciliation"
+    state.set_result(provider_terminal=False)
+    assert state.reason() == "dispatch transition requires exactly one reconciliation"
+    state.set_result(code="E_PROVIDER_NO_PROGRESS")
+    assert state.reason() == "dispatch transition prior command is not eligible"
+    state.set_result()
+    assert state.anchor()["eligible"] is True
+
+    (state.workspace / "drifted.txt").write_text("drift\n", encoding="utf-8")
+    assert state.reason() == ("dispatch transition terminal material is not current")
+    (state.workspace / "drifted.txt").unlink()
+    assert state.anchor()["eligible"] is True
+
+    state.execute(
+        """
+        INSERT INTO reconciliations VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            new_uuid(),
+            state.session.session_id,
+            state.command_id,
+            state.checkpoint.checkpoint_id,
+            state.material_digest,
+            "pending material",
+            "[]",
+            "{}",
+            "pending",
+            "",
+            "{}",
+            utc_now(),
+            "",
+        ),
+    )
+    assert state.reason() == (
+        "dispatch transition terminal result has a reconciliation"
+    )
+    state.execute(
+        "DELETE FROM reconciliations WHERE command_id = ?",
+        (state.command_id,),
+    )
+
+    state.execute(
+        "UPDATE command_dispatches SET crossed_boundary = 0 WHERE command_id = ?",
+        (state.command_id,),
+    )
+    assert state.reason() == "dispatch transition terminal boundary is not exact"
+    state.execute(
+        "UPDATE command_dispatches SET crossed_boundary = 1 WHERE command_id = ?",
+        (state.command_id,),
+    )
+    other_session = session(state.workspace)
+    state.store.create_session(other_session)
+    state.execute(
+        "UPDATE command_dispatches SET session_id = ? WHERE command_id = ?",
+        (other_session.session_id, state.command_id),
+    )
+    assert state.reason() == ("dispatch transition terminal dispatch session changed")
+    state.execute(
+        "UPDATE command_dispatches SET session_id = ? WHERE command_id = ?",
+        (state.session.session_id, state.command_id),
+    )
+    state.execute(
+        "UPDATE command_dispatches SET state = 'interrupted' WHERE command_id = ?",
+        (state.command_id,),
+    )
+    assert state.reason() == "dispatch transition terminal dispatch is not failed"
+    state.execute(
+        "UPDATE command_dispatches SET state = 'failed' WHERE command_id = ?",
+        (state.command_id,),
+    )
+
+    state.execute(
+        "UPDATE turns SET session_id = ? WHERE turn_id = ?",
+        (new_uuid(), state.turn_id),
+    )
+    assert state.reason() == "dispatch transition terminal turn is unknown"
+    state.execute(
+        "UPDATE turns SET session_id = ? WHERE turn_id = ?",
+        (state.session.session_id, state.turn_id),
+    )
+    state.execute(
+        "UPDATE turns SET status = 'ambiguous' WHERE turn_id = ?",
+        (state.turn_id,),
+    )
+    assert state.reason() == "dispatch transition terminal turn is not failed"
+    state.execute(
+        "UPDATE turns SET status = 'failed' WHERE turn_id = ?",
+        (state.turn_id,),
+    )
+
+    state.execute(
+        """
+        UPDATE events SET metadata_json = ?
+        WHERE session_id = ? AND event_type = 'guard.tripped'
+        """,
+        (
+            json.dumps({"command_id": state.command_id}, sort_keys=True),
+            state.session.session_id,
+        ),
+    )
+    assert state.reason() == "dispatch transition terminal guard receipt changed"
+    state.execute(
+        """
+        UPDATE events SET metadata_json = ?
+        WHERE session_id = ? AND event_type = 'guard.tripped'
+        """,
+        (
+            json.dumps(
+                {
+                    "command_id": state.command_id,
+                    "attempt_id": state.attempt_id,
+                    "checkpoint_id": state.checkpoint.checkpoint_id,
+                    "provider_terminal": True,
+                },
+                sort_keys=True,
+            ),
+            state.session.session_id,
+        ),
+    )
+    assert state.anchor()["eligible"] is True
+
+    state.execute(
+        "DELETE FROM events WHERE session_id = ? AND event_type = 'checkpoint.created'",
+        (state.session.session_id,),
+    )
+    assert state.reason() == ("dispatch transition terminal checkpoint receipt changed")
+    state.store.close()
+
+
+def test_needs_reconciliation_still_requires_one_resolved_reconciliation(
+    tmp_path: Path,
+) -> None:
+    state = _terminal_guard_state(tmp_path, "terminal-reconciliation")
+    state.set_result(
+        code="E_NEEDS_RECONCILIATION",
+        provider_terminal=True,
+    )
+    reconciliation_id = new_uuid()
+    state.execute(
+        """
+        INSERT INTO reconciliations VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            reconciliation_id,
+            state.session.session_id,
+            state.command_id,
+            state.checkpoint.checkpoint_id,
+            state.material_digest,
+            "ambiguous material",
+            "[]",
+            "{}",
+            "pending",
+            "",
+            "{}",
+            utc_now(),
+            "",
+        ),
+    )
+
+    assert state.reason() == "dispatch transition reconciliation is unresolved"
+    state.execute(
+        """
+        UPDATE reconciliations SET status = 'resolved', resolution = 'accept-current',
+            audit_json = ?, resolved_at = ?
+        WHERE reconciliation_id = ?
+        """,
+        (
+            json.dumps(
+                {
+                    "resolution_checkpoint_id": state.checkpoint.checkpoint_id,
+                    "resolution_workspace_digest": state.material_digest,
+                },
+                sort_keys=True,
+            ),
+            utc_now(),
+            reconciliation_id,
+        ),
+    )
+    anchor = state.anchor()
+
+    assert anchor["eligible"] is True
+    assert anchor["prior_anchor_kind"] == "resolved-reconciliation"
+    assert anchor["prior_reconciliation_id"] == reconciliation_id
+    assert anchor["prior_reconciliation_resolution"] == "accept-current"
+    state.store.close()
 
 
 def test_idempotent_mutation_serializes_and_rolls_back_nested_state(

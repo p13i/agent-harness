@@ -564,7 +564,7 @@
     },
     {
       "id": "AH-AC-069",
-      "title": "Expose and consume exact provider, control, and resolved-reconciliation transition anchors",
+      "title": "Expose and consume exact provider, control, resolved-reconciliation, and terminal-checkpoint transition anchors",
       "local_evidence": [
         "//tests:e2e_tests",
         "//tests:unit_tests",

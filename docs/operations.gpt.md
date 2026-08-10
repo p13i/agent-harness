@@ -529,7 +529,21 @@ exactly one resolved reconciliation, an `accept-current` or
 `restore-pre-turn` decision, and its latest resolution
 checkpoint. Its protected `resolution_workspace_digest` must
 equal the current live material before the anchor is
-eligible. The proof snapshot exposes the current prompt-free
+eligible. A `terminal-checkpoint` anchor covers the soft
+success where an unattended guard stops a provider after the
+turn already certified a clean checkpoint. It requires a
+failed `E_SAFETY_GUARD` message whose result declares the
+provider terminal and carries the exact latest checkpoint
+and a valid material digest equal to the current live
+material. That command must own exactly one failed
+post-boundary dispatch and its failed turn, one matching
+terminal `guard.tripped` receipt, one matching
+`checkpoint.created` receipt, and no reconciliation. The
+harness never synthesizes, resolves, or skips a
+reconciliation: `E_NEEDS_RECONCILIATION`, a nonterminal
+result, an interrupted or ambiguous dispatch, a stale
+checkpoint, or drifted live material stays ineligible. The
+proof snapshot exposes the current prompt-free
 `transition_anchor`, including its eligibility, goal, epoch,
 checkpoint, material, generation, and reconciliation
 bindings. Storage independently revalidates those bindings
