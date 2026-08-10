@@ -2342,6 +2342,146 @@ class StateStore:
             ).fetchone()
         return _command(row)
 
+    def stop_session(
+        self,
+        session_id: str,
+        *,
+        stop_command_id: str = "",
+        active_command_id: str = "",
+    ) -> dict[str, Any]:
+        """Stop a session and release its unaccepted provider commands.
+
+        A stopped session keeps no worker, so any command still queued
+        or claimed would hold its safety envelope in an active state
+        forever and consume provider concurrency. This terminalizes
+        those commands as cancelled and releases their envelopes in the
+        same transaction that marks the session stopped. Commands that
+        already crossed the provider boundary are left for
+        reconciliation, and checkpoints, events, and workspace material
+        are untouched.
+        """
+        now = utc_now()
+        released: list[dict[str, Any]] = []
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT command_id, command_type, status FROM commands
+                WHERE session_id = ? AND status IN (?, ?, ?)
+                ORDER BY created_at, command_id
+                """,
+                (
+                    session_id,
+                    CommandStatus.QUEUED,
+                    CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                    CommandStatus.DISPATCHING,
+                ),
+            ).fetchall()
+            sequence_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) AS sequence
+                FROM events WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            sequence = int(sequence_row["sequence"])
+            for row in rows:
+                command_id = str(row["command_id"])
+                if command_id in {stop_command_id, active_command_id}:
+                    continue
+                if str(row["command_type"]) in TRANSITION_CONTROL_COMMANDS:
+                    continue
+                if self._command_crossed_provider_boundary(
+                    connection,
+                    command_id,
+                ):
+                    continue
+                prior_status = str(row["status"])
+                result = {
+                    "code": "E_SESSION_STOPPED",
+                    "message": ("session stopped before the command was accepted"),
+                    "accepted": False,
+                    "prior_status": prior_status,
+                }
+                cursor = connection.execute(
+                    """
+                    UPDATE commands SET status = ?, result_json = ?,
+                        updated_at = ? WHERE command_id = ? AND status = ?
+                    """,
+                    (
+                        CommandStatus.CANCELLED,
+                        _dump(result),
+                        now,
+                        command_id,
+                        prior_status,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE command_envelopes SET state = 'released',
+                        guard_reason = 'session-stopped', updated_at = ?
+                    WHERE command_id = ?
+                    """,
+                    (now, command_id),
+                )
+                entry = {
+                    "command_id": command_id,
+                    "command_type": str(row["command_type"]),
+                    "prior_status": prior_status,
+                    "reason": "session-stopped",
+                    "accepted": False,
+                }
+                sequence += 1
+                connection.execute(
+                    """
+                    INSERT INTO events(
+                        session_id, sequence, event_id, event_type, role,
+                        text, status, metadata_json, blob_digest, turn_id,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, '', '', ?, ?, '', '', ?)
+                    """,
+                    (
+                        session_id,
+                        sequence,
+                        new_uuid(),
+                        "command.released",
+                        CommandStatus.CANCELLED,
+                        _dump(entry),
+                        now,
+                    ),
+                )
+                released.append(entry)
+            cursor = connection.execute(
+                """
+                UPDATE sessions SET lifecycle = ?, attention = ?,
+                    updated_at = ? WHERE session_id = ?
+                """,
+                (Lifecycle.STOPPED, Attention.IDLE, now, session_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("session")
+        return {
+            "session": self.get_session(session_id).as_dict(),
+            "released_commands": released,
+        }
+
+    def _command_crossed_provider_boundary(
+        self,
+        connection: sqlite3.Connection,
+        command_id: str,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM command_dispatches
+            WHERE command_id = ? AND crossed_boundary = 1
+            """,
+            (command_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return int(row["count"]) > 0
+
     def xhigh_authorization_or_park(
         self,
         command_id: str,

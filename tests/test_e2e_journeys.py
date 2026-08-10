@@ -1099,6 +1099,164 @@ async def test_worker_controls_interrupt_steer_pause_resume_and_stop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("implementation_status", ["queued", "dispatching"])
+async def test_stop_releases_an_unaccepted_command_and_frees_the_route(
+    tmp_path: Path,
+    implementation_status: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _repository(workspace)
+    harness_paths = paths(tmp_path / "state")
+    prepare_paths(harness_paths)
+    store = StateStore(harness_paths.database)
+    blobs = BlobStore(harness_paths.blobs)
+    created = session(workspace)
+    store.create_session(created)
+    store.set_session_safety(created.session_id, "unattended")
+    adapters: dict[str, ProviderAdapter] = {"kimi": ScriptedAdapter("kimi")}
+    scheduler = Scheduler(store, adapters)
+    scheduler._usage_cache = {"kimi": _usage("kimi", 20.0)}
+    scheduler._usage_at = asyncio.get_running_loop().time()
+    worker = SessionWorker(
+        store,
+        blobs,
+        scheduler,
+        adapters,
+        created.session_id,
+    )
+    store.register_worker(created.session_id, 123, worker.incarnation)
+    checkpoint = checkpoint_workspace(
+        created,
+        blobs,
+        sequence=store.last_sequence(created.session_id),
+        provider="kimi",
+        native_session_id="kimi-native",
+        context_text="context",
+    )
+    store.add_checkpoint(checkpoint)
+    try:
+        implementation = store.enqueue_command(
+            created.session_id,
+            "message",
+            {"text": "implement the change"},
+            "kimi-implementation",
+        )
+        store.create_command_envelope(
+            implementation.command_id,
+            created.session_id,
+            "unattended",
+            {"max_seconds": 900},
+        )
+        store.update_command_envelope(
+            implementation.command_id,
+            provider="kimi",
+        )
+        if implementation_status == "dispatching":
+            claimed_implementation = store.claim_command(created.session_id)
+            assert claimed_implementation is not None
+            assert claimed_implementation.command_id == implementation.command_id
+        assert store.active_unattended_provider_count("kimi") == 1
+        follower = session(workspace)
+        store.create_session(follower)
+        store.set_session_safety(follower.session_id, "unattended")
+        next_command = store.enqueue_command(
+            follower.session_id,
+            "message",
+            {"text": "implement the next change"},
+            "kimi-next-implementation",
+        )
+        store.create_command_envelope(
+            next_command.command_id,
+            follower.session_id,
+            "unattended",
+            {"max_seconds": 900},
+        )
+
+        async def route_next() -> Any:
+            return await scheduler.choose(
+                store.get_session(follower.session_id),
+                workload="implementation",
+                required_capabilities=frozenset(),
+                execution_profile="unattended",
+                enforce_concurrency=True,
+                command_id=next_command.command_id,
+            )
+
+        with pytest.raises(ProviderUnavailableError):
+            await route_next()
+
+        stop = store.enqueue_command(
+            created.session_id,
+            "stop",
+            {},
+            "kimi-stop",
+        )
+        claimed = store.claim_command(
+            created.session_id,
+            frozenset({"stop"}),
+        )
+        assert claimed is not None
+        await worker._control(claimed)
+
+        released = store.get_command(implementation.command_id)
+        assert released.status == "cancelled"
+        assert released.result["code"] == "E_SESSION_STOPPED"
+        assert released.result["accepted"] is False
+        assert released.result["prior_status"] == implementation_status
+        envelope = store.command_envelope(implementation.command_id)
+        assert envelope["state"] == "released"
+        assert envelope["guard_reason"] == "session-stopped"
+        assert store.active_unattended_provider_count("kimi") == 0
+        assert store.get_session(created.session_id).lifecycle == "stopped"
+        stop_receipt = store.get_command(stop.command_id)
+        assert stop_receipt.status == "complete"
+        assert [
+            entry["command_id"] for entry in stop_receipt.result["released_commands"]
+        ] == [implementation.command_id]
+        event_types = [
+            event.event_type for event in store.events(created.session_id)
+        ]
+        assert "command.released" in event_types
+        assert "session.stopped" in event_types
+        assert [
+            record.checkpoint_id for record in store.checkpoints(created.session_id)
+        ] == [checkpoint.checkpoint_id]
+
+        decision = await route_next()
+        assert decision.provider == "kimi"
+        assert store.get_command(next_command.command_id).status == "queued"
+
+        repeat = store.enqueue_command(
+            created.session_id,
+            "stop",
+            {},
+            "kimi-stop-again",
+        )
+        replacement = SessionWorker(
+            store,
+            blobs,
+            scheduler,
+            adapters,
+            created.session_id,
+        )
+        store.register_worker(
+            created.session_id,
+            124,
+            replacement.incarnation,
+        )
+        await replacement._loop()
+        repeat_receipt = store.get_command(repeat.command_id)
+        assert repeat_receipt.status == "complete"
+        assert repeat_receipt.result["released_commands"] == []
+        assert store.get_session(created.session_id).lifecycle == "stopped"
+        assert store.get_command(implementation.command_id).result == (
+            released.result
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_worker_run_surfaces_restart_recovery_states(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
