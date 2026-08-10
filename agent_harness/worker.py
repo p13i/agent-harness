@@ -100,7 +100,7 @@ from agent_harness.safety import (
     tighten_limits,
 )
 from agent_harness.scheduler import Scheduler
-from agent_harness.storage import StateStore
+from agent_harness.storage import STOPPED_SESSION_COMMANDS, StateStore
 from agent_harness.sync import publish_session
 from agent_harness.transcript import (
     DEFAULT_TOKEN_BUDGET,
@@ -112,7 +112,6 @@ from agent_harness.workspace import checkpoint_workspace, workspace_summary
 from agent_harness.workspace_state import inspect_workspace
 
 CONTROL_COMMANDS = frozenset({"interrupt", "pause", "resume", "stop", "steer"})
-STOP_COMMANDS = frozenset({"stop"})
 APPROVAL_POLL_LIMIT = 3600
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
@@ -380,14 +379,24 @@ class SessionWorker:
         )
 
     async def _loop(self) -> None:
-        while not self._stopping:
+        while True:
             if not self._maintain_worker_ownership():
                 return
             session = self.store.get_session(self.session_id)
             if session.lifecycle == Lifecycle.STOPPED:
-                # A stopped session keeps no worker, so a repeated stop
-                # would stay queued forever. Resolve it here instead.
-                await self._resolve_pending_stops()
+                # A stopped session keeps no worker, so a control left
+                # queued here would never be claimed. Drain what a
+                # stopped session still admits, and keep running when a
+                # resume reactivates the session. This precedes the
+                # stopping flag on purpose: the stop control sets that
+                # flag while this worker is still the registered one,
+                # and a resume admitted in that window would be handed
+                # to a worker that had already left the loop.
+                reactivated = await self._drain_stopped_session()
+                if reactivated:
+                    continue
+                return
+            if self._stopping:
                 return
             if session.lifecycle in {
                 Lifecycle.COMPLETED,
@@ -437,15 +446,33 @@ class SessionWorker:
                 },
             )
 
-    async def _resolve_pending_stops(self) -> None:
+    async def _drain_stopped_session(self) -> bool:
+        """Resolve the controls a stopped session admits.
+
+        Returns True when a resume reactivated the session and this
+        worker must keep claiming for it. Returns False only after the
+        store retired this registration in the same transaction that
+        found the queue empty, so a control enqueued during the drain
+        either lands before that check or reaches a fresh worker.
+        """
+
         while True:
             control = self.store.claim_command(
                 self.session_id,
-                STOP_COMMANDS,
+                STOPPED_SESSION_COMMANDS,
             )
             if control is None:
-                return
+                retired = self.store.retire_worker(
+                    self.session_id,
+                    self.incarnation,
+                    STOPPED_SESSION_COMMANDS,
+                )
+                if retired:
+                    return False
+                continue
             await self._control(control)
+            if control.command_type == "resume":
+                return True
 
     def _maintain_worker_ownership(self, *, force: bool = False) -> bool:
         observed_at = time.monotonic()
@@ -2240,6 +2267,9 @@ class SessionWorker:
                 attention=Attention.IDLE,
             )
         elif command.command_type == "resume":
+            # A resume claimed behind a stop supersedes it, so the
+            # session returns to running and keeps this worker.
+            self._stopping = False
             self.store.update_session(
                 self.session_id,
                 lifecycle=Lifecycle.RUNNING,

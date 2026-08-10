@@ -627,6 +627,17 @@ sessions are rediscovered and their workers resume ordered
 commands from SQLite. The export projections can be
 regenerated at any time.
 
+A terminal session keeps no worker, so the harness refuses
+any command it could not hand to one. A stopped session
+admits only `resume`; every other control and every message
+is rejected with `E_CONFLICT` and leaves no receipt. A
+completed or failed session admits nothing. Stopping also
+cancels the commands that raced the transition, so no queued
+command survives a stop. The queued resume returns the
+session to `running` through the one worker that drains it,
+and worker supervision starts that worker for a stopped
+session whose resume is still queued after a restart.
+
 If a provider mutation has an ambiguous result, the session
 enters reconciliation instead of replaying the mutation on
 another provider. Read-only or clearly unstarted work can

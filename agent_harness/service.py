@@ -82,7 +82,11 @@ from agent_harness.safety import (
     validate_profile,
 )
 from agent_harness.scheduler import Scheduler
-from agent_harness.storage import DISPATCH_TRANSITION_ANCHOR_KINDS, StateStore
+from agent_harness.storage import (
+    DISPATCH_TRANSITION_ANCHOR_KINDS,
+    STOPPED_SESSION_COMMANDS,
+    StateStore,
+)
 from agent_harness.transfer import load_machine_keys, open_transfer, seal_transfer
 from agent_harness.workspace import (
     checkpoint_workspace,
@@ -117,9 +121,10 @@ class WorkerManager:
             "unrecovered": [],
         }
 
-    def ensure(self, session_id: str) -> None:
+    def ensure(self, session_id: str, *, force: bool = False) -> None:
         process = self._processes.get(session_id)
-        if process is not None and process.poll() is None:
+        live = process is not None and process.poll() is None
+        if live and not force:
             return
         command = [
             *launcher_command(),
@@ -678,11 +683,7 @@ class HarnessService:
         session_ids: list[str] = []
         for session in self.store.list_sessions():
             session = self._name_session_from_history(session)
-            if session.lifecycle not in {
-                Lifecycle.PAUSED,
-                Lifecycle.STARTING,
-                Lifecycle.RUNNING,
-            }:
+            if not self._needs_worker(session):
                 continue
             if session.session_id in blocked_sessions:
                 continue
@@ -690,6 +691,27 @@ class HarnessService:
                 continue
             session_ids.append(session.session_id)
         return sorted(session_ids)
+
+    def _needs_worker(self, session: Session) -> bool:
+        """Report whether supervision must keep a worker for a session.
+
+        A stopped session keeps no worker of its own, but a resume
+        queued for one has to reach a worker even when the service
+        restarted between the enqueue and the claim.
+        """
+
+        if session.lifecycle in {
+            Lifecycle.PAUSED,
+            Lifecycle.STARTING,
+            Lifecycle.RUNNING,
+        }:
+            return True
+        if session.lifecycle != Lifecycle.STOPPED:
+            return False
+        return self.store.queued_command_exists(
+            session.session_id,
+            STOPPED_SESSION_COMMANDS,
+        )
 
     def _worker_session_pairs(
         self,
@@ -1690,8 +1712,24 @@ class HarnessService:
             normalized_payload,
             idempotency_key,
         )
-        self.workers.ensure(session_id)
+        self._ensure_control_worker(session_id)
         return receipt.as_dict()
+
+    def _ensure_control_worker(self, session_id: str) -> None:
+        """Start the worker that must claim a freshly queued control.
+
+        A stopped session normally keeps no worker, and a worker that
+        drained its queue retires its registration a moment before its
+        process exits. A resume enqueued in that window must not be
+        handed to the exiting process, so an unregistered stopped
+        session forces a replacement worker.
+        """
+
+        force = False
+        session = self.store.get_session(session_id)
+        if session.lifecycle == Lifecycle.STOPPED:
+            force = not self.store.worker_registered(session_id)
+        self.workers.ensure(session_id, force=force)
 
     def resolve_approval(
         self,

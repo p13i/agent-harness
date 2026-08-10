@@ -4712,3 +4712,191 @@ def test_active_turn_seconds_and_countable_turn_count(tmp_path: Path) -> None:
     assert store.countable_turn_count(created.session_id) == 2
     assert store.active_turn_seconds(created.session_id, now) == 90.0
     store.close()
+
+
+def _command_rows(store: StateStore, session_id: str) -> list[tuple[str, str]]:
+    with store.transaction() as connection:
+        rows = connection.execute(
+            """
+            SELECT command_type, status FROM commands
+            WHERE session_id = ? ORDER BY created_at, command_id
+            """,
+            (session_id,),
+        ).fetchall()
+    return [(str(row["command_type"]), str(row["status"])) for row in rows]
+
+
+def test_terminal_sessions_admit_only_a_stopped_session_resume(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    racing = store.enqueue_command(
+        created.session_id,
+        "interrupt",
+        {},
+        "interrupt-racing-the-stop",
+    )
+    store.stop_session(created.session_id)
+    cancelled = store.get_command(racing.command_id)
+    assert cancelled.status == CommandStatus.CANCELLED
+    assert cancelled.result["code"] == "E_SESSION_STOPPED"
+    assert cancelled.result["accepted"] is False
+
+    for command_type in ("interrupt", "pause", "steer", "stop"):
+        with pytest.raises(ConflictError, match="admits only a resume command"):
+            store.enqueue_command(
+                created.session_id,
+                command_type,
+                {},
+                "stopped-" + command_type,
+            )
+    with pytest.raises(ConflictError, match="admits only a resume command"):
+        store.ensure_message_command(
+            created.session_id,
+            {"text": "after the stop"},
+            "stopped-message",
+        )
+    assert _command_rows(store, created.session_id) == [
+        ("interrupt", CommandStatus.CANCELLED),
+    ]
+    assert store.claim_command(created.session_id) is None
+
+    resume = store.enqueue_command(
+        created.session_id,
+        "resume",
+        {},
+        "stopped-resume",
+    )
+    assert resume.status == CommandStatus.QUEUED
+    repeated = store.enqueue_command(
+        created.session_id,
+        "resume",
+        {},
+        "stopped-resume",
+    )
+    assert repeated.command_id == resume.command_id
+    assert _command_rows(store, created.session_id) == [
+        ("interrupt", CommandStatus.CANCELLED),
+        ("resume", CommandStatus.QUEUED),
+    ]
+
+    for lifecycle in ("completed", "failed"):
+        store.update_session(created.session_id, lifecycle=lifecycle)
+        with pytest.raises(ConflictError, match="admits no commands"):
+            store.enqueue_command(
+                created.session_id,
+                "resume",
+                {},
+                lifecycle + "-resume",
+            )
+    store.close()
+
+
+def test_a_terminal_session_never_requeues_a_retryable_failure(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    live = session(tmp_path)
+    stopped = session(tmp_path)
+    store.create_session(live)
+    store.create_session(stopped)
+    for created in (live, stopped):
+        command = store.enqueue_command(
+            created.session_id,
+            "message",
+            {"text": "retry me"},
+            "retryable-" + created.session_id,
+        )
+        store.resolve_command(
+            command.command_id,
+            CommandStatus.FAILED,
+            {"retryable": True},
+        )
+    store.stop_session(stopped.session_id)
+
+    requeued = store.enqueue_command(
+        live.session_id,
+        "message",
+        {"text": "retry me"},
+        "retryable-" + live.session_id,
+    )
+    assert requeued.status == CommandStatus.QUEUED
+
+    held = store.enqueue_command(
+        stopped.session_id,
+        "message",
+        {"text": "retry me"},
+        "retryable-" + stopped.session_id,
+    )
+    assert held.status == CommandStatus.FAILED
+    assert store.claim_command(stopped.session_id) is None
+    store.close()
+
+
+def test_retire_worker_holds_a_worker_for_a_queued_stopped_session_control(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    store.stop_session(created.session_id)
+    store.register_worker(created.session_id, 4321, "incarnation-one")
+    assert store.worker_registered(created.session_id) is True
+    assert (
+        store.retire_worker(
+            created.session_id,
+            "incarnation-two",
+            storage_module.STOPPED_SESSION_COMMANDS,
+        )
+        is True
+    )
+    assert store.worker_registered(created.session_id) is True
+
+    resume = store.enqueue_command(
+        created.session_id,
+        "resume",
+        {},
+        "resume-before-retirement",
+    )
+    assert (
+        store.queued_command_exists(
+            created.session_id,
+            storage_module.STOPPED_SESSION_COMMANDS,
+        )
+        is True
+    )
+    assert (
+        store.retire_worker(
+            created.session_id,
+            "incarnation-one",
+            storage_module.STOPPED_SESSION_COMMANDS,
+        )
+        is False
+    )
+    assert store.worker_registered(created.session_id) is True
+
+    claimed = store.claim_command(
+        created.session_id,
+        storage_module.STOPPED_SESSION_COMMANDS,
+    )
+    assert claimed is not None
+    assert claimed.command_id == resume.command_id
+    assert (
+        store.queued_command_exists(
+            created.session_id,
+            storage_module.STOPPED_SESSION_COMMANDS,
+        )
+        is False
+    )
+    assert (
+        store.retire_worker(
+            created.session_id,
+            "incarnation-one",
+            storage_module.STOPPED_SESSION_COMMANDS,
+        )
+        is True
+    )
+    assert store.worker_registered(created.session_id) is False
+    store.close()

@@ -45,7 +45,8 @@ class Workers:
     def __init__(self) -> None:
         self.started: list[str] = []
 
-    def ensure(self, session_id: str) -> None:
+    def ensure(self, session_id: str, *, force: bool = False) -> None:
+        del force
         self.started.append(session_id)
 
     def stop_all(self) -> None:

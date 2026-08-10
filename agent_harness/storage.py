@@ -60,6 +60,18 @@ PROOF_SNAPSHOT_RETENTION_HOURS = 336
 TRANSITION_CONTROL_COMMANDS = frozenset(
     {"interrupt", "pause", "resume", "stop", "steer"}
 )
+TERMINAL_LIFECYCLES = frozenset(
+    {
+        Lifecycle.STOPPED,
+        Lifecycle.COMPLETED,
+        Lifecycle.FAILED,
+    }
+)
+# The commands a stopped session may still hand to a worker. A resume
+# is the operator reactivation, and a stop may already be queued from a
+# concurrent request that lost the race to the stop that terminalized
+# the session.
+STOPPED_SESSION_COMMANDS = frozenset({"resume", "stop"})
 DISPATCH_TRANSITION_ANCHOR_KINDS = frozenset(
     {
         "provider-result",
@@ -2028,6 +2040,10 @@ class StateStore:
         normalized_payload = normalize_command_payload(payload)
         turn_ref = normalize_turn_ref(normalized_payload.get("turn_ref"))
         with self.transaction() as connection:
+            rejection = _terminal_command_rejection(
+                _session_lifecycle(connection, session_id),
+                command_type,
+            )
             existing = connection.execute(
                 "SELECT * FROM commands WHERE idempotency_key = ?",
                 (idempotency_key,),
@@ -2045,10 +2061,11 @@ class StateStore:
                     raise ConflictError(
                         "idempotency key was already used with different command input"
                     )
-                existing = self._requeue_retryable_failure(
-                    connection,
-                    existing,
-                )
+                if not rejection:
+                    existing = self._requeue_retryable_failure(
+                        connection,
+                        existing,
+                    )
                 if instruction_event and str(existing["status"]) in {
                     CommandStatus.QUEUED,
                     CommandStatus.DISPATCHING,
@@ -2069,6 +2086,8 @@ class StateStore:
                             + str(existing["command_id"])
                         ) from error
                 return _command(existing), False
+            if rejection:
+                raise ConflictError(rejection)
             now = utc_now()
             command_id = new_uuid()
             connection.execute(
@@ -2367,6 +2386,12 @@ class StateStore:
         records that the command was not accepted; checkpoints, events,
         and workspace material remain untouched even when a prior
         attempt crossed the provider boundary.
+
+        A control that raced this transition is cancelled with every
+        other unaccepted command. The worker claims controls in order,
+        so nothing older than the stop is still queued here, and a
+        newer control never reached an accepting session. Leaving one
+        queued would strand it once this worker exits.
         """
         now = utc_now()
         released: list[dict[str, Any]] = []
@@ -2395,8 +2420,6 @@ class StateStore:
             for row in rows:
                 command_id = str(row["command_id"])
                 if command_id in {stop_command_id, active_command_id}:
-                    continue
-                if str(row["command_type"]) in TRANSITION_CONTROL_COMMANDS:
                     continue
                 prior_status = str(row["status"])
                 result = {
@@ -7886,6 +7909,14 @@ class StateStore:
             ).fetchone()
         return row is not None
 
+    def worker_registered(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM workers WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def remove_worker(self, session_id: str, incarnation: str) -> None:
         with self.transaction() as connection:
             connection.execute(
@@ -7894,6 +7925,55 @@ class StateStore:
                 WHERE session_id = ? AND incarnation = ?
                 """,
                 (session_id, incarnation),
+            )
+
+    def retire_worker(
+        self,
+        session_id: str,
+        incarnation: str,
+        command_types: frozenset[str],
+    ) -> bool:
+        """Drop this worker's registration unless queued work still needs it.
+
+        A worker that leaves a stopped session must not strand a command
+        enqueued the instant before it exits. The queue probe and the
+        registration delete share one transaction, so an enqueue either
+        commits first and holds the worker in its claim loop, or commits
+        after the registration is gone and a fresh worker is started for
+        it. Returns True when the caller may exit.
+        """
+
+        with self.transaction() as connection:
+            owned = connection.execute(
+                """
+                SELECT 1 FROM workers
+                WHERE session_id = ? AND incarnation = ?
+                """,
+                (session_id, incarnation),
+            ).fetchone()
+            if owned is None:
+                return True
+            if _queued_command_exists(connection, session_id, command_types):
+                return False
+            connection.execute(
+                """
+                DELETE FROM workers
+                WHERE session_id = ? AND incarnation = ?
+                """,
+                (session_id, incarnation),
+            )
+        return True
+
+    def queued_command_exists(
+        self,
+        session_id: str,
+        command_types: frozenset[str],
+    ) -> bool:
+        with self._lock:
+            return _queued_command_exists(
+                self._connection,
+                session_id,
+                command_types,
             )
 
     def worker_registrations(self) -> list[dict[str, Any]]:
@@ -8736,6 +8816,62 @@ class StateStore:
                 str(safety.get("updated_at", now)),
             ),
         )
+
+
+def _queued_command_exists(
+    connection: sqlite3.Connection,
+    session_id: str,
+    command_types: frozenset[str],
+) -> bool:
+    placeholders = ", ".join("?" for _ in command_types)
+    parameters: list[Any] = [session_id, CommandStatus.QUEUED]
+    parameters.extend(sorted(command_types))
+    row = connection.execute(
+        """
+        SELECT 1 FROM commands
+        WHERE session_id = ? AND status = ?
+        AND command_type IN ("""
+        + placeholders
+        + """)
+        LIMIT 1
+        """,
+        tuple(parameters),
+    ).fetchone()
+    return row is not None
+
+
+def _session_lifecycle(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> str:
+    row = connection.execute(
+        """
+        SELECT COALESCE(MAX(lifecycle), '') AS lifecycle FROM sessions
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    return str(row["lifecycle"])
+
+
+def _terminal_command_rejection(lifecycle: str, command_type: str) -> str:
+    """Explain why a terminal session refuses a command, or return ''.
+
+    A terminal session keeps no worker, so a command admitted into one
+    would stay queued with nothing to claim it, holding its safety
+    envelope open and blocking release quiescence forever. Admission
+    therefore fails closed: only a resume, which is what returns a
+    stopped session to a live lifecycle and starts the single writer
+    that drains its queue, survives the guard.
+    """
+
+    if lifecycle not in TERMINAL_LIFECYCLES:
+        return ""
+    if lifecycle != Lifecycle.STOPPED:
+        return "a " + lifecycle + " session admits no commands"
+    if command_type == "resume":
+        return ""
+    return "a stopped session admits only a resume command"
 
 
 def _sqlite_contention(error: sqlite3.OperationalError) -> bool:

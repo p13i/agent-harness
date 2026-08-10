@@ -58,7 +58,7 @@ from agent_harness.reconciliation import ReconciliationManager, inspect_workspac
 from agent_harness.safety import SafetyConsumption, TurnGuard, limits_for
 from agent_harness.scheduler import Scheduler
 from agent_harness.service import HarnessService
-from agent_harness.storage import StateStore
+from agent_harness.storage import STOPPED_SESSION_COMMANDS, StateStore
 from agent_harness.usage import UsageSnapshot
 from agent_harness.worker import SessionWorker
 from agent_harness.workspace import checkpoint_workspace
@@ -1252,11 +1252,28 @@ async def test_stop_releases_an_unaccepted_command_and_frees_the_route(
         assert decision.provider == "kimi"
         assert store.get_command(next_command.command_id).status == "queued"
 
-        repeat = store.enqueue_command(
+        with pytest.raises(ConflictError, match="admits only a resume command"):
+            store.enqueue_command(
+                created.session_id,
+                "stop",
+                {},
+                "kimi-stop-again",
+            )
+        assert not store.queued_command_exists(
             created.session_id,
-            "stop",
+            STOPPED_SESSION_COMMANDS,
+        )
+        assert store.claim_command(created.session_id) is None
+        assert store.get_session(created.session_id).lifecycle == "stopped"
+        assert store.get_command(implementation.command_id).result == (
+            released.result
+        )
+
+        resume = store.enqueue_command(
+            created.session_id,
+            "resume",
             {},
-            "kimi-stop-again",
+            "kimi-resume",
         )
         replacement = SessionWorker(
             store,
@@ -1270,14 +1287,22 @@ async def test_stop_releases_an_unaccepted_command_and_frees_the_route(
             124,
             replacement.incarnation,
         )
-        await replacement._loop()
-        repeat_receipt = store.get_command(repeat.command_id)
-        assert repeat_receipt.status == "complete"
-        assert repeat_receipt.result["released_commands"] == []
-        assert store.get_session(created.session_id).lifecycle == "stopped"
-        assert store.get_command(implementation.command_id).result == (
-            released.result
+        loop = asyncio.create_task(replacement._loop())
+        await _await_command(store, resume.command_id)
+        assert store.get_session(created.session_id).lifecycle == "running"
+
+        pending = store.enqueue_command(
+            created.session_id,
+            "interrupt",
+            {},
+            "kimi-interrupt-after-resume",
         )
+        assert (await _await_command(store, pending.command_id)).status == (
+            "complete"
+        )
+        store.remove_worker(created.session_id, replacement.incarnation)
+        await asyncio.wait_for(loop, timeout=10)
+        assert store.claim_command(created.session_id) is None
     finally:
         store.close()
 
@@ -1517,6 +1542,12 @@ async def test_worker_loop_handles_idle_control_barriers_and_unknown_work(
                 lambda unused_session, unused_incarnation: True,
             )
             await rig.worker._loop()
+        assert rig.store.worker_registered(rig.session.session_id) is False
+        rig.store.register_worker(
+            rig.session.session_id,
+            123,
+            rig.worker.incarnation,
+        )
 
         rig.store.update_session(
             rig.session.session_id,
@@ -2547,7 +2578,8 @@ class _ForkWorkers:
     def __init__(self) -> None:
         self.ensured: list[str] = []
 
-    def ensure(self, session_id: str) -> None:
+    def ensure(self, session_id: str, *, force: bool = False) -> None:
+        del force
         self.ensured.append(session_id)
 
     def stop_all(self) -> None:
@@ -6272,6 +6304,19 @@ async def _ambiguous_reconciliation(
     record = recovery.reconciliations[0]
     assert record.safety_consumption["total_tokens"] == 73
     return manager, record, command
+
+
+async def _await_command(
+    store: StateStore,
+    command_id: str,
+) -> CommandReceipt:
+    for unused in range(1000):
+        del unused
+        receipt = store.get_command(command_id)
+        if receipt.status in {"complete", "failed", "cancelled"}:
+            return receipt
+        await asyncio.sleep(0.01)
+    raise AssertionError("command did not settle: " + command_id)
 
 
 async def _wait_for_approval(

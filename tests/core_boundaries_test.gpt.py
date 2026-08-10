@@ -53,7 +53,7 @@ from agent_harness.orchestration import normalized_digest
 from agent_harness.scheduler import Scheduler
 from agent_harness.safety import TurnGuard, limits_for
 from agent_harness.service import HarnessService, WorkerManager, _export_digests
-from agent_harness.storage import StateStore
+from agent_harness.storage import STOPPED_SESSION_COMMANDS, StateStore
 from agent_harness.transfer import (
     MachineKeys,
     load_machine_keys,
@@ -76,7 +76,8 @@ class WorkerProbe:
     def __init__(self) -> None:
         self.sessions: list[str] = []
 
-    def ensure(self, session_id: str) -> None:
+    def ensure(self, session_id: str, *, force: bool = False) -> None:
+        del force
         self.sessions.append(session_id)
 
 
@@ -253,12 +254,14 @@ def test_worker_manager_starts_reuses_and_stops_workers(
     manager.ensure("session")
     manager.ensure("session")
     assert len(processes) == 1
-    manager.stop_all()
-    assert processes[0].signals == [signal.SIGTERM]
-
-    processes[0].returncode = 1
-    manager.ensure("session")
+    manager.ensure("session", force=True)
     assert len(processes) == 2
+    manager.stop_all()
+    assert processes[1].signals == [signal.SIGTERM]
+
+    processes[1].returncode = 1
+    manager.ensure("session")
+    assert len(processes) == 3
 
 
 def test_worker_supervision_bounds_spawn_failures_and_recovers_after_window(
@@ -2129,6 +2132,10 @@ def test_service_worker_recovery_budget_lease_and_ui_boundaries(
         workers.sessions.clear()
         service.recover_workers()
         assert workers.sessions == []
+        service.store.update_session(
+            session.session_id,
+            lifecycle=Lifecycle.RUNNING,
+        )
 
         invalid_extensions = (
             {},
@@ -4457,6 +4464,260 @@ def test_worker_attempt_admission_ownership_and_result_boundaries(
         )
     assert pause_reasons[-1] == "E_PROVIDER_AMBIGUOUS_MUTATION"
     service.close()
+
+
+def _registered_worker(
+    service: HarnessService,
+    session_id: str,
+    pid: int,
+) -> SessionWorker:
+    worker = SessionWorker(
+        service.store,
+        service.blobs,
+        Scheduler(service.store, {}),
+        {},
+        session_id,
+    )
+    service.store.register_worker(session_id, pid, worker.incarnation)
+    return worker
+
+
+def _stopped_worker(
+    service: HarnessService,
+    session_id: str,
+    pid: int,
+) -> SessionWorker:
+    service.store.stop_session(session_id)
+    return _registered_worker(service, session_id, pid)
+
+
+async def _settle(condition: Callable[[], bool]) -> None:
+    for unused in range(1000):
+        del unused
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("worker state did not settle")
+
+
+@pytest.mark.asyncio
+async def test_stopped_session_worker_retires_without_queued_residue(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        created = _create_direct(service, tmp_path)
+        worker = _stopped_worker(service, created.session_id, 5001)
+
+        assert await worker._drain_stopped_session() is False
+        assert service.store.worker_registered(created.session_id) is False
+        assert service.store.claim_command(created.session_id) is None
+        assert service.store.get_session(created.session_id).lifecycle == (
+            Lifecycle.STOPPED
+        )
+    finally:
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_stopped_session_worker_claims_a_resume_queued_while_retiring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        created = _create_direct(service, tmp_path)
+        worker = _stopped_worker(service, created.session_id, 5002)
+        raced: list[str] = []
+        claim_command = service.store.claim_command
+
+        def racing_claim(
+            session_id: str,
+            command_types: frozenset[str] = frozenset(),
+        ):
+            claimed = claim_command(session_id, command_types)
+            if claimed is None and not raced:
+                receipt = service.store.enqueue_command(
+                    session_id,
+                    "resume",
+                    {},
+                    "resume-raced-with-retirement",
+                )
+                raced.append(receipt.command_id)
+            return claimed
+
+        monkeypatch.setattr(service.store, "claim_command", racing_claim)
+
+        assert await worker._drain_stopped_session() is True
+
+        assert service.store.worker_registered(created.session_id) is True
+        assert service.store.get_command(raced[0]).status == CommandStatus.COMPLETE
+        assert service.store.get_session(created.session_id).lifecycle == (
+            Lifecycle.RUNNING
+        )
+        assert service.store.claim_command(created.session_id) is None
+    finally:
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_stopped_session_worker_drains_a_stop_that_raced_the_stop(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        created = _create_direct(service, tmp_path)
+        worker = _stopped_worker(service, created.session_id, 5003)
+        service.store.update_session(
+            created.session_id,
+            lifecycle=Lifecycle.RUNNING,
+        )
+        stop = service.store.enqueue_command(
+            created.session_id,
+            "stop",
+            {},
+            "stop-that-lost-the-race",
+        )
+        service.store.update_session(
+            created.session_id,
+            lifecycle=Lifecycle.STOPPED,
+        )
+
+        assert await worker._drain_stopped_session() is False
+
+        assert service.store.get_command(stop.command_id).status == (
+            CommandStatus.COMPLETE
+        )
+        assert service.store.get_session(created.session_id).lifecycle == (
+            Lifecycle.STOPPED
+        )
+        assert service.store.worker_registered(created.session_id) is False
+        assert worker._stopping is True
+    finally:
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_the_stop_control_retires_through_the_drain(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        created = _create_direct(service, tmp_path)
+        worker = _registered_worker(service, created.session_id, 5005)
+        stop = service.store.enqueue_command(
+            created.session_id,
+            "stop",
+            {},
+            "operator-stop",
+        )
+
+        await worker._loop()
+
+        assert service.store.get_command(stop.command_id).status == (
+            CommandStatus.COMPLETE
+        )
+        assert service.store.get_session(created.session_id).lifecycle == (
+            Lifecycle.STOPPED
+        )
+        assert worker._stopping is True
+        assert service.store.worker_registered(created.session_id) is False
+        assert service.store.claim_command(created.session_id) is None
+    finally:
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_the_stop_control_claims_a_resume_admitted_before_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        created = _create_direct(service, tmp_path)
+        worker = _registered_worker(service, created.session_id, 5006)
+        service.store.enqueue_command(
+            created.session_id,
+            "stop",
+            {},
+            "operator-stop",
+        )
+        admitted: list[str] = []
+        stop_session = service.store.stop_session
+
+        def resuming_stop(session_id: str, **values: object):
+            stopped = stop_session(session_id, **values)
+            if not admitted:
+                # The operator resumes the instant the session reaches
+                # stopped, while this worker is still the registered
+                # one. Nothing else may claim the command, so the loop
+                # must reach its drain before it honors the stop.
+                assert service.store.worker_registered(session_id) is True
+                receipt = service.store.enqueue_command(
+                    session_id,
+                    "resume",
+                    {},
+                    "resume-admitted-before-retirement",
+                )
+                admitted.append(receipt.command_id)
+            return stopped
+
+        monkeypatch.setattr(service.store, "stop_session", resuming_stop)
+        loop = asyncio.create_task(worker._loop())
+
+        def reactivated() -> bool:
+            if loop.done():
+                return True
+            session = service.store.get_session(created.session_id)
+            return session.lifecycle == Lifecycle.RUNNING
+
+        await _settle(reactivated)
+        service.store.remove_worker(created.session_id, worker.incarnation)
+        await asyncio.wait_for(loop, timeout=10)
+
+        assert admitted
+        assert service.store.get_command(admitted[0]).status == (
+            CommandStatus.COMPLETE
+        )
+        assert service.store.get_session(created.session_id).lifecycle == (
+            Lifecycle.RUNNING
+        )
+        assert worker._stopping is False
+        assert service.store.claim_command(created.session_id) is None
+    finally:
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_a_resume_supersedes_a_stop_claimed_before_it(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    try:
+        created = _create_direct(service, tmp_path)
+        worker = _stopped_worker(service, created.session_id, 5004)
+        worker._stopping = True
+        resume = service.store.enqueue_command(
+            created.session_id,
+            "resume",
+            {},
+            "resume-after-a-stop",
+        )
+        claimed = service.store.claim_command(
+            created.session_id,
+            STOPPED_SESSION_COMMANDS,
+        )
+        assert claimed is not None
+        assert claimed.command_id == resume.command_id
+
+        await worker._control(claimed)
+
+        assert worker._stopping is False
+        assert service.store.get_session(created.session_id).lifecycle == (
+            Lifecycle.RUNNING
+        )
+    finally:
+        service.close()
 
 
 if __name__ == "__main__":

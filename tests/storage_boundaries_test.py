@@ -2096,8 +2096,13 @@ def test_goal_promotion_rejects_every_durable_boundary(
         _promote(store, previous, next_goal, "active-goal")
     store.close()
 
-    store, created, previous, next_goal = _promotion_store(tmp_path, "command")
+    store, created, previous, next_goal = _promotion_store(
+        tmp_path,
+        "command",
+        complete_session=False,
+    )
     store.enqueue_command(created.session_id, "message", {"text": "active"}, "active")
+    store.update_session(created.session_id, lifecycle="completed")
     with pytest.raises(ConflictError, match="command quiescence"):
         _promote(store, previous, next_goal, "command")
     store.close()
@@ -2111,6 +2116,7 @@ def test_goal_promotion_rejects_every_durable_boundary(
     store, created, previous, next_goal = _promotion_store(
         tmp_path,
         "reconciliation",
+        complete_session=False,
     )
     unused_command, unused_record = _ambiguous(store, created)
     del unused_command, unused_record

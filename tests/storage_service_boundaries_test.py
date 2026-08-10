@@ -38,9 +38,11 @@ SUPPORTED_PROVIDERS = frozenset({"claude", "codex", "kimi", "grok"})
 class WorkerProbe:
     def __init__(self) -> None:
         self.sessions: list[str] = []
+        self.forced: list[bool] = []
 
-    def ensure(self, session_id: str) -> None:
+    def ensure(self, session_id: str, *, force: bool = False) -> None:
         self.sessions.append(session_id)
+        self.forced.append(force)
 
 
 class GoalStoreProbe:
@@ -1809,6 +1811,100 @@ def test_submit_message_requeues_a_retryable_failed_command(
         owned.session_id,
         owned.session_id,
     ]
+    service.close()
+
+
+def test_service_commands_fail_closed_on_terminal_sessions(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    stopped = session(tmp_path)
+    service.store.create_session(stopped)
+    service.store.stop_session(stopped.session_id)
+    probe = service.workers
+
+    for command_type, payload in (
+        ("interrupt", {}),
+        ("pause", {}),
+        ("stop", {}),
+        ("steer", {"text": "keep going"}),
+    ):
+        with pytest.raises(ConflictError, match="admits only a resume command"):
+            service.command(
+                stopped.session_id,
+                command_type,
+                payload,
+                "stopped-" + command_type,
+            )
+    assert probe.sessions == []  # type: ignore[attr-defined]
+    assert service.store.claim_command(stopped.session_id) is None
+    assert not service.store.queued_command_exists(
+        stopped.session_id,
+        storage_module.STOPPED_SESSION_COMMANDS,
+    )
+
+    receipt = service.command(
+        stopped.session_id,
+        "resume",
+        {},
+        "stopped-resume",
+    )
+    assert receipt["status"] == CommandStatus.QUEUED
+    replayed = service.command(
+        stopped.session_id,
+        "resume",
+        {},
+        "stopped-resume",
+    )
+    assert replayed["command_id"] == receipt["command_id"]
+    assert probe.sessions == [  # type: ignore[attr-defined]
+        stopped.session_id,
+        stopped.session_id,
+    ]
+    assert probe.forced == [True, True]  # type: ignore[attr-defined]
+
+    assert service._recoverable_worker_sessions() == [stopped.session_id]
+    claimed = service.store.claim_command(
+        stopped.session_id,
+        storage_module.STOPPED_SESSION_COMMANDS,
+    )
+    assert claimed is not None
+    assert claimed.command_id == receipt["command_id"]
+    assert service._recoverable_worker_sessions() == []
+
+    for lifecycle in ("completed", "failed"):
+        service.store.update_session(stopped.session_id, lifecycle=lifecycle)
+        with pytest.raises(ConflictError, match="admits no commands"):
+            service.command(
+                stopped.session_id,
+                "resume",
+                {},
+                lifecycle + "-resume",
+            )
+        assert service._recoverable_worker_sessions() == []
+    service.close()
+
+
+def test_service_forces_a_worker_past_a_retiring_stopped_session_worker(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    stopped = session(tmp_path)
+    service.store.create_session(stopped)
+    service.store.stop_session(stopped.session_id)
+    probe = service.workers
+
+    service.command(stopped.session_id, "resume", {}, "resume-while-retiring")
+    assert probe.forced == [True]  # type: ignore[attr-defined]
+
+    service.store.register_worker(stopped.session_id, 4321, "incarnation-one")
+    service.command(stopped.session_id, "resume", {}, "resume-with-a-worker")
+    assert probe.forced == [True, False]  # type: ignore[attr-defined]
+
+    running = session(tmp_path)
+    service.store.create_session(running)
+    service.command(running.session_id, "pause", {}, "pause-a-running-session")
+    assert probe.forced == [True, False, False]  # type: ignore[attr-defined]
     service.close()
 
 
