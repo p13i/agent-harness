@@ -2627,6 +2627,160 @@ def test_kimi_run_turn_terminates_the_process_when_the_handler_rejects_an_event(
     assert terminated == [(process, identity)]
 
 
+def test_kimi_run_turn_terminates_detached_children_after_normal_completion(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                if False:
+                    yield b""
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class Process:
+        pid = 42
+        returncode: int | None = None
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    process = Process()
+    identity = SimpleNamespace(pid=42, pgid=42, pid_start="start")
+
+    async def fake_exec(*_argv, **_kwargs):
+        return process
+
+    terminated: list[tuple[object, object]] = []
+
+    async def terminate(selected_process, selected_identity) -> None:
+        terminated.append((selected_process, selected_identity))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        kimi,
+        "process_group_identity",
+        lambda unused: identity,
+    )
+    monkeypatch.setattr(kimi, "terminate_process_group", terminate)
+
+    async def handler(_event: ProviderEvent) -> None:
+        return
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        adapter = kimi.KimiAdapter()
+        result = await adapter.run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="",
+            permission_mode="full",
+            model="kimi-code/k3",
+            effort="",
+            event_handler=handler,
+            approval_handler=approvals,
+        )
+        assert result.status == "complete"
+        assert adapter.process_identity() == (0, "")
+
+    asyncio.run(scenario())
+
+    assert terminated == [(process, identity)]
+
+
+def test_kimi_run_turn_waits_for_cleanup_when_cancelled(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    process_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                await asyncio.Event().wait()
+                if False:
+                    yield b""
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class Process:
+        pid = 42
+        returncode: int | None = None
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 0
+
+    process = Process()
+    identity = SimpleNamespace(pid=42, pgid=42, pid_start="start")
+
+    async def fake_exec(*_argv, **_kwargs):
+        process_started.set()
+        return process
+
+    async def terminate(selected_process, selected_identity) -> None:
+        assert selected_process is process
+        assert selected_identity is identity
+        cleanup_started.set()
+        await allow_cleanup.wait()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        kimi,
+        "process_group_identity",
+        lambda unused: identity,
+    )
+    monkeypatch.setattr(kimi, "terminate_process_group", terminate)
+
+    async def handler(_event: ProviderEvent) -> None:
+        return
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        adapter = kimi.KimiAdapter()
+        run_task = asyncio.create_task(
+            adapter.run_turn(
+                workspace=tmp_path,
+                prompt="do it",
+                native_session_id="",
+                permission_mode="full",
+                model="kimi-code/k3",
+                effort="",
+                event_handler=handler,
+                approval_handler=approvals,
+            )
+        )
+        await process_started.wait()
+        run_task.cancel()
+        await cleanup_started.wait()
+        assert not run_task.done()
+        allow_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        assert adapter.process_identity() == (0, "")
+
+    asyncio.run(scenario())
+
+
 def test_grok_payload_normalizes_streaming_json() -> None:
     events = normalize.grok_payload({"type": "text", "data": "ok"})
     assert [(e.event_type, e.text) for e in events] == [("agent.message", "ok")]

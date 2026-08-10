@@ -70,6 +70,7 @@ class KimiAdapter(ProviderAdapter):
     def __init__(self) -> None:
         self._active_process: asyncio.subprocess.Process | None = None
         self._process_group: ProcessGroupIdentity | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def run_turn(
         self,
@@ -118,6 +119,7 @@ class KimiAdapter(ProviderAdapter):
                 await process.wait()
                 raise
         self._active_process = process
+        self._cleanup_task = None
 
         session_id = native_session_id
         status = "complete"
@@ -152,17 +154,13 @@ class KimiAdapter(ProviderAdapter):
                         native_session_id=session_id,
                     )
                 )
-        except BaseException:
+        finally:
             identity = self._process_group
             if identity is not None:
-                cleanup = asyncio.create_task(
-                    terminate_process_group(process, identity)
-                )
-                await asyncio.shield(cleanup)
-            raise
-        finally:
+                await self._terminate_active_process(process, identity)
             self._active_process = None
             self._process_group = None
+            self._cleanup_task = None
 
         return ProviderResult(
             provider=self.provider_id,
@@ -177,7 +175,24 @@ class KimiAdapter(ProviderAdapter):
         identity = self._process_group
         if process is None or identity is None:
             return
-        await terminate_process_group(process, identity)
+        await self._terminate_active_process(process, identity)
+
+    async def _terminate_active_process(
+        self,
+        process: asyncio.subprocess.Process,
+        identity: ProcessGroupIdentity,
+    ) -> None:
+        cleanup = self._cleanup_task
+        if cleanup is None:
+            cleanup = asyncio.create_task(
+                terminate_process_group(process, identity)
+            )
+            self._cleanup_task = cleanup
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
 
     def process_identity(self) -> tuple[int, str]:
         process = self._active_process
