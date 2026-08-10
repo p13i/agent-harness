@@ -1471,12 +1471,85 @@ async def test_process_group_control_is_identity_bound_and_bounded(
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert bounded_waits == [2.0]
 
-    outcomes = iter((False, False))
+    outcomes = iter((False, False, False))
     with pytest.raises(RuntimeError, match="did not exit"):
         await process_control_module.terminate_process_group(
             process,  # type: ignore[arg-type]
             identity,
         )
+
+
+@pytest.mark.asyncio
+async def test_process_group_control_kills_identity_bound_members_after_group_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = process_control_module.ProcessGroupIdentity(41, 41, "leader")
+    members = (
+        process_control_module.ProcessGroupMemberIdentity(41, "leader"),
+        process_control_module.ProcessGroupMemberIdentity(43, "child"),
+    )
+
+    class Process:
+        pid = 41
+        returncode = None
+
+        async def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        process_control_module,
+        "process_group_identity",
+        lambda unused_pid: identity,
+    )
+    monkeypatch.setattr(
+        process_control_module,
+        "_process_group_members",
+        lambda unused_pgid: members,
+    )
+    group_signals: list[signal.Signals] = []
+    member_signals: list[signal.Signals] = []
+
+    def signal_group(
+        unused_pgid: int,
+        selected_signal: signal.Signals,
+    ) -> None:
+        group_signals.append(selected_signal)
+
+    def signal_members(
+        unused_pgid: int,
+        selected_members: tuple[object, ...],
+        selected_signal: signal.Signals,
+    ) -> None:
+        assert selected_members == members
+        member_signals.append(selected_signal)
+
+    outcomes = iter((False, False, True))
+
+    async def group_exit(
+        unused_pgid: int,
+        unused_timeout: float,
+    ) -> bool:
+        return next(outcomes)
+
+    async def bounded_wait(unused_process: object, unused_timeout: float) -> None:
+        return
+
+    monkeypatch.setattr(process_control_module, "_signal_group", signal_group)
+    monkeypatch.setattr(
+        process_control_module,
+        "_signal_group_members",
+        signal_members,
+    )
+    monkeypatch.setattr(process_control_module, "_wait_group_exit", group_exit)
+    monkeypatch.setattr(process_control_module, "_bounded_wait", bounded_wait)
+
+    await process_control_module.terminate_process_group(
+        Process(),  # type: ignore[arg-type]
+        identity,
+    )
+
+    assert group_signals == [signal.SIGTERM, signal.SIGKILL]
+    assert member_signals == [signal.SIGKILL]
 
 
 @pytest.mark.asyncio
@@ -1716,6 +1789,66 @@ async def test_process_group_poll_signal_and_start_boundaries(
             ),
         )
         assert process_control_module._process_start(41) == "41"
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            process_control_module.subprocess,
+            "run",
+            lambda *unused, **unused_values: SimpleNamespace(
+                returncode=0,
+                stdout="41 41\n43 41\n44 42\ninvalid\n",
+            ),
+        )
+        context.setattr(
+            process_control_module,
+            "_process_start",
+            lambda pid: "start-" + str(pid),
+        )
+        assert process_control_module._process_group_members(41) == (
+            process_control_module.ProcessGroupMemberIdentity(41, "start-41"),
+            process_control_module.ProcessGroupMemberIdentity(43, "start-43"),
+        )
+
+    member_signals: list[tuple[int, signal.Signals]] = []
+
+    def member_start(pid: int) -> str:
+        if pid == 41:
+            return "start-41"
+        return "reused"
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            process_control_module.os,
+            "getpgid",
+            lambda unused_pid: 41,
+        )
+        context.setattr(
+            process_control_module,
+            "_process_start",
+            member_start,
+        )
+        context.setattr(
+            process_control_module.os,
+            "kill",
+            lambda pid, selected_signal: member_signals.append(
+                (pid, selected_signal)
+            ),
+        )
+        process_control_module._signal_group_members(
+            41,
+            (
+                process_control_module.ProcessGroupMemberIdentity(
+                    41,
+                    "start-41",
+                ),
+                process_control_module.ProcessGroupMemberIdentity(
+                    43,
+                    "start-43",
+                ),
+            ),
+            signal.SIGKILL,
+        )
+    assert member_signals == [(41, signal.SIGKILL)]
 
 
 class RequestProbe(dict[str, object]):

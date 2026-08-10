@@ -17,6 +17,12 @@ class ProcessGroupIdentity:
     pid_start: str
 
 
+@dataclass(frozen=True)
+class ProcessGroupMemberIdentity:
+    pid: int
+    pid_start: str
+
+
 def process_group_identity(pid: int) -> ProcessGroupIdentity:
     if pid <= 0:
         raise ValueError("process id must be positive")
@@ -54,6 +60,7 @@ async def terminate_process_group(
             # identity-changed path).
             await _bounded_wait(process, kill_timeout)
             return
+    members = _process_group_members(identity.pgid)
     if grace_timeout > 0 and await _wait_group_exit(identity.pgid, grace_timeout):
         await _bounded_wait(process, kill_timeout)
         return
@@ -63,7 +70,9 @@ async def terminate_process_group(
         return
     _signal_group(identity.pgid, signal.SIGKILL)
     if not await _wait_group_exit(identity.pgid, kill_timeout):
-        raise RuntimeError("process group did not exit after SIGKILL")
+        _signal_group_members(identity.pgid, members, signal.SIGKILL)
+        if not await _wait_group_exit(identity.pgid, kill_timeout):
+            raise RuntimeError("process group did not exit after SIGKILL")
     await _bounded_wait(process, kill_timeout)
 
 
@@ -134,6 +143,56 @@ def _signal_group(pgid: int, selected_signal: signal.Signals) -> None:
         os.killpg(pgid, selected_signal)
     except ProcessLookupError:
         return
+
+
+def _process_group_members(pgid: int) -> tuple[ProcessGroupMemberIdentity, ...]:
+    completed = subprocess.run(
+        ["ps", "-eo", "pid=,pgid="],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return ()
+    members: list[ProcessGroupMemberIdentity] = []
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid = int(fields[0])
+            observed_pgid = int(fields[1])
+        except ValueError:
+            continue
+        if pid <= 0 or observed_pgid != pgid:
+            continue
+        members.append(
+            ProcessGroupMemberIdentity(
+                pid=pid,
+                pid_start=_process_start(pid),
+            )
+        )
+    return tuple(members)
+
+
+def _signal_group_members(
+    pgid: int,
+    members: tuple[ProcessGroupMemberIdentity, ...],
+    selected_signal: signal.Signals,
+) -> None:
+    for member in members:
+        try:
+            observed_pgid = os.getpgid(member.pid)
+        except ProcessLookupError:
+            continue
+        if observed_pgid != pgid:
+            continue
+        if _process_start(member.pid) != member.pid_start:
+            continue
+        try:
+            os.kill(member.pid, selected_signal)
+        except ProcessLookupError:
+            continue
 
 
 def _process_start(pid: int) -> str:
