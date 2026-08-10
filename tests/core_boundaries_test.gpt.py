@@ -1551,6 +1551,18 @@ async def test_process_group_control_kills_identity_bound_members_after_group_st
     assert group_signals == [signal.SIGTERM, signal.SIGKILL]
     assert member_signals == [signal.SIGKILL]
 
+    group_signals.clear()
+    member_signals.clear()
+    outcomes = iter((True,))
+
+    await process_control_module.terminate_process_group(
+        Process(),  # type: ignore[arg-type]
+        identity,
+    )
+
+    assert group_signals == [signal.SIGTERM]
+    assert member_signals == [signal.SIGKILL]
+
 
 @pytest.mark.asyncio
 async def test_recorded_process_control_and_wait_boundaries(
@@ -1817,11 +1829,6 @@ async def test_process_group_poll_signal_and_start_boundaries(
         return "reused"
 
     with monkeypatch.context() as context:
-        context.setattr(
-            process_control_module.os,
-            "getpgid",
-            lambda unused_pid: 41,
-        )
         context.setattr(
             process_control_module,
             "_process_start",

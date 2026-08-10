@@ -50,27 +50,30 @@ async def terminate_process_group(
         try:
             current = process_group_identity(identity.pid)
         except ProcessLookupError:
-            # Leader already gone; wait for the asyncio handle only.
-            await _bounded_wait(process, kill_timeout)
-            return
-        if current != identity:
-            # PID was reused after the original leader exited. Signaling
-            # the new process would be unsafe; treat as already-exited
-            # (same outcome as terminate_recorded_process_group's
-            # identity-changed path).
-            await _bounded_wait(process, kill_timeout)
-            return
+            if not _group_exists(identity.pgid):
+                # The leader and every group member are already gone.
+                await _bounded_wait(process, kill_timeout)
+                return
+        else:
+            if current != identity:
+                # PID was reused after the original leader exited.
+                # Signaling the new process would be unsafe.
+                await _bounded_wait(process, kill_timeout)
+                return
     members = _process_group_members(identity.pgid)
     if grace_timeout > 0 and await _wait_group_exit(identity.pgid, grace_timeout):
+        _signal_group_members(identity.pgid, members, signal.SIGKILL)
         await _bounded_wait(process, kill_timeout)
         return
     _signal_group(identity.pgid, signal.SIGTERM)
     if await _wait_group_exit(identity.pgid, terminate_timeout):
+        _signal_group_members(identity.pgid, members, signal.SIGKILL)
         await _bounded_wait(process, kill_timeout)
         return
     _signal_group(identity.pgid, signal.SIGKILL)
-    if not await _wait_group_exit(identity.pgid, kill_timeout):
-        _signal_group_members(identity.pgid, members, signal.SIGKILL)
+    group_exited = await _wait_group_exit(identity.pgid, kill_timeout)
+    _signal_group_members(identity.pgid, members, signal.SIGKILL)
+    if not group_exited:
         if not await _wait_group_exit(identity.pgid, kill_timeout):
             raise RuntimeError("process group did not exit after SIGKILL")
     await _bounded_wait(process, kill_timeout)
@@ -180,13 +183,8 @@ def _signal_group_members(
     members: tuple[ProcessGroupMemberIdentity, ...],
     selected_signal: signal.Signals,
 ) -> None:
+    del pgid
     for member in members:
-        try:
-            observed_pgid = os.getpgid(member.pid)
-        except ProcessLookupError:
-            continue
-        if observed_pgid != pgid:
-            continue
         if _process_start(member.pid) != member.pid_start:
             continue
         try:
