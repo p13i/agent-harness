@@ -2212,7 +2212,7 @@ def test_terminal_checkpoint_anchor_rejects_every_unproven_boundary(
 
     state.execute(
         "UPDATE turns SET session_id = ? WHERE turn_id = ?",
-        (new_uuid(), state.turn_id),
+        (other_session.session_id, state.turn_id),
     )
     assert state.reason() == "dispatch transition terminal turn is unknown"
     state.execute(

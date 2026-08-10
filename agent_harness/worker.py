@@ -1768,26 +1768,37 @@ class SessionWorker:
                 terminal_action,
                 snapshot,
             )
+            # Only an exactly complete provider result certifies the turn it
+            # stopped. A failed or cancelled result never mints the terminal
+            # checkpoint identity, so it can never anchor the next dispatch
+            # generation.
+            terminal_checkpoint_id = ""
+            terminal_material_digest = ""
+            if result.status == "complete":
+                terminal_checkpoint_id = checkpoint.checkpoint_id
+                terminal_material_digest = completed_material_digest
+            guard_metadata: dict[str, Any] = {
+                "command_id": command_id,
+                "attempt_id": attempt_id,
+                "reason": terminal_guard_reason,
+                "action": terminal_action,
+                "snapshot": snapshot,
+            }
+            if terminal_checkpoint_id:
+                guard_metadata["provider_terminal"] = True
+                guard_metadata["checkpoint_id"] = terminal_checkpoint_id
             self.store.append_event(
                 self.session_id,
                 "guard.tripped",
                 status="failed",
-                metadata={
-                    "command_id": command_id,
-                    "attempt_id": attempt_id,
-                    "reason": terminal_guard_reason,
-                    "action": terminal_action,
-                    "snapshot": snapshot,
-                    "provider_terminal": True,
-                    "checkpoint_id": checkpoint.checkpoint_id,
-                },
+                metadata=guard_metadata,
                 turn_id=turn_id,
             )
             terminal_error = SafetyGuardError(
                 terminal_guard_reason,
                 decision.provider,
-                terminal_checkpoint_id=checkpoint.checkpoint_id,
-                terminal_material_digest=completed_material_digest,
+                terminal_checkpoint_id=terminal_checkpoint_id,
+                terminal_material_digest=terminal_material_digest,
             )
             if result.ambiguous_mutation:
                 reconciliation_id = await self._pause_for_ambiguous_dispatch(

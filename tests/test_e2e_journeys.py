@@ -4567,6 +4567,217 @@ async def test_e2e_noop_review_transition_allows_one_verifier_stage(
 
 
 @pytest.mark.asyncio
+async def test_e2e_terminal_guard_checkpoint_carries_one_review_stage(
+    tmp_path: Path,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/cs-builder",
+        "job_id": "builder-terminal-checkpoint",
+    }
+    claude = ScriptedAdapter("claude", claims_cost_reporting=True)
+    rig = JourneyRig(tmp_path, claude=claude, external_ref=external_ref)
+    next_turn_ref = {"step_id": "review", "agent_role": "reviewer"}
+    next_command_payload = {
+        "text": "Review the terminal builder checkpoint.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["reviewer"],
+        allowed_step_prefixes=["review"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.scheduler._usage_cache = {
+        "claude": _usage("claude", 20.0, credits=True),
+        "codex": _usage("codex", 20.0),
+    }
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    workspace = Path(rig.session.worktree)
+    try:
+        stopped = await rig.message(
+            "Implement the stage under a metered envelope.",
+            provider="claude",
+            metered_budget=1,
+            turn_ref={"step_id": "implement", "agent_role": "builder"},
+        )
+
+        assert stopped.status == "failed", stopped.result
+        assert stopped.result["code"] == "E_SAFETY_GUARD"
+        assert stopped.result["message"].endswith("dollar-accounting")
+        assert stopped.result["provider_terminal"] is True
+        certified = rig.store.checkpoints(rig.session.session_id)[-1]
+        material_digest = inspect_workspace(workspace)[0]
+        assert stopped.result["checkpoint_id"] == certified.checkpoint_id
+        assert stopped.result["workspace_material_digest"] == material_digest
+        assert not rig.store.pending_reconciliations(rig.session.session_id)
+        guard_events = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "guard.tripped"
+        ]
+        assert len(guard_events) == 1
+        assert guard_events[0].metadata["provider_terminal"] is True
+        assert guard_events[0].metadata["checkpoint_id"] == (certified.checkpoint_id)
+        anchor = rig.store.dispatch_transition_anchor(rig.session.session_id)
+        assert anchor["eligible"] is True, anchor["reason"]
+        assert anchor["prior_anchor_kind"] == "terminal-checkpoint"
+        assert anchor["prior_command_id"] == stopped.command_id
+        assert anchor["prior_command_type"] == "message"
+        assert anchor["prior_checkpoint_id"] == certified.checkpoint_id
+        assert anchor["prior_material_digest"] == material_digest
+        assert anchor["prior_reconciliation_id"] == ""
+        assert anchor["prior_reconciliation_resolution"] == ""
+        assert proof_snapshot(rig.store, rig.session.session_id)[
+            "transition_anchor"
+        ] == anchor
+
+        transition = _advance_orchestration_generation(
+            rig,
+            stopped.command_id,
+            next_turn_ref,
+            "terminal-checkpoint-to-review",
+            policy,
+            1,
+            next_command_payload,
+        )
+        assert transition["prior_anchor_kind"] == "terminal-checkpoint"
+        rig.store.update_session(
+            rig.session.session_id,
+            lifecycle="running",
+            attention="idle",
+        )
+        reviewed = await rig.message(**next_command_payload)
+        replay = await rig.message(
+            "Review again without a new boundary.",
+            provider="codex",
+            turn_ref=next_turn_ref,
+        )
+
+        assert reviewed.status == "complete", reviewed.result
+        assert replay.status == "failed"
+        assert replay.result["code"] == "E_SAFETY_GUARD"
+        assert (
+            rig.store.command_envelope(replay.command_id)["guard_reason"]
+            == "dispatch-transition-already-consumed"
+        )
+        consumed = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "dispatch.generation.transition.consumed"
+        ]
+        assert len(consumed) == 1
+        assert consumed[0].metadata["invalidation_id"] == transition["invalidation_id"]
+        assert consumed[0].metadata["command_id"] == reviewed.command_id
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_status", ["failed", "cancelled"])
+async def test_e2e_noncomplete_terminal_guard_never_anchors_a_transition(
+    tmp_path: Path,
+    provider_status: str,
+) -> None:
+    class NoncompleteGuardAdapter(ScriptedAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            pre_prompt_gate = values["pre_prompt_gate"]
+            if pre_prompt_gate is not None:
+                await pre_prompt_gate()
+            event_handler = values["event_handler"]
+            await event_handler(
+                ProviderEvent(
+                    "provider.prompt.accepted",
+                    status="accepted",
+                    native_session_id="claude-native-session",
+                )
+            )
+            return ProviderResult(
+                provider="claude",
+                native_session_id="claude-native-session",
+                native_turn_id="claude-turn",
+                status=provider_status,
+                usage={"total_tokens": 7},
+            )
+
+    external_ref = {
+        "orchestrator": "p13i/machines/cs-builder",
+        "job_id": "builder-noncomplete-guard",
+    }
+    root = tmp_path / provider_status
+    root.mkdir()
+    claude = NoncompleteGuardAdapter("claude", claims_cost_reporting=True)
+    rig = JourneyRig(root, claude=claude, external_ref=external_ref)
+    next_turn_ref = {"step_id": "review", "agent_role": "reviewer"}
+    next_command_payload = {
+        "text": "Review a stage that never certified a checkpoint.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    _install_transition_policy(
+        rig,
+        allowed_agent_roles=["reviewer"],
+        allowed_step_prefixes=["review"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.scheduler._usage_cache = {
+        "claude": _usage("claude", 20.0, credits=True),
+        "codex": _usage("codex", 20.0),
+    }
+    rig.scheduler._usage_at = asyncio.get_running_loop().time()
+    try:
+        stopped = await rig.message(
+            "Implement the stage under a metered envelope.",
+            provider="claude",
+            metered_budget=1,
+            turn_ref={"step_id": "implement", "agent_role": "builder"},
+        )
+
+        assert stopped.status == "failed", stopped.result
+        assert stopped.result["code"] == "E_SAFETY_GUARD"
+        assert "provider_terminal" not in stopped.result
+        assert "checkpoint_id" not in stopped.result
+        assert "workspace_material_digest" not in stopped.result
+        guard_events = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "guard.tripped"
+        ]
+        assert len(guard_events) == 1
+        assert "provider_terminal" not in guard_events[0].metadata
+        assert "checkpoint_id" not in guard_events[0].metadata
+        anchor = rig.store.dispatch_transition_anchor(rig.session.session_id)
+        assert anchor["eligible"] is False
+        assert anchor["reason"] == (
+            "dispatch transition requires exactly one reconciliation"
+        )
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_compact_followup_transition_consumes_exact_second_stage(
     tmp_path: Path,
 ) -> None:

@@ -3264,6 +3264,46 @@ def test_dispatch_invalidation_binds_every_transition_field(
         service.close()
 
 
+def test_dispatch_invalidation_admits_the_terminal_checkpoint_anchor_kind(
+    tmp_path: Path,
+) -> None:
+    service, session, policy, next_turn_ref, next_command_digest = (
+        _transition_fixture(tmp_path)
+    )
+    payload = _managed_transition_payload(
+        service,
+        session.session_id,
+        policy,
+        next_turn_ref,
+        next_command_digest,
+    )
+    payload["prior_anchor_kind"] = "terminal-checkpoint"
+
+    try:
+        # The service admits the terminal-checkpoint kind and defers to the
+        # store, which independently rejects it against a provider-result
+        # anchor. An unknown kind never reaches that revalidation.
+        with pytest.raises(
+            ConflictError,
+            match="prior_anchor_kind is stale",
+        ):
+            service.invalidate_dispatch_generation(
+                session.session_id,
+                payload,
+                idempotency_key="invalidate-terminal-checkpoint",
+            )
+        unknown = copy.deepcopy(payload)
+        unknown["prior_anchor_kind"] = "terminal-guess"
+        with pytest.raises(ValueError, match="anchor kind is invalid"):
+            service.invalidate_dispatch_generation(
+                session.session_id,
+                unknown,
+                idempotency_key="invalidate-unknown-anchor-kind",
+            )
+    finally:
+        service.close()
+
+
 def test_dispatch_invalidation_requires_a_retained_policy_reference(
     tmp_path: Path,
 ) -> None:
