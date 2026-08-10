@@ -278,7 +278,14 @@ def normalize_usage(value: object) -> dict[str, Any]:
     }
     _collect_usage(value, totals)
     minimum_total = totals["input_tokens"] + totals["output_tokens"]
-    totals["total_tokens"] = max(totals["total_tokens"], minimum_total)
+    reported_total = totals["total_tokens"]
+    component_total = minimum_total + totals["cached_input_tokens"]
+    reported_uncached_total = reported_total
+    # An exact component sum proves that the provider included cache reads.
+    # Otherwise retain the reported total so unclassified tokens are not lost.
+    if reported_total > 0 and reported_total == component_total:
+        reported_uncached_total = reported_total - totals["cached_input_tokens"]
+    totals["total_tokens"] = max(minimum_total, reported_uncached_total)
     totals["exact"] = totals["total_tokens"] > 0 and not totals.pop("invalid")
     return totals
 

@@ -186,6 +186,30 @@ def test_usage_normalization_accepts_both_provider_shapes() -> None:
         "total_tokens": 175,
         "exact": True,
     }
+    cached_heavy = normalize_usage(
+        {
+            "input_tokens": 161_197,
+            "cache_read_input_tokens": 3_466_112,
+            "output_tokens": 31_155,
+            "total_tokens": 3_658_464,
+        }
+    )
+    assert cached_heavy == {
+        "input_tokens": 161_197,
+        "cached_input_tokens": 3_466_112,
+        "output_tokens": 31_155,
+        "total_tokens": 192_352,
+        "exact": True,
+    }
+    inclusive_input = normalize_usage(
+        {
+            "input_tokens": 120,
+            "cached_input_tokens": 40,
+            "output_tokens": 30,
+            "total_tokens": 150,
+        }
+    )
+    assert inclusive_input["total_tokens"] == 150
     fallback = normalize_usage(
         [
             None,
@@ -349,6 +373,48 @@ def test_provider_usage_cannot_reduce_accounted_consumption() -> None:
     assert incremental["input_tokens"] == 100
     assert incremental["output_tokens"] == 20
     assert incremental["total_tokens"] == 120
+
+
+def test_cached_input_does_not_trip_the_total_token_guard() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_total_tokens=200_000))
+    guard.begin_attempt(9_128)
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            metadata={
+                "input_tokens": 161_197,
+                "cache_read_input_tokens": 3_466_112,
+                "output_tokens": 31_155,
+                "total_tokens": 3_658_464,
+            },
+        )
+    )
+
+    assert guard.violation() == ""
+    consumption = guard.snapshot()["consumption"]
+    assert consumption["total_tokens"] == 192_352
+    assert consumption["cached_input_tokens"] == 3_466_112
+
+
+def test_cached_input_does_not_hide_unclassified_tokens() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_total_tokens=160))
+    guard.begin_attempt(10)
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            metadata={
+                "input_tokens": 120,
+                "cache_read_input_tokens": 40,
+                "output_tokens": 30,
+                "total_tokens": 175,
+            },
+        )
+    )
+
+    assert guard.violation() == "total-tokens"
+    assert guard.snapshot()["consumption"]["total_tokens"] == 175
 
 
 def test_subscription_attempt_ignores_provider_cost_equivalent() -> None:
