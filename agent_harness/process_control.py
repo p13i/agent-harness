@@ -52,31 +52,42 @@ async def terminate_process_group(
         except ProcessLookupError:
             if not _group_exists(identity.pgid):
                 # The leader and every group member are already gone.
-                await _bounded_wait(process, kill_timeout)
+                await _reap_terminated_process(process, kill_timeout)
                 return
         else:
             if current != identity:
                 # PID was reused after the original leader exited.
                 # Signaling the new process would be unsafe.
-                await _bounded_wait(process, kill_timeout)
+                await _reap_terminated_process(process, kill_timeout)
                 return
     members = _process_group_members(identity.pgid)
     if grace_timeout > 0 and await _wait_group_exit(identity.pgid, grace_timeout):
         _signal_group_members(identity.pgid, members, signal.SIGKILL)
-        await _bounded_wait(process, kill_timeout)
+        if not await _wait_members_exit(members, kill_timeout):
+            raise RuntimeError(
+                "identity-bound process did not exit after SIGKILL"
+            )
+        await _reap_terminated_process(process, kill_timeout)
         return
     _signal_group(identity.pgid, signal.SIGTERM)
     if await _wait_group_exit(identity.pgid, terminate_timeout):
         _signal_group_members(identity.pgid, members, signal.SIGKILL)
-        await _bounded_wait(process, kill_timeout)
+        if not await _wait_members_exit(members, kill_timeout):
+            raise RuntimeError(
+                "identity-bound process did not exit after SIGKILL"
+            )
+        await _reap_terminated_process(process, kill_timeout)
         return
     _signal_group(identity.pgid, signal.SIGKILL)
     group_exited = await _wait_group_exit(identity.pgid, kill_timeout)
     _signal_group_members(identity.pgid, members, signal.SIGKILL)
+    members_exited = await _wait_members_exit(members, kill_timeout)
     if not group_exited:
         if not await _wait_group_exit(identity.pgid, kill_timeout):
             raise RuntimeError("process group did not exit after SIGKILL")
-    await _bounded_wait(process, kill_timeout)
+    if not members_exited:
+        raise RuntimeError("identity-bound process did not exit after SIGKILL")
+    await _reap_terminated_process(process, kill_timeout)
 
 
 async def terminate_recorded_process_group(
@@ -121,6 +132,19 @@ async def _bounded_wait(
         ) from error
 
 
+async def _reap_terminated_process(
+    process: asyncio.subprocess.Process,
+    timeout: float,
+) -> None:
+    try:
+        await _bounded_wait(process, timeout)
+    except RuntimeError:
+        # The isolated group and its captured members have already been
+        # terminated at every call site. A delayed asyncio child watcher must
+        # not turn successful containment into a worker crash and redispatch.
+        return
+
+
 async def _wait_group_exit(pgid: int, timeout: float) -> bool:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -129,6 +153,19 @@ async def _wait_group_exit(pgid: int, timeout: float) -> bool:
             return True
         await asyncio.sleep(0.05)
     return not _group_exists(pgid)
+
+
+async def _wait_members_exit(
+    members: tuple[ProcessGroupMemberIdentity, ...],
+    timeout: float,
+) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if not any(_member_is_alive(member) for member in members):
+            return True
+        await asyncio.sleep(0.05)
+    return not any(_member_is_alive(member) for member in members)
 
 
 def _group_exists(pgid: int) -> bool:
@@ -191,6 +228,29 @@ def _signal_group_members(
             os.kill(member.pid, selected_signal)
         except ProcessLookupError:
             continue
+
+
+def _member_is_alive(member: ProcessGroupMemberIdentity) -> bool:
+    if _process_start(member.pid) != member.pid_start:
+        return False
+    stat_path = Path("/proc") / str(member.pid) / "stat"
+    try:
+        stat_text = stat_path.read_text(encoding="utf-8")
+    except OSError:
+        stat_text = ""
+    unused_prefix, separator, suffix = stat_text.rpartition(") ")
+    del unused_prefix
+    if separator:
+        fields = suffix.split()
+        if fields and fields[0] in {"X", "Z"}:
+            return False
+    try:
+        os.kill(member.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _process_start(pid: int) -> str:

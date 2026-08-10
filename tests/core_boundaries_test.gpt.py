@@ -1565,6 +1565,94 @@ async def test_process_group_control_kills_identity_bound_members_after_group_st
 
 
 @pytest.mark.asyncio
+async def test_process_group_control_does_not_redispatch_after_reaping_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = process_control_module.ProcessGroupIdentity(41, 41, "leader")
+
+    class Process:
+        pid = 41
+        returncode = None
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    monkeypatch.setattr(
+        process_control_module,
+        "process_group_identity",
+        lambda unused_pid: identity,
+    )
+    monkeypatch.setattr(
+        process_control_module,
+        "_process_group_members",
+        lambda unused_pgid: (),
+    )
+
+    async def group_exit(unused_pgid: int, unused_timeout: float) -> bool:
+        return True
+
+    monkeypatch.setattr(process_control_module, "_wait_group_exit", group_exit)
+
+    await process_control_module.terminate_process_group(
+        Process(),  # type: ignore[arg-type]
+        identity,
+        terminate_timeout=0.01,
+        kill_timeout=0.01,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_group_control_rejects_a_surviving_captured_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = process_control_module.ProcessGroupIdentity(41, 41, "leader")
+    members = (
+        process_control_module.ProcessGroupMemberIdentity(43, "child"),
+    )
+
+    class Process:
+        pid = 41
+        returncode = None
+
+        async def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        process_control_module,
+        "process_group_identity",
+        lambda unused_pid: identity,
+    )
+    monkeypatch.setattr(
+        process_control_module,
+        "_process_group_members",
+        lambda unused_pgid: members,
+    )
+
+    async def group_exit(unused_pgid: int, unused_timeout: float) -> bool:
+        return True
+
+    async def members_exit(
+        unused_members: tuple[object, ...],
+        unused_timeout: float,
+    ) -> bool:
+        return False
+
+    monkeypatch.setattr(process_control_module, "_wait_group_exit", group_exit)
+    monkeypatch.setattr(
+        process_control_module,
+        "_wait_members_exit",
+        members_exit,
+    )
+
+    with pytest.raises(RuntimeError, match="identity-bound process"):
+        await process_control_module.terminate_process_group(
+            Process(),  # type: ignore[arg-type]
+            identity,
+        )
+
+
+@pytest.mark.asyncio
 async def test_recorded_process_control_and_wait_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
