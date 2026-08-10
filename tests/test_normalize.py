@@ -432,3 +432,113 @@ def test_grok_payload_maps_end_and_error() -> None:
     err = grok_payload({"type": "error", "message": "boom"})
     assert err[0].event_type == "turn.failed"
     assert err[0].text == "boom"
+
+
+def test_grok_payload_preserves_typed_tool_progress() -> None:
+    from agent_harness.providers.normalize import grok_payload
+
+    started = grok_payload(
+        {
+            "type": "tool_call",
+            "toolCallId": "call_1",
+            "title": "Read",
+            "kind": "read",
+            "status": "in_progress",
+            "toolName": "read_file",
+            "rawInput": {"path": "src/main.rs"},
+            "content": [],
+            "locations": [],
+            "sessionId": "session_g",
+        }
+    )
+    assert len(started) == 1
+    assert started[0].event_type == "tool.started"
+    assert started[0].text == "read_file"
+    assert started[0].native_session_id == "session_g"
+    assert started[0].metadata is not None
+    assert started[0].metadata["id"] == "call_1"
+    assert started[0].metadata["tool_call_id"] == "call_1"
+    assert started[0].metadata["input"] == {"path": "src/main.rs"}
+
+    progress = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "content": [{"type": "text", "text": "chunk-1"}],
+            "rawOutput": {"bytes": 128},
+        }
+    )
+    assert len(progress) == 1
+    assert progress[0].event_type == "tool.progress"
+    assert progress[0].metadata is not None
+    assert progress[0].metadata["tool_use_id"] == "call_1"
+    assert progress[0].metadata["tool_call_id"] == "call_1"
+    assert progress[0].metadata["output"] == {"bytes": 128}
+
+    named_progress = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "toolName": "run_terminal_cmd",
+            "title": "Shell progress",
+            "locations": [{"path": "Makefile"}],
+            "content": [{"type": "text", "text": "running"}],
+            "rawOutput": {"line": "make test"},
+        }
+    )
+    assert named_progress[0].event_type == "tool.progress"
+    assert named_progress[0].metadata is not None
+    assert named_progress[0].metadata["name"] == "run_terminal_cmd"
+    assert named_progress[0].metadata["title"] == "Shell progress"
+    assert named_progress[0].metadata["locations"] == [{"path": "Makefile"}]
+
+    completed = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "completed",
+            "content": [],
+            "rawOutput": {"lines": 42},
+        }
+    )
+    assert len(completed) == 1
+    assert completed[0].event_type == "tool.completed"
+    assert completed[0].status == "complete"
+    assert completed[0].metadata is not None
+    assert completed[0].metadata["tool_use_id"] == "call_1"
+    assert completed[0].metadata["output"] == {"lines": 42}
+
+    failed = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_2",
+            "status": "failed",
+            "rawOutput": {"error": "timeout"},
+        }
+    )
+    assert failed[0].event_type == "tool.completed"
+    assert failed[0].status == "failed"
+
+    cancelled = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_3",
+            "status": "cancelled",
+            "rawOutput": {"reason": "user-stop"},
+        }
+    )
+    assert cancelled[0].event_type == "tool.completed"
+    assert cancelled[0].status == "cancelled"
+
+    stopped = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_4",
+            "status": "stopped",
+            "rawOutput": {"reason": "interrupted"},
+        }
+    )
+    assert stopped[0].event_type == "tool.completed"
+    assert stopped[0].status == "cancelled"

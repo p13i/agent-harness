@@ -449,6 +449,7 @@ class TurnGuard:
         self._attempt_exact_dollars = 0.0
         self._charge_reported_cost = True
         self._material_state_digest = ""
+        self._recent_tool_progress_fingerprints: list[str] = []
 
     def begin_attempt(
         self,
@@ -491,6 +492,9 @@ class TurnGuard:
             self._pending_tools.setdefault(identity, []).append(
                 _event_fingerprint(event)
             )
+        if event.event_type == "tool.progress":
+            if _is_grok_tool_progress(event):
+                self._note_tool_progress(event)
         if event.event_type == "agent.child.started":
             self.consumption.child_agents += self._new_child_start_count(event)
         if _tool_completed(event.event_type):
@@ -525,6 +529,7 @@ class TurnGuard:
         self._material_state_digest = digest
         self._last_progress = self._monotonic()
         self._tool_pairs.clear()
+        self._recent_tool_progress_fingerprints.clear()
         return True
 
     def note_child_admissions(self, consumed: int) -> None:
@@ -609,6 +614,7 @@ class TurnGuard:
         self._tool_pairs.clear()
         self._pending_tools.clear()
         self._completed_tool_pair = ""
+        self._recent_tool_progress_fingerprints.clear()
 
     def snapshot(self) -> dict[str, Any]:
         self.violation()
@@ -689,6 +695,31 @@ class TurnGuard:
             return
         self._last_progress = self._monotonic()
 
+    def _note_tool_progress(self, event: ProviderEvent) -> None:
+        fingerprint = _event_fingerprint(event)
+        if fingerprint in self._recent_tool_progress_fingerprints:
+            return
+        self._recent_tool_progress_fingerprints.append(fingerprint)
+        maximum = 8
+        if len(self._recent_tool_progress_fingerprints) > maximum:
+            del self._recent_tool_progress_fingerprints[0]
+        self._last_progress = self._monotonic()
+
+
+def _is_grok_tool_progress(event: ProviderEvent) -> bool:
+    """Grok progress carries tool_call_id; other providers do not.
+
+    Stagnation refresh on tool.progress is intentionally limited to the
+    Grok tool_call_update path so Claude child rewrites stay unchanged.
+    """
+    metadata = event.metadata
+    if not isinstance(metadata, dict):
+        return False
+    tool_call_id = metadata.get("tool_call_id")
+    if isinstance(tool_call_id, str) and tool_call_id:
+        return True
+    return False
+
 
 def _tool_started(event_type: str) -> bool:
     return event_type in {
@@ -745,6 +776,10 @@ def _stable_fingerprint_value(value: object) -> object:
                 "requestid",
                 "tool_use_id",
                 "tooluseid",
+                "tool_call_id",
+                "toolcallid",
+                "call_id",
+                "callid",
             }:
                 continue
             stable[name] = _stable_fingerprint_value(item)

@@ -439,8 +439,10 @@ def grok_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
     """Normalize one Grok Build ``--output-format streaming-json`` line.
 
     Grok emits type-tagged NDJSON (``text``, ``thought``, ``tool_call``,
-    ``usage``, ``end``, ``error``, …). ``end`` always carries
-    ``sessionId`` for resume; ``error`` is terminal for the turn.
+    ``tool_call_update``, ``usage``, ``end``, ``error``, …). Tool starts
+    and changing tool progress stay typed so the turn guard can treat
+    them as meaningful work. ``end`` always carries ``sessionId`` for
+    resume; ``error`` is terminal for the turn.
     """
     event_type = str(payload.get("type", ""))
     session_id = _optional_text(
@@ -466,20 +468,10 @@ def grok_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
                 native_session_id=session_id,
             )
         ]
-    if event_type in {"tool_call", "tool_call_update"}:
-        return [
-            ProviderEvent(
-                "provider.event",
-                text=str(payload.get("toolName") or payload.get("title") or ""),
-                raw=payload,
-                native_session_id=session_id,
-                metadata={
-                    "grok_type": event_type,
-                    "tool_call_id": payload.get("toolCallId"),
-                    "status": payload.get("status"),
-                },
-            )
-        ]
+    if event_type == "tool_call":
+        return _grok_tool_call(payload, session_id)
+    if event_type == "tool_call_update":
+        return _grok_tool_call_update(payload, session_id)
     if event_type == "usage":
         usage = payload.get("usage")
         metadata: dict[str, Any] = {}
@@ -523,6 +515,107 @@ def grok_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
             "provider.event",
             raw=payload,
             native_session_id=session_id,
+        )
+    ]
+
+
+def _grok_tool_call(
+    payload: dict[str, Any],
+    session_id: str,
+) -> list[ProviderEvent]:
+    tool_id = payload.get("toolCallId")
+    tool_name = str(payload.get("toolName") or payload.get("title") or "")
+    metadata: dict[str, Any] = {
+        "id": tool_id,
+        "tool_call_id": tool_id,
+        "name": payload.get("toolName") or payload.get("title") or "",
+        "status": payload.get("status"),
+    }
+    if "kind" in payload:
+        metadata["kind"] = payload["kind"]
+    if "title" in payload:
+        metadata["title"] = payload["title"]
+    if "rawInput" in payload:
+        metadata["input"] = redact_observable(payload["rawInput"])
+    if "content" in payload:
+        metadata["content"] = redact_observable(payload["content"])
+    if "locations" in payload:
+        metadata["locations"] = redact_observable(payload["locations"])
+    return [
+        ProviderEvent(
+            "tool.started",
+            text=tool_name,
+            status=str(payload.get("status") or "running"),
+            raw=payload,
+            native_session_id=session_id,
+            metadata=metadata,
+        )
+    ]
+
+
+def _grok_tool_call_update(
+    payload: dict[str, Any],
+    session_id: str,
+) -> list[ProviderEvent]:
+    tool_id = payload.get("toolCallId")
+    status = str(payload.get("status") or "").casefold()
+    text = payload_text(
+        payload.get("rawOutput")
+        or payload.get("content")
+        or payload.get("title")
+        or payload.get("toolName")
+        or ""
+    )
+    metadata: dict[str, Any] = {
+        "id": tool_id,
+        "tool_call_id": tool_id,
+        "tool_use_id": tool_id,
+        "status": payload.get("status"),
+    }
+    if "toolName" in payload or "title" in payload:
+        metadata["name"] = payload.get("toolName") or payload.get("title") or ""
+    if "title" in payload:
+        metadata["title"] = payload["title"]
+    if "rawOutput" in payload:
+        metadata["output"] = redact_observable(payload["rawOutput"])
+    if "content" in payload:
+        metadata["content"] = redact_observable(payload["content"])
+    if "locations" in payload:
+        metadata["locations"] = redact_observable(payload["locations"])
+    if status in {
+        "completed",
+        "complete",
+        "failed",
+        "error",
+        "cancelled",
+        "canceled",
+        "stopped",
+        "killed",
+    }:
+        event_name = "tool.completed"
+        event_status = "complete"
+        if status in {"failed", "error"}:
+            event_status = "failed"
+        if status in {"cancelled", "canceled", "stopped", "killed"}:
+            event_status = "cancelled"
+        return [
+            ProviderEvent(
+                event_name,
+                text=text,
+                status=event_status,
+                raw=payload,
+                native_session_id=session_id,
+                metadata=metadata,
+            )
+        ]
+    return [
+        ProviderEvent(
+            "tool.progress",
+            text=text,
+            status=str(payload.get("status") or "running"),
+            raw=payload,
+            native_session_id=session_id,
+            metadata=metadata,
         )
     ]
 

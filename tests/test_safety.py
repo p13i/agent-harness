@@ -10,6 +10,7 @@ import pytest
 
 from agent_harness.errors import SafetyGuardError
 from agent_harness.providers.base import ProviderEvent
+from agent_harness.providers.normalize import grok_payload
 from agent_harness.safety import (
     INTERACTIVE,
     LIVE_SMOKE,
@@ -695,3 +696,348 @@ def test_noop_file_change_cannot_clear_repetition_history() -> None:
     guard.observe(completed)
 
     assert guard.violation() == "repeated-tool"
+
+
+def test_changing_grok_tool_progress_refreshes_stagnation_clock() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    for event in grok_payload(
+        {
+            "type": "tool_call",
+            "toolCallId": "call_1",
+            "toolName": "read_file",
+            "status": "in_progress",
+            "rawInput": {"path": "src/main.rs"},
+        }
+    ):
+        guard.observe(event)
+    clock.advance(9)
+    assert guard.violation() == ""
+
+    for event in grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "rawOutput": {"bytes": 128},
+        }
+    ):
+        guard.observe(event)
+    clock.advance(9)
+    assert guard.violation() == ""
+
+    for event in grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "rawOutput": {"bytes": 256},
+        }
+    ):
+        guard.observe(event)
+    clock.advance(9)
+    assert guard.violation() == ""
+
+    for event in grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "completed",
+            "rawOutput": {"lines": 42},
+        }
+    ):
+        guard.observe(event)
+    clock.advance(9)
+    assert guard.violation() == ""
+
+
+def test_repeated_identical_tool_progress_does_not_defeat_stagnation() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    stuck = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "rawOutput": {"bytes": 128},
+        }
+    )
+    for event in stuck:
+        guard.observe(event)
+    clock.advance(5)
+    for event in stuck:
+        guard.observe(event)
+    clock.advance(5)
+    for event in stuck:
+        guard.observe(event)
+
+    assert guard.violation() == "stagnation"
+
+
+def test_alternating_grok_tool_progress_does_not_defeat_stagnation() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    first = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "rawOutput": {"line": "heartbeat-a"},
+        }
+    )
+    second = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "rawOutput": {"line": "heartbeat-b"},
+        }
+    )
+    for event in first:
+        guard.observe(event)
+    clock.advance(1)
+    for event in second:
+        guard.observe(event)
+    for unused in range(20):
+        del unused
+        clock.advance(9)
+        for event in first:
+            guard.observe(event)
+        if guard.violation():
+            break
+        clock.advance(9)
+        for event in second:
+            guard.observe(event)
+        if guard.violation():
+            break
+
+    assert guard.violation() == "stagnation"
+
+
+def test_grok_tool_starts_do_not_widen_stagnation_but_keep_absolute_limits() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+        max_tool_calls=2,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    for event in grok_payload(
+        {
+            "type": "tool_call",
+            "toolCallId": "call_1",
+            "toolName": "read_file",
+            "status": "in_progress",
+            "rawInput": {"path": "a.py"},
+        }
+    ):
+        guard.observe(event)
+    clock.advance(10)
+    assert guard.violation() == "stagnation"
+
+    clock = Clock()
+    limited = TurnGuard(limits, monotonic=clock)
+    limited.begin_attempt(100)
+    for event in grok_payload(
+        {
+            "type": "tool_call",
+            "toolCallId": "call_1",
+            "toolName": "read_file",
+            "status": "in_progress",
+            "rawInput": {"path": "a.py"},
+        }
+    ):
+        limited.observe(event)
+    for event in grok_payload(
+        {
+            "type": "tool_call",
+            "toolCallId": "call_2",
+            "toolName": "grep",
+            "status": "in_progress",
+            "rawInput": {"pattern": "TODO"},
+        }
+    ):
+        limited.observe(event)
+    for event in grok_payload(
+        {
+            "type": "tool_call",
+            "toolCallId": "call_3",
+            "toolName": "list_dir",
+            "status": "in_progress",
+            "rawInput": {"path": "."},
+        }
+    ):
+        limited.observe(event)
+    assert limited.violation() == "tool-calls"
+
+
+def test_claude_tool_progress_does_not_refresh_stagnation() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    for index in range(3):
+        guard.observe(
+            ProviderEvent(
+                "tool.progress",
+                text="child heartbeat " + str(index),
+                metadata={
+                    "child_id": "bash-process",
+                    "tool_use_id": "bash-tool",
+                    "status": "running",
+                    "output": {"tick": index},
+                },
+            )
+        )
+        clock.advance(9)
+
+    assert guard.violation() == "stagnation"
+    guard.observe(ProviderEvent("tool.progress"))
+    guard.observe(
+        ProviderEvent(
+            "tool.progress",
+            metadata={"tool_call_id": 7},
+        )
+    )
+    guard.observe(
+        ProviderEvent(
+            "tool.progress",
+            metadata={"tool_call_id": ""},
+        )
+    )
+    clock.advance(1)
+    assert guard.violation() == "stagnation"
+
+
+def test_grok_tool_progress_ring_bounds_repeated_history() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    for index in range(10):
+        for event in grok_payload(
+            {
+                "type": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress",
+                "rawOutput": {"step": index},
+            }
+        ):
+            guard.observe(event)
+        clock.advance(1)
+
+    assert guard.violation() == ""
+    guard.establish_material_state("workspace-a")
+    assert guard.note_material_progress("workspace-b") is True
+    clock.advance(10)
+    assert guard.violation() == "stagnation"
+
+
+def test_normalized_tool_completion_still_detects_repeated_pairs() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(100)
+    for index in range(3):
+        call_id = "call-" + str(index)
+        for event in grok_payload(
+            {
+                "type": "tool_call",
+                "toolCallId": call_id,
+                "toolName": "read_file",
+                "status": "in_progress",
+                "rawInput": {"path": "same.py"},
+            }
+        ):
+            guard.observe(event)
+        for event in grok_payload(
+            {
+                "type": "tool_call_update",
+                "toolCallId": call_id,
+                "status": "completed",
+                "rawOutput": {"lines": 1, "content": "same content"},
+            }
+        ):
+            guard.observe(event)
+    assert guard.violation() == "repeated-tool"
+
+
+def test_grok_normalized_tool_stream_refreshes_and_still_bounds_stagnation() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    for event in grok_payload(
+        {
+            "type": "tool_call",
+            "toolCallId": "call_1",
+            "toolName": "run_terminal_cmd",
+            "title": "Shell",
+            "status": "in_progress",
+            "rawInput": {"command": "make test"},
+        }
+    ):
+        guard.observe(event)
+    clock.advance(9)
+    assert guard.violation() == ""
+
+    for index in range(3):
+        for event in grok_payload(
+            {
+                "type": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress",
+                "rawOutput": {"line": "progress-" + str(index)},
+            }
+        ):
+            guard.observe(event)
+        clock.advance(9)
+        assert guard.violation() == ""
+
+    stuck = grok_payload(
+        {
+            "type": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "in_progress",
+            "rawOutput": {"line": "progress-stuck"},
+        }
+    )
+    for event in stuck:
+        guard.observe(event)
+    clock.advance(5)
+    for event in stuck:
+        guard.observe(event)
+    clock.advance(5)
+    for event in stuck:
+        guard.observe(event)
+    assert guard.violation() == "stagnation"
