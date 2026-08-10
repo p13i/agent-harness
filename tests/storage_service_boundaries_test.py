@@ -1761,6 +1761,57 @@ def test_worker_status_and_supervision_failure_are_defensive(tmp_path: Path) -> 
         service_module._optional_number(float("inf"))
 
 
+def test_submit_message_requeues_a_retryable_failed_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    owned = session(tmp_path)
+    service.store.create_session(owned)
+    monkeypatch.setattr(
+        service_module,
+        "require_state_headroom",
+        lambda unused_path, unused_provider: 10 * 1024**3,
+    )
+    payload = {"text": "Review the cs-builder change.", "provider": "grok"}
+    first = service.submit_message(
+        owned.session_id,
+        payload,
+        "cs-builder-review",
+    )
+    service.store.resolve_command(
+        str(first["command_id"]),
+        CommandStatus.FAILED,
+        {
+            "code": "E_PROVIDER_UNAVAILABLE",
+            "message": "grok is unavailable",
+            "retryable": True,
+        },
+    )
+
+    replayed = service.submit_message(
+        owned.session_id,
+        payload,
+        "cs-builder-review",
+    )
+
+    assert first["status"] == CommandStatus.QUEUED
+    assert replayed["command_id"] == first["command_id"]
+    assert replayed["status"] == CommandStatus.QUEUED
+    assert replayed["result"] == {}
+    instructions = [
+        event
+        for event in service.store.events(owned.session_id, limit=5000)
+        if event.event_type == "user.message"
+    ]
+    assert len(instructions) == 1
+    assert service.workers.sessions == [  # type: ignore[attr-defined]
+        owned.session_id,
+        owned.session_id,
+    ]
+    service.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(
         pytest.main(

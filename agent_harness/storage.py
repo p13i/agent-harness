@@ -2037,6 +2037,10 @@ class StateStore:
                     raise ConflictError(
                         "idempotency key was already used with different command input"
                     )
+                existing = self._requeue_retryable_failure(
+                    connection,
+                    existing,
+                )
                 if instruction_event and str(existing["status"]) in {
                     CommandStatus.QUEUED,
                     CommandStatus.DISPATCHING,
@@ -2106,6 +2110,64 @@ class StateStore:
             receipt,
             True,
         )
+
+    def _requeue_retryable_failure(
+        self,
+        connection: sqlite3.Connection,
+        existing: sqlite3.Row,
+    ) -> sqlite3.Row:
+        """Requeue a failed command for an identical idempotent resubmission.
+
+        Only a failed command whose persisted result explicitly recorded
+        `retryable` may run again, and only while no attempt crossed the
+        provider boundary. The guarded status transition is the whole
+        admission test, so two concurrent resubmissions requeue the command
+        once and never fan out into duplicate work.
+        """
+
+        result = _load_object(str(existing["result_json"]))
+        if result.get("retryable") is not True:
+            return existing
+        command_id = str(existing["command_id"])
+        crossed = connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM command_dispatches
+            WHERE command_id = ? AND crossed_boundary = 1
+            """,
+            (command_id,),
+        ).fetchone()
+        crossed_count = 0
+        if crossed is not None:
+            crossed_count = int(crossed["count"])
+        if crossed_count > 0:
+            return existing
+        now = utc_now()
+        cursor = connection.execute(
+            """
+            UPDATE commands SET status = ?, result_json = '{}',
+                updated_at = ? WHERE command_id = ? AND status = ?
+            """,
+            (
+                CommandStatus.QUEUED,
+                now,
+                command_id,
+                CommandStatus.FAILED,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return existing
+        connection.execute(
+            """
+            UPDATE command_envelopes SET state = 'reserved',
+                guard_reason = '', updated_at = ?
+            WHERE command_id = ?
+            """,
+            (now, command_id),
+        )
+        return connection.execute(
+            "SELECT * FROM commands WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
 
     def claim_command(
         self,

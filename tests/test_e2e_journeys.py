@@ -3533,6 +3533,80 @@ async def test_e2e_retryable_provider_failure_keeps_session_claimable(
 
 
 @pytest.mark.asyncio
+async def test_e2e_identical_resubmission_retries_a_retryable_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    rig.prime_capacity()
+    try:
+        original_failover = rig.worker._execute_with_failover
+        attempts: list[str] = []
+
+        async def failover(
+            command_id: str,
+            payload: dict[str, Any],
+            text: str,
+            guard: Any,
+            evaluator: Any = None,
+        ) -> dict[str, Any]:
+            attempts.append(command_id)
+            if len(attempts) == 1:
+                raise ProviderUnavailableError(
+                    "grok",
+                    detail="fleet saturated",
+                )
+            return await original_failover(
+                command_id,
+                payload,
+                text,
+                guard,
+                evaluator,
+            )
+
+        monkeypatch.setattr(rig.worker, "_execute_with_failover", failover)
+        payload = {"text": "Review the cs-builder change."}
+        submitted, was_created = rig.store.ensure_message_command(
+            rig.session.session_id,
+            payload,
+            "cs-builder-review",
+        )
+        assert was_created
+
+        await rig.execute(submitted.command_id)
+        failed = rig.store.get_command(submitted.command_id)
+        assert failed.status == "failed"
+        assert failed.result["code"] == "E_PROVIDER_UNAVAILABLE"
+        assert failed.result["retryable"] is True
+
+        requeued, created_again = rig.store.ensure_message_command(
+            rig.session.session_id,
+            payload,
+            "cs-builder-review",
+        )
+        assert not created_again
+        assert requeued.command_id == submitted.command_id
+        assert requeued.status == "queued"
+
+        await rig.execute(submitted.command_id)
+        completed = rig.store.get_command(submitted.command_id)
+
+        assert completed.status == "complete", completed.result
+        assert attempts == [submitted.command_id, submitted.command_id]
+        instructions = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "user.message"
+        ]
+        assert [event.metadata["command_id"] for event in instructions] == [
+            submitted.command_id
+        ]
+        assert len(rig.store.attempts(rig.session.session_id)) == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_non_retryable_failure_still_pauses_for_operator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

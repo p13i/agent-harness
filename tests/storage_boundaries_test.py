@@ -3748,6 +3748,238 @@ def test_followup_transition_rejects_control_lineage_missing_from_enumeration(
     store.close()
 
 
+def _failed_message(
+    store: StateStore,
+    session_id: str,
+    payload: dict[str, Any],
+    idempotency_key: str,
+    result: dict[str, Any],
+):
+    receipt, was_created = store.ensure_message_command(
+        session_id,
+        payload,
+        idempotency_key,
+    )
+    assert was_created
+    store.create_command_envelope(
+        receipt.command_id,
+        session_id,
+        "unattended",
+        {"max_attempts": 3},
+    )
+    assert store.claim_command(session_id) is not None
+    store.update_command_envelope(
+        receipt.command_id,
+        state="paused",
+        guard_reason="provider-capacity",
+    )
+    store.resolve_command(
+        receipt.command_id,
+        CommandStatus.FAILED,
+        result,
+    )
+    return receipt
+
+
+def _instruction_events(store: StateStore, session_id: str) -> list[Any]:
+    return [
+        event
+        for event in store.events(session_id, limit=5000)
+        if event.event_type == "user.message"
+    ]
+
+
+def test_retryable_failed_command_requeues_on_identical_resubmission(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    payload = {"text": "Review the cs-builder change."}
+    first = _failed_message(
+        store,
+        created.session_id,
+        payload,
+        "builder-resubmission",
+        {
+            "code": "E_PROVIDER_UNAVAILABLE",
+            "message": "grok is unavailable",
+            "retryable": True,
+        },
+    )
+
+    requeued, created_again = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "builder-resubmission",
+    )
+
+    assert not created_again
+    assert requeued.command_id == first.command_id
+    assert requeued.status == CommandStatus.QUEUED
+    assert requeued.result == {}
+    envelope = store.command_envelope(first.command_id)
+    assert envelope["state"] == "reserved"
+    assert envelope["guard_reason"] == ""
+    instructions = _instruction_events(store, created.session_id)
+    assert [event.metadata["command_id"] for event in instructions] == [
+        first.command_id
+    ]
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+    assert claimed.command_id == first.command_id
+    assert store.claim_command(created.session_id) is None
+    store.close()
+
+
+def test_terminal_commands_stay_terminal_on_identical_resubmission(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    defect_payload = {"text": "Run the defective instruction."}
+    defect = _failed_message(
+        store,
+        created.session_id,
+        defect_payload,
+        "non-retryable-failure",
+        {
+            "code": "E_DEFECT",
+            "message": "a genuine non-retryable defect",
+            "retryable": False,
+        },
+    )
+    complete_payload = {"text": "Run the accepted instruction."}
+    complete, was_created = store.ensure_message_command(
+        created.session_id,
+        complete_payload,
+        "complete-command",
+    )
+    assert was_created
+    store.resolve_command(
+        complete.command_id,
+        CommandStatus.COMPLETE,
+        {"status": "complete", "retryable": True},
+    )
+
+    replayed_defect, defect_created = store.ensure_message_command(
+        created.session_id,
+        defect_payload,
+        "non-retryable-failure",
+    )
+    replayed_complete, complete_created = store.ensure_message_command(
+        created.session_id,
+        complete_payload,
+        "complete-command",
+    )
+
+    assert not defect_created
+    assert replayed_defect.command_id == defect.command_id
+    assert replayed_defect.status == CommandStatus.FAILED
+    assert replayed_defect.result["code"] == "E_DEFECT"
+    assert not complete_created
+    assert replayed_complete.command_id == complete.command_id
+    assert replayed_complete.status == CommandStatus.COMPLETE
+    assert replayed_complete.result["status"] == "complete"
+    assert store.command_envelope(defect.command_id)["state"] == "paused"
+    assert store.claim_command(created.session_id) is None
+    store.close()
+
+
+def test_retryable_failure_past_the_provider_boundary_stays_terminal(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    payload = {"text": "Dispatch across the provider boundary."}
+    first = _failed_message(
+        store,
+        created.session_id,
+        payload,
+        "crossed-boundary",
+        {
+            "code": "E_PROVIDER_UNAVAILABLE",
+            "message": "grok is unavailable",
+            "retryable": True,
+        },
+    )
+    attempt = _dispatched_attempt(store, created.session_id, first.command_id)
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE command_dispatches SET crossed_boundary = 1
+            WHERE attempt_id = ?
+            """,
+            (attempt.attempt_id,),
+        )
+
+    replayed, created_again = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "crossed-boundary",
+    )
+
+    assert not created_again
+    assert replayed.command_id == first.command_id
+    assert replayed.status == CommandStatus.FAILED
+    assert replayed.result["code"] == "E_PROVIDER_UNAVAILABLE"
+    assert store.claim_command(created.session_id) is None
+    store.close()
+
+
+def test_concurrent_resubmissions_requeue_a_failed_command_once(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    payload = {"text": "Retry exactly once."}
+    first = _failed_message(
+        store,
+        created.session_id,
+        payload,
+        "concurrent-resubmission",
+        {
+            "code": "E_PROVIDER_UNAVAILABLE",
+            "message": "grok is unavailable",
+            "retryable": True,
+        },
+    )
+    barrier = threading.Barrier(2)
+    receipts: list[Any] = []
+
+    def resubmit() -> None:
+        barrier.wait(timeout=5)
+        receipts.append(
+            store.ensure_message_command(
+                created.session_id,
+                payload,
+                "concurrent-resubmission",
+            )
+        )
+
+    threads = [threading.Thread(target=resubmit) for unused in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(receipts) == 2
+    for receipt, created_again in receipts:
+        assert not created_again
+        assert receipt.command_id == first.command_id
+        assert receipt.status == CommandStatus.QUEUED
+    assert len(_instruction_events(store, created.session_id)) == 1
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+    assert claimed.command_id == first.command_id
+    assert store.claim_command(created.session_id) is None
+    store.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(
         pytest.main(
