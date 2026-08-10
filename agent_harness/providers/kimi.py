@@ -12,11 +12,12 @@ Three consequences of that choice, all deliberate:
   still be interrupted and is contained in an isolated process group.
 - ``--yolo`` is NOT passed. Kimi rejects it together with ``--prompt``.
 - Restrictive harness permission modes stay unmappable (only ``full``
-  is accepted), the stream carries no bounded tool accounting, and a
-  positive child-agent limit cannot be metered, so ``run_turn`` raises
-  for those. A zero child-agent limit is accepted: containment comes
-  from deny rules for the Agent/AgentSwarm tools in the host's
-  ``~/.kimi-code/config.toml`` rather than from the harness gate.
+  is accepted) and a positive child-agent limit cannot be metered, so
+  ``run_turn`` raises for those. A zero child-agent limit is accepted:
+  containment comes from deny rules for the Agent/AgentSwarm tools in
+  the host's ``~/.kimi-code/config.toml`` rather than from the harness
+  gate. Tool calls are accounted: the stream-json ``tool_calls`` and
+  ``role: "tool"`` lines normalize to the canonical tool events.
 """
 
 from __future__ import annotations
@@ -151,6 +152,14 @@ class KimiAdapter(ProviderAdapter):
                         native_session_id=session_id,
                     )
                 )
+        except BaseException:
+            identity = self._process_group
+            if identity is not None:
+                cleanup = asyncio.create_task(
+                    terminate_process_group(process, identity)
+                )
+                await asyncio.shield(cleanup)
+            raise
         finally:
             self._active_process = None
             self._process_group = None
@@ -213,8 +222,8 @@ class KimiAdapter(ProviderAdapter):
         detail = "npx was not found"
         if npx_available:
             detail = (
-                "one-shot run; full permission mode only, tool usage "
-                "unaccounted, child agents contained by host config denies"
+                "one-shot run; full permission mode only, "
+                "child agents contained by host config denies"
             )
         return ProviderStatus(
             provider=self.provider_id,
@@ -226,6 +235,7 @@ class KimiAdapter(ProviderAdapter):
                 {
                     "resume",
                     "streaming",
+                    "tools",
                     "worktree",
                 }
             ),

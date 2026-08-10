@@ -631,6 +631,13 @@ def kimi_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
     The stream ends with a ``role: "meta"`` line of type
     ``session.resume_hint`` carrying the session id, so the turn's
     completion and its native session id arrive together.
+
+    Tool activity arrives as OpenAI-chat-shaped lines: an assistant
+    message carrying a ``tool_calls`` array, then a ``role: "tool"``
+    result message. Mapping both onto the canonical tool events lets
+    the turn guard count tool calls and treat completed tool work as
+    progress; leaving them as neutral provider events stalls every
+    long read-only inspection at the stagnation limit.
     """
     role = str(payload.get("role", ""))
     if role == "meta":
@@ -645,13 +652,102 @@ def kimi_payload(payload: dict[str, Any]) -> list[ProviderEvent]:
             )
         ]
     text = payload_text(payload.get("content"))
+    if role == "assistant":
+        events: list[ProviderEvent] = []
+        if text:
+            events.append(
+                ProviderEvent("agent.message", text=text, raw=payload)
+            )
+        events.extend(_kimi_tool_starts(payload))
+        if events:
+            return events
+        return [ProviderEvent("provider.event", raw=payload)]
+    if role == "tool":
+        completed = _kimi_tool_result(payload, text)
+        if completed is not None:
+            return [completed]
+        return [ProviderEvent("provider.event", raw=payload)]
     if not text:
         return [ProviderEvent("provider.event", raw=payload)]
-    if role == "assistant":
-        return [ProviderEvent("agent.message", text=text, raw=payload)]
     if role == "user":
         return [ProviderEvent("user.message", text=text, raw=payload)]
     return [ProviderEvent("provider.event", text=text, raw=payload)]
+
+
+def _kimi_tool_starts(payload: dict[str, Any]) -> list[ProviderEvent]:
+    tool_calls = payload.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return []
+    events: list[ProviderEvent] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        started = _kimi_tool_started(call, payload)
+        if started is not None:
+            events.append(started)
+    return events
+
+
+def _kimi_tool_started(
+    call: dict[str, Any],
+    payload: dict[str, Any],
+) -> ProviderEvent | None:
+    tool_id = _optional_text(call.get("id")).strip()
+    if not tool_id:
+        tool_id = _optional_text(call.get("tool_call_id")).strip()
+    name = _optional_text(call.get("name")).strip()
+    arguments = call.get("arguments")
+    function = call.get("function")
+    if isinstance(function, dict):
+        if not name:
+            name = _optional_text(function.get("name")).strip()
+        if arguments is None:
+            arguments = function.get("arguments")
+    if not tool_id or not name:
+        return None
+    metadata: dict[str, Any] = {
+        "id": tool_id,
+        "tool_call_id": tool_id,
+        "tool_use_id": tool_id,
+        "name": name,
+    }
+    if arguments is not None:
+        # The arguments keep distinct invocations of one tool apart in
+        # the guard's repetition fingerprints.
+        metadata["input"] = redact_observable(arguments)
+    return ProviderEvent(
+        "tool.started",
+        text=name,
+        status="running",
+        raw=payload,
+        metadata=metadata,
+    )
+
+
+def _kimi_tool_result(
+    payload: dict[str, Any],
+    text: str,
+) -> ProviderEvent | None:
+    tool_id = _optional_text(payload.get("tool_call_id")).strip()
+    if not tool_id:
+        tool_id = _optional_text(payload.get("id")).strip()
+    if not tool_id:
+        return None
+    metadata: dict[str, Any] = {
+        "id": tool_id,
+        "tool_call_id": tool_id,
+        "tool_use_id": tool_id,
+    }
+    name = _optional_text(payload.get("name"))
+    if name:
+        metadata["name"] = name
+    return ProviderEvent(
+        "tool.completed",
+        text=text,
+        status="complete",
+        raw=payload,
+        metadata=metadata,
+    )
 
 
 def payload_text(value: object) -> str:

@@ -21,6 +21,7 @@ from agent_harness.errors import (
     HarnessError,
     ProviderExhaustedError,
     ProviderUnavailableError,
+    SafetyGuardError,
 )
 from agent_harness.providers import base, claude, codex, grok, kimi, normalize
 from agent_harness.providers.base import (
@@ -2325,12 +2326,12 @@ def test_kimi_status_and_models(monkeypatch, tmp_path: Path) -> None:
     status = kimi.KimiAdapter().status()
     assert status.ready
     assert status.provider == "kimi"
-    assert "tool usage unaccounted" in status.detail
+    assert "child agents contained by host config denies" in status.detail
     # A one-shot run has no live turn to steer and cannot prompt for
     # approval, so neither capability is claimed.
     assert "approval" not in status.capabilities
     assert "streaming" in status.capabilities
-    assert "tools" not in status.capabilities
+    assert "tools" in status.capabilities
     assert "subagents" not in status.capabilities
 
     monkeypatch.setattr(kimi.shutil, "which", lambda _name: None)
@@ -2352,6 +2353,10 @@ def test_kimi_status_and_models(monkeypatch, tmp_path: Path) -> None:
 def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) -> None:
     lines = [
         b'{"role":"assistant","content":"ok"}\n',
+        b'{"role":"assistant","content":"","tool_calls":[{"id":"call_1",'
+        b'"type":"function","function":{"name":"Read",'
+        b'"arguments":"{\\"file_path\\":\\"README.md\\"}"}}]}\n',
+        b'{"role":"tool","tool_call_id":"call_1","content":"file contents"}\n',
         b'{"role":"meta","type":"session.resume_hint","session_id":"session_z"}\n',
         b"not json\n",
     ]
@@ -2405,7 +2410,12 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
 
     asyncio.run(scenario())
 
-    assert [e.event_type for e in seen] == ["agent.message", "turn.completed"]
+    assert [e.event_type for e in seen] == [
+        "agent.message",
+        "tool.started",
+        "tool.completed",
+        "turn.completed",
+    ]
 
 
 def test_kimi_run_turn_gates_on_a_positive_child_limit(
@@ -2544,6 +2554,77 @@ def test_kimi_run_turn_reports_a_nonzero_exit_as_a_failed_turn(
     assert [(item.event_type, item.text) for item in seen] == [
         ("turn.failed", "kimi: config.invalid")
     ]
+
+
+def test_kimi_run_turn_terminates_the_process_when_the_handler_rejects_an_event(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    lines = [b'{"role":"assistant","content":"guard trip"}\n']
+
+    class Stdout:
+        def __aiter__(self):
+            async def gen():
+                for line in lines:
+                    yield line
+
+            return gen()
+
+    class Stderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class Process:
+        pid = 42
+        stdout = Stdout()
+        stderr = Stderr()
+
+        async def wait(self) -> int:
+            return 0
+
+    process = Process()
+    identity = SimpleNamespace(pid=42, pgid=42, pid_start="start")
+
+    async def fake_exec(*_argv, **_kwargs):
+        return process
+
+    terminated: list[tuple[object, object]] = []
+
+    async def terminate(selected_process, selected_identity) -> None:
+        terminated.append((selected_process, selected_identity))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        kimi,
+        "process_group_identity",
+        lambda unused: identity,
+    )
+    monkeypatch.setattr(kimi, "terminate_process_group", terminate)
+
+    async def handler(_event: ProviderEvent) -> None:
+        raise SafetyGuardError("stagnation", "kimi")
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def scenario() -> None:
+        adapter = kimi.KimiAdapter()
+        with pytest.raises(SafetyGuardError, match="stagnation"):
+            await adapter.run_turn(
+                workspace=tmp_path,
+                prompt="do it",
+                native_session_id="",
+                permission_mode="full",
+                model="kimi-code/k3",
+                effort="",
+                event_handler=handler,
+                approval_handler=approvals,
+            )
+        assert adapter.process_identity() == (0, "")
+
+    asyncio.run(scenario())
+
+    assert terminated == [(process, identity)]
 
 
 def test_grok_payload_normalizes_streaming_json() -> None:

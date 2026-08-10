@@ -11,6 +11,7 @@ import pytest
 from agent_harness.errors import SafetyGuardError
 from agent_harness.providers.base import ProviderEvent
 from agent_harness.providers.normalize import grok_payload
+from agent_harness.providers.normalize import kimi_payload
 from agent_harness.safety import (
     INTERACTIVE,
     LIVE_SMOKE,
@@ -1107,3 +1108,88 @@ def test_grok_normalized_tool_stream_refreshes_and_still_bounds_stagnation() -> 
     for event in stuck:
         guard.observe(event)
     assert guard.violation() == "stagnation"
+
+
+def _kimi_read_lines(call_id: str, path: str, content: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "arguments": '{"file_path": "' + path + '"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content,
+        },
+    ]
+
+
+def test_kimi_file_read_tool_activity_renews_the_stagnation_deadline() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    for index in range(4):
+        for line in _kimi_read_lines(
+            "call_" + str(index),
+            "src/file_" + str(index) + ".py",
+            "contents of file " + str(index),
+        ):
+            for event in kimi_payload(line):
+                guard.observe(event)
+        clock.advance(9)
+        assert guard.violation() == ""
+
+    assert guard.consumption.tool_calls == 4
+
+
+def test_kimi_plain_chatter_cannot_renew_the_stagnation_deadline() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(LIVE_SMOKE, "implementation"),
+        stagnation_seconds=10,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(100)
+
+    for index in range(3):
+        for event in kimi_payload(
+            {
+                "role": "assistant",
+                "content": "still inspecting " + str(index),
+            }
+        ):
+            guard.observe(event)
+        clock.advance(9)
+
+    assert guard.violation() == "stagnation"
+
+
+def test_kimi_repeated_identical_tool_pairs_still_trip_the_cycle_guard() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(100)
+
+    for index in range(3):
+        for line in _kimi_read_lines(
+            "call_" + str(index),
+            "src/same.py",
+            "identical contents",
+        ):
+            for event in kimi_payload(line):
+                guard.observe(event)
+
+    assert guard.violation() == "repeated-tool"

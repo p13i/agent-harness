@@ -420,6 +420,77 @@ def test_kimi_payload_falls_back_to_a_neutral_provider_event() -> None:
     ]
 
 
+def test_kimi_payload_maps_tool_activity_to_canonical_tool_events() -> None:
+    started = kimi_payload(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "arguments": '{"file_path": "README.md"}',
+                    },
+                }
+            ],
+        }
+    )
+    assert [(item.event_type, item.text) for item in started] == [
+        ("tool.started", "Read")
+    ]
+    assert started[0].metadata is not None
+    assert started[0].metadata["tool_use_id"] == "call_1"
+
+    completed = kimi_payload(
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "file contents",
+        }
+    )
+    assert [(item.event_type, item.text, item.status) for item in completed] == [
+        ("tool.completed", "file contents", "complete")
+    ]
+    assert completed[0].metadata is not None
+    assert completed[0].metadata["tool_use_id"] == "call_1"
+
+    mixed = kimi_payload(
+        {
+            "role": "assistant",
+            "content": "checking the file",
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "function": {"name": "Glob", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+    assert [item.event_type for item in mixed] == [
+        "agent.message",
+        "tool.started",
+    ]
+
+    malformed = kimi_payload(
+        {"role": "assistant", "content": "", "tool_calls": ["nope"]}
+    )
+    assert [(item.event_type, item.text) for item in malformed] == [
+        ("provider.event", "")
+    ]
+
+    anonymous_start = kimi_payload(
+        {"role": "assistant", "content": "", "tool_calls": [{}]}
+    )
+    assert [item.event_type for item in anonymous_start] == ["provider.event"]
+
+    anonymous_result = kimi_payload(
+        {"role": "tool", "content": "unpaired output"}
+    )
+    assert [item.event_type for item in anonymous_result] == ["provider.event"]
+
+
 def test_grok_payload_maps_end_and_error() -> None:
     from agent_harness.providers.normalize import grok_payload
 
