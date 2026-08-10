@@ -1151,10 +1151,36 @@ async def test_stop_releases_an_unaccepted_command_and_frees_the_route(
             implementation.command_id,
             provider="kimi",
         )
-        if implementation_status == "dispatching":
-            claimed_implementation = store.claim_command(created.session_id)
-            assert claimed_implementation is not None
-            assert claimed_implementation.command_id == implementation.command_id
+        claimed_implementation = store.claim_command(created.session_id)
+        assert claimed_implementation is not None
+        assert claimed_implementation.command_id == implementation.command_id
+        attempt = ProviderAttempt(
+            attempt_id=new_uuid(),
+            session_id=created.session_id,
+            provider="kimi",
+            native_session_id="kimi-native",
+            model="kimi-code/k3",
+            effort="medium",
+            auth_mode="subscription",
+            status="running",
+            started_at=utc_now(),
+            ended_at="",
+        )
+        store.create_attempt(attempt)
+        turn_id = store.start_turn(
+            created.session_id,
+            attempt.attempt_id,
+            turn_ref=implementation.turn_ref,
+        )
+        store.record_dispatch_checkpoint(
+            implementation.command_id,
+            attempt.attempt_id,
+            turn_id,
+            checkpoint.checkpoint_id,
+        )
+        store.mark_provider_boundary(attempt.attempt_id)
+        if implementation_status == "queued":
+            store.requeue_command(implementation.command_id)
         assert store.active_unattended_provider_count("kimi") == 1
         follower = session(workspace)
         store.create_session(follower)
