@@ -139,6 +139,15 @@ _GOAL_PROMOTION_EVIDENCE_COLUMNS = (
     "value_digest",
     "created_at",
 )
+# The checkpoint columns that carry workspace material. A context
+# digest, provider label, or native session id can change while the
+# tree the turn was dispatched against stands untouched, so none of
+# them is evidence that an implementation landed.
+_CHECKPOINT_MATERIAL_COLUMNS = (
+    "base_commit",
+    "patch_digest",
+    "untracked_digest",
+)
 _GOAL_CONTRACT_ADOPTION_COLUMNS = (
     "adoption_id",
     "session_id",
@@ -6331,8 +6340,9 @@ class StateStore:
         """Project a resolved dispatch onto the completion the log already proves.
 
         Returns ``None`` unless the accepted turn left an observable
-        terminal record. Every field is read back from the recorded
-        event log; nothing here reconstructs an unobserved outcome.
+        terminal record and moved the workspace. Every field is read
+        back from the recorded event log; nothing here reconstructs an
+        unobserved outcome.
         """
         if decision != ReconciliationDecision.ACCEPT_CURRENT:
             return None
@@ -6349,12 +6359,27 @@ class StateStore:
         # in this session, not just an id the audit happens to carry.
         checkpoint = connection.execute(
             """
-            SELECT checkpoint_id FROM checkpoints
+            SELECT base_commit, patch_digest, untracked_digest FROM checkpoints
             WHERE checkpoint_id = ? AND session_id = ?
             """,
             (checkpoint_id, session_id),
         ).fetchone()
         if checkpoint is None:
+            return None
+        # A provider can end its turn cleanly and say so without the
+        # implementation ever landing. Terminal provider status is not
+        # implementation completion, so the accepted workspace has to
+        # differ in material from the tree the dispatch started against.
+        pre_dispatch = connection.execute(
+            """
+            SELECT base_commit, patch_digest, untracked_digest FROM checkpoints
+            WHERE checkpoint_id = ? AND session_id = ?
+            """,
+            (str(reconciliation["pre_dispatch_checkpoint_id"]), session_id),
+        ).fetchone()
+        if pre_dispatch is None:
+            return None
+        if not _checkpoint_material_differs(pre_dispatch, checkpoint):
             return None
         command = connection.execute(
             "SELECT * FROM commands WHERE command_id = ?",
@@ -8967,6 +8992,17 @@ def _is_digest(value: str) -> bool:
     if len(value) != 64:
         return False
     return all(character in "0123456789abcdef" for character in value)
+
+
+def _checkpoint_material_differs(
+    before: sqlite3.Row,
+    after: sqlite3.Row,
+) -> bool:
+    """Report whether two checkpoints hold different workspace material."""
+    for column in _CHECKPOINT_MATERIAL_COLUMNS:
+        if str(before[column]) != str(after[column]):
+            return True
+    return False
 
 
 def _topology_receipt_binds(

@@ -3746,6 +3746,21 @@ def test_proof_route_admissibility_requires_bounded_binding_usage() -> None:
     )
 
 
+_PRE_DISPATCH_MATERIAL = {
+    "base_commit": "base",
+    "patch_digest": "patch",
+    "untracked_digest": "untracked",
+    "context_digest": "context",
+}
+# The default accepted workspace carries work the dispatch did not
+# start with, which is what separates a landed implementation from a
+# provider that merely stopped talking.
+_IMPLEMENTED_MATERIAL = {
+    **_PRE_DISPATCH_MATERIAL,
+    "patch_digest": "patch-implemented",
+}
+
+
 def _ambiguous_live_dispatch(
     tmp_path: Path,
     *,
@@ -3754,6 +3769,7 @@ def _ambiguous_live_dispatch(
     record_message: bool = True,
     message_after_completion: bool = False,
     contradiction: tuple[str, str] | None = None,
+    resolution_material: dict[str, str] | None = None,
 ) -> SimpleNamespace:
     """Reproduce a crossed-boundary dispatch whose turn already finished."""
     store = StateStore(tmp_path / "state.sqlite3")
@@ -3793,11 +3809,8 @@ def _ambiguous_live_dispatch(
         sequence=store.last_sequence(created.session_id),
         provider="claude",
         native_session_id=native_session_id,
-        base_commit="base",
-        patch_digest="patch",
-        untracked_digest="untracked",
-        context_digest="context",
         created_at=now,
+        **_PRE_DISPATCH_MATERIAL,
     )
     store.add_checkpoint(checkpoint)
     store.record_dispatch_checkpoint(
@@ -3848,17 +3861,17 @@ def _ambiguous_live_dispatch(
     assert len(recovery.reconciliations) == 1
     record = recovery.reconciliations[0]
     assert store.get_command(command.command_id).status == CommandStatus.FAILED
+    material = dict(_IMPLEMENTED_MATERIAL)
+    if resolution_material is not None:
+        material = dict(resolution_material)
     resolution = Checkpoint(
         checkpoint_id=new_uuid(),
         session_id=created.session_id,
         sequence=store.last_sequence(created.session_id),
         provider="claude",
         native_session_id="",
-        base_commit="base",
-        patch_digest="patch",
-        untracked_digest="untracked",
-        context_digest="context",
         created_at=utc_now(),
+        **material,
     )
     store.add_checkpoint(resolution)
     return SimpleNamespace(
@@ -4089,6 +4102,123 @@ def test_accept_current_without_certified_material_stays_ambiguous(
 
 
 @pytest.mark.parametrize(
+    "material",
+    [
+        # The accepted workspace is exact-clean against the tree the
+        # dispatch started from.
+        _PRE_DISPATCH_MATERIAL,
+        # Context and native identity move without any implementation
+        # landing, so neither is material.
+        {**_PRE_DISPATCH_MATERIAL, "context_digest": "context-after"},
+    ],
+)
+def test_accept_current_without_moved_material_stays_ambiguous(
+    tmp_path: Path,
+    material: dict[str, str],
+) -> None:
+    """A clean provider turn over unchanged material is not completion."""
+    rig = _ambiguous_live_dispatch(tmp_path, resolution_material=material)
+    store = rig.store
+
+    resolved = store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+
+    failed = store.get_command(rig.command.command_id)
+    assert failed.status == CommandStatus.FAILED
+    assert failed.result["code"] == "E_NEEDS_RECONCILIATION"
+    assert [item.status for item in store.attempts(rig.session.session_id)] == [
+        "ambiguous"
+    ]
+    envelope = store.command_envelope(rig.command.command_id)
+    assert envelope["state"] == "paused"
+    assert envelope["guard_reason"] == "ambiguous-provider-dispatch"
+    receipt = _topology(rig, resolved)
+    assert receipt["attempt_state"] == "ambiguous"
+    assert receipt["turn_state"] == "ambiguous"
+    assert receipt["dispatch_state"] == "ambiguous"
+    assert "command_status" not in receipt
+    assert "completion_evidence" not in receipt
+    with store.transaction() as connection:
+        dispatch = connection.execute(
+            "SELECT state FROM command_dispatches WHERE command_id = ?",
+            (rig.command.command_id,),
+        ).fetchone()
+    assert dispatch["state"] == "ambiguous"
+    store.close()
+
+
+def test_accept_current_requires_a_bound_pre_dispatch_anchor(
+    tmp_path: Path,
+) -> None:
+    """Material moved against a foreign anchor proves nothing here."""
+    rig = _ambiguous_live_dispatch(tmp_path)
+    store = rig.store
+    other = session(tmp_path / "other")
+    store.create_session(other)
+    foreign = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=other.session_id,
+        sequence=store.last_sequence(other.session_id),
+        provider="claude",
+        native_session_id="",
+        created_at=utc_now(),
+        **_PRE_DISPATCH_MATERIAL,
+    )
+    store.add_checkpoint(foreign)
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE reconciliations SET pre_dispatch_checkpoint_id = ?
+            WHERE reconciliation_id = ?
+            """,
+            (foreign.checkpoint_id, rig.record.reconciliation_id),
+        )
+
+    resolved = store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+
+    assert store.get_command(rig.command.command_id).status == CommandStatus.FAILED
+    receipt = _topology(rig, resolved)
+    assert receipt["attempt_state"] == "ambiguous"
+    assert "completion_evidence" not in receipt
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["base_commit", "patch_digest", "untracked_digest"],
+)
+def test_accept_current_accepts_any_moved_material_field(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    rig = _ambiguous_live_dispatch(
+        tmp_path,
+        resolution_material={**_PRE_DISPATCH_MATERIAL, field: "moved"},
+    )
+    store = rig.store
+
+    resolved = store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+
+    assert store.get_command(rig.command.command_id).status == CommandStatus.COMPLETE
+    assert _topology(rig, resolved)["command_status"] == "complete"
+    store.close()
+
+
+@pytest.mark.parametrize(
     "status,result",
     [
         (CommandStatus.FAILED, {"reconciliation_id": "other"}),
@@ -4255,6 +4385,47 @@ def test_resolved_reconciliation_projects_a_stranded_completion(
     ]
     assert len(repeated) == 1
     assert repeated[0].event_id == transition.event_id
+    store.close()
+
+
+def test_projection_declines_a_resolution_without_moved_material(
+    tmp_path: Path,
+) -> None:
+    """A stranded command stays stranded when the workspace never moved."""
+    rig = _ambiguous_live_dispatch(
+        tmp_path,
+        resolution_material=_PRE_DISPATCH_MATERIAL,
+    )
+    store = rig.store
+    store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    _strand_resolved_reconciliation(rig)
+
+    assert store.project_resolved_reconciliation(rig.record.reconciliation_id) is None
+
+    stranded = store.get_command(rig.command.command_id)
+    assert stranded.status == CommandStatus.FAILED
+    assert stranded.result["code"] == "E_SAFETY_GUARD"
+    assert [item.status for item in store.attempts(rig.session.session_id)] == [
+        "ambiguous"
+    ]
+    envelope = store.command_envelope(rig.command.command_id)
+    assert envelope["state"] == "paused"
+    assert envelope["guard_reason"] == "ambiguous-provider-dispatch"
+    receipt = store.reconciliation(rig.record.reconciliation_id).audit[
+        "topology_receipt"
+    ]
+    assert "command_status" not in receipt
+    assert "completion_evidence" not in receipt
+    assert not [
+        item
+        for item in store.all_events(rig.session.session_id)
+        if item.event_type == "reconciliation.projected"
+    ]
     store.close()
 
 
