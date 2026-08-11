@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 import agent_harness.storage as storage_module
+from agent_harness.blobs import BlobStore
 from agent_harness.errors import ConflictError
 from agent_harness.errors import NotFoundError
 from agent_harness.ids import new_uuid
@@ -31,6 +32,7 @@ from agent_harness.orchestration import normalized_digest
 from agent_harness.storage import PORTABLE_GLOBAL_TABLES
 from agent_harness.storage import PORTABLE_SESSION_TABLES
 from agent_harness.storage import StateStore
+from agent_harness.workspace import checkpoint_workspace
 from tests.test_support import session
 
 
@@ -2695,6 +2697,7 @@ def _transition_store(
     name: str,
     *,
     profile: str = "interactive",
+    checkpoint_change: bool = False,
 ) -> tuple[
     StateStore,
     Any,
@@ -2717,6 +2720,18 @@ def _transition_store(
         ["git", "-C", str(workspace), "commit", "--allow-empty", "-qm", "initial"],
         check=True,
     )
+    if checkpoint_change:
+        tracked = workspace / "tracked.txt"
+        tracked.write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(workspace), "add", "tracked.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(workspace), "commit", "-qm", "base"],
+            check=True,
+        )
+        tracked.write_text("accepted\n", encoding="utf-8")
     created = replace(
         session(workspace),
         external_ref={"orchestrator": "machines", "job_id": name},
@@ -2776,17 +2791,13 @@ def _transition_store(
     )
     material_digest, unused_summary = storage_module.inspect_workspace(workspace)
     del unused_summary
-    checkpoint = Checkpoint(
-        checkpoint_id=new_uuid(),
-        session_id=created.session_id,
+    checkpoint = checkpoint_workspace(
+        created,
+        BlobStore(root / (name + ".blobs")),
         sequence=store.last_sequence(created.session_id),
         provider="codex",
         native_session_id="native",
-        base_commit="base",
-        patch_digest="patch",
-        untracked_digest="untracked",
-        context_digest="context",
-        created_at=utc_now(),
+        context_text="context",
     )
     store.add_checkpoint(checkpoint)
     store.resolve_command(
@@ -3293,6 +3304,159 @@ def test_dispatch_transition_reservation_and_consumption_guards(
                 created.session_id,
                 new_uuid(),
                 Path(created.worktree),
+            )
+    store.close()
+
+
+def _checkpoint_collapse_transition(
+    tmp_path: Path,
+    name: str,
+) -> tuple[
+    StateStore,
+    Any,
+    dict[str, str],
+    dict[str, Any],
+    Any,
+    dict[str, Any],
+]:
+    store, created, policy, refs, payloads = _transition_store(
+        tmp_path,
+        name,
+        checkpoint_change=True,
+    )
+    authorization, anchor = _transition_authorization(
+        store,
+        created,
+        policy,
+        refs[0],
+        payloads[0],
+        "interactive",
+        1,
+    )
+    _create_transition(store, created, authorization, anchor, refs[0], name)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        payloads[0],
+        name + "-command",
+    )
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "interactive",
+        {"max_attempts": 1},
+    )
+    return store, created, refs[0], anchor, command, authorization
+
+
+def _commit_checkpoint_material(created: Any) -> None:
+    workspace = Path(created.worktree)
+    subprocess.run(
+        ["git", "-C", str(workspace), "add", "tracked.txt"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "-qm", "checkpoint collapse"],
+        check=True,
+    )
+
+
+def test_dispatch_transition_accepts_an_exact_checkpoint_collapse(
+    tmp_path: Path,
+) -> None:
+    store, created, turn_ref, anchor, command, unused_authorization = (
+        _checkpoint_collapse_transition(tmp_path, "collapse-before-reserve")
+    )
+    del unused_authorization
+    _commit_checkpoint_material(created)
+    collapsed_digest, unused_summary = storage_module.inspect_workspace(
+        Path(created.worktree)
+    )
+    del unused_summary
+    assert collapsed_digest != anchor["prior_material_digest"]
+    assert store.reserve_dispatch_generation_transition(
+        created.session_id,
+        command.command_id,
+        turn_ref,
+        collapsed_digest,
+    ) == "reserved"
+    with store.transaction() as connection:
+        store._consume_reserved_dispatch_transition(
+            connection,
+            created.session_id,
+            command.command_id,
+            Path(created.worktree),
+        )
+    collapse_events = [
+        event
+        for event in store.all_events(created.session_id)
+        if event.event_type.startswith("dispatch.generation.transition.")
+    ]
+    assert collapse_events[-2].metadata["material_binding"] == "checkpoint-collapse"
+    assert collapse_events[-1].metadata["material_binding"] == "checkpoint-collapse"
+    store.close()
+
+    store, created, turn_ref, anchor, command, unused_authorization = (
+        _checkpoint_collapse_transition(tmp_path, "collapse-after-reserve")
+    )
+    del unused_authorization
+    assert store.reserve_dispatch_generation_transition(
+        created.session_id,
+        command.command_id,
+        turn_ref,
+        str(anchor["prior_material_digest"]),
+    ) == "reserved"
+    _commit_checkpoint_material(created)
+    with store.transaction() as connection:
+        store._consume_reserved_dispatch_transition(
+            connection,
+            created.session_id,
+            command.command_id,
+            Path(created.worktree),
+        )
+    store.close()
+
+
+def test_dispatch_transition_rejects_a_changed_checkpoint_collapse(
+    tmp_path: Path,
+) -> None:
+    store, created, turn_ref, unused_anchor, command, unused_authorization = (
+        _checkpoint_collapse_transition(tmp_path, "changed-collapse")
+    )
+    del unused_anchor, unused_authorization
+    workspace = Path(created.worktree)
+    (workspace / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    _commit_checkpoint_material(created)
+    changed_digest, unused_summary = storage_module.inspect_workspace(workspace)
+    del unused_summary
+    assert store.reserve_dispatch_generation_transition(
+        created.session_id,
+        command.command_id,
+        turn_ref,
+        changed_digest,
+    ) == "material-mismatch"
+    store.close()
+
+    store, created, turn_ref, anchor, command, unused_authorization = (
+        _checkpoint_collapse_transition(tmp_path, "changed-after-reserve")
+    )
+    del unused_authorization
+    assert store.reserve_dispatch_generation_transition(
+        created.session_id,
+        command.command_id,
+        turn_ref,
+        str(anchor["prior_material_digest"]),
+    ) == "reserved"
+    workspace = Path(created.worktree)
+    (workspace / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    _commit_checkpoint_material(created)
+    with store.transaction() as connection:
+        with pytest.raises(ConflictError, match="live material changed"):
+            store._consume_reserved_dispatch_transition(
+                connection,
+                created.session_id,
+                command.command_id,
+                workspace,
             )
     store.close()
 

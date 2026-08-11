@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import json
 import os
+import stat
 import subprocess
 import tarfile
 from pathlib import Path, PurePosixPath
@@ -175,6 +177,87 @@ def restore_checkpoint(
     archive = blobs.get(checkpoint.untracked_digest)
     if archive:
         _extract_untracked(workspace, archive)
+
+
+def workspace_matches_checkpoint_collapse(
+    workspace: Path,
+    *,
+    base_commit: str,
+    patch_digest: str,
+    untracked_digest: str,
+) -> bool:
+    """Prove that a clean child commit contains exact checkpoint material."""
+    current_commit = _git(workspace, "rev-parse", "HEAD").stdout.strip()
+    if current_commit == base_commit:
+        return False
+    parent_line = _git(
+        workspace,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        current_commit,
+    ).stdout.strip()
+    if parent_line.split() != [current_commit, base_commit]:
+        return False
+    current_patch = _git_bytes(
+        workspace,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "HEAD",
+    )
+    if current_patch:
+        return False
+    if special_workspace_objects(workspace):
+        return False
+    collapsed_patch = _git_bytes(
+        workspace,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        base_commit,
+    )
+    if hashlib.sha256(collapsed_patch).hexdigest() != patch_digest:
+        return False
+    current_untracked = _untracked_archive(workspace)
+    if hashlib.sha256(current_untracked).hexdigest() != untracked_digest:
+        return False
+    return True
+
+
+def special_workspace_objects(root: Path) -> list[tuple[bytes, int]]:
+    pending = [root]
+    records = []
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise HarnessError(
+                "E_WORKSPACE_INSPECTION",
+                "Workspace material changed during inspection",
+                status=409,
+            ) from error
+        for entry in entries:
+            if directory == root and entry.name == ".git":
+                continue
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as error:
+                raise HarnessError(
+                    "E_WORKSPACE_INSPECTION",
+                    "Workspace material changed during inspection",
+                    status=409,
+                ) from error
+            if stat.S_ISDIR(mode):
+                pending.append(Path(entry.path))
+                continue
+            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                continue
+            relative = Path(entry.path).relative_to(root)
+            records.append((os.fsencode(str(relative)), stat.S_IFMT(mode)))
+    return sorted(records)
 
 
 def workspace_summary(workspace: Path) -> str:

@@ -20,6 +20,7 @@ import pytest
 import agent_harness.reconciliation as reconciliation_module
 import agent_harness.safety as safety_module
 import agent_harness.worker as worker_module
+import agent_harness.workspace as workspace_module
 import agent_harness.workspace_state as workspace_state_module
 from agent_harness import child_gate
 from agent_harness import process_control as process_control_module
@@ -4255,6 +4256,101 @@ def _install_transition_policy(
 
 
 @pytest.mark.asyncio
+async def test_e2e_provider_switch_accepts_an_exact_checkpoint_collapse(
+    tmp_path: Path,
+) -> None:
+    external_ref = {
+        "orchestrator": "p13i/machines/cs-builder",
+        "job_id": "provider-switch-checkpoint-collapse",
+    }
+    rig = JourneyRig(tmp_path, external_ref=external_ref)
+    workspace = Path(rig.session.worktree)
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(workspace), "add", "tracked.txt"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "-qm", "base"],
+        check=True,
+    )
+    tracked.write_text("accepted\n", encoding="utf-8")
+    next_turn_ref = {"step_id": "review", "agent_role": "reviewer"}
+    next_payload = {
+        "text": "Review the exact collapsed checkpoint.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["reviewer"],
+        allowed_step_prefixes=["review"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        prior = await rig.message(
+            "Complete implementation before the provider switch.",
+            provider="claude",
+            turn_ref={"step_id": "implement", "agent_role": "builder"},
+        )
+        assert prior.status == "complete"
+        transition = _advance_orchestration_generation(
+            rig,
+            prior.command_id,
+            next_turn_ref,
+            "provider-switch-checkpoint-collapse",
+            policy,
+            1,
+            next_payload,
+        )
+        authorized_digest = inspect_workspace(workspace)[0]
+        subprocess.run(
+            ["git", "-C", str(workspace), "add", "tracked.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(workspace), "commit", "-qm", "collapse"],
+            check=True,
+        )
+        assert inspect_workspace(workspace)[0] != authorized_digest
+
+        reviewed = await rig.message(**next_payload)
+
+        assert reviewed.status == "complete", reviewed.result
+        transition_events = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.metadata.get("invalidation_id") == transition["invalidation_id"]
+            and event.event_type.startswith("dispatch.generation.transition.")
+        ]
+        assert [event.status for event in transition_events] == [
+            "reserved",
+            "consumed",
+        ]
+        assert all(
+            event.metadata["material_binding"] == "checkpoint-collapse"
+            for event in transition_events
+        )
+        assert len(rig.adapters["claude"].prompts) == 1
+        assert len(rig.adapters["codex"].prompts) == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_e2e_control_anchor_consumes_exact_next_message(
     tmp_path: Path,
 ) -> None:
@@ -6226,7 +6322,7 @@ def test_workspace_inspection_rejects_material_that_moves_underneath_it(
         workspace_state_module._git(tmp_path / "not-a-repository", "status")
 
     with pytest.raises(HarnessError, match="changed during inspection"):
-        workspace_state_module._special_workspace_objects(tmp_path / "absent")
+        workspace_module.special_workspace_objects(tmp_path / "absent")
 
     class UnstableEntry:
         def __init__(self, path: Path) -> None:
@@ -6243,7 +6339,7 @@ def test_workspace_inspection_rejects_material_that_moves_underneath_it(
         lambda directory: [UnstableEntry(Path(directory) / "vanished")],
     )
     with pytest.raises(HarnessError, match="changed during inspection"):
-        workspace_state_module._special_workspace_objects(workspace)
+        workspace_module.special_workspace_objects(workspace)
 
 
 @pytest.mark.asyncio

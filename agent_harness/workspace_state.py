@@ -9,7 +9,11 @@ import subprocess
 from pathlib import Path
 
 from agent_harness.errors import HarnessError
-from agent_harness.workspace import git_stderr_tail, workspace_summary
+from agent_harness.workspace import (
+    git_stderr_tail,
+    special_workspace_objects,
+    workspace_summary,
+)
 
 
 def inspect_workspace(workspace: Path) -> tuple[str, str]:
@@ -64,7 +68,7 @@ def inspect_workspace(workspace: Path) -> tuple[str, str]:
         digest.update(b"\0")
         digest.update(target.read_bytes())
         digest.update(b"\0")
-    special_objects = _special_workspace_objects(root)
+    special_objects = special_workspace_objects(root)
     if special_objects:
         digest.update(b"\0special-objects\0")
     for raw_path, object_type in special_objects:
@@ -73,42 +77,6 @@ def inspect_workspace(workspace: Path) -> tuple[str, str]:
         digest.update(str(object_type).encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest(), workspace_summary(root)
-
-
-def _special_workspace_objects(root: Path) -> list[tuple[bytes, int]]:
-    pending = [root]
-    records = []
-    while pending:
-        directory = pending.pop()
-        try:
-            entries = list(os.scandir(directory))
-        except OSError as error:
-            raise HarnessError(
-                "E_WORKSPACE_INSPECTION",
-                "Workspace material changed during inspection",
-                status=409,
-            ) from error
-        for entry in entries:
-            if directory == root and entry.name == ".git":
-                continue
-            try:
-                mode = entry.stat(follow_symlinks=False).st_mode
-            except OSError as error:
-                raise HarnessError(
-                    "E_WORKSPACE_INSPECTION",
-                    "Workspace material changed during inspection",
-                    status=409,
-                ) from error
-            if stat.S_ISDIR(mode):
-                pending.append(Path(entry.path))
-                continue
-            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-                continue
-            relative = Path(entry.path).relative_to(root)
-            records.append((os.fsencode(str(relative)), stat.S_IFMT(mode)))
-    return sorted(records)
-
-
 def _git(workspace: Path, *arguments: str) -> bytes:
     completed = subprocess.run(
         ["git", "-C", str(workspace), *arguments],

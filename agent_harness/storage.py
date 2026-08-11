@@ -49,6 +49,7 @@ from agent_harness.orchestration import (
     normalized_digest,
 )
 from agent_harness.safety import effort_requires_xhigh_authorization
+from agent_harness.workspace import workspace_matches_checkpoint_collapse
 from agent_harness.workspace_state import inspect_workspace
 
 SCHEMA_VERSION = 5
@@ -4678,8 +4679,23 @@ class StateStore:
                 authorization,
             ):
                 return "epoch-mismatch"
-            if authorization.get("prior_material_digest") != live_material_digest:
+            session = connection.execute(
+                "SELECT worktree FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
                 return "material-mismatch"
+            if not _dispatch_transition_material_is_current(
+                connection,
+                session_id,
+                authorization,
+                Path(str(session["worktree"])),
+                live_material_digest,
+            ):
+                return "material-mismatch"
+            material_binding = "digest"
+            if authorization.get("prior_material_digest") != live_material_digest:
+                material_binding = "checkpoint-collapse"
             expected_turn_ref = normalize_turn_ref(authorization.get("next_turn_ref"))
             if normalized_turn_ref != expected_turn_ref:
                 return "stage-mismatch"
@@ -4765,6 +4781,7 @@ class StateStore:
                     "prior_command_id": str(authorization.get("prior_command_id", "")),
                     "epoch_id": str(authorization.get("epoch_id", "")),
                     "next_turn_ref": normalized_turn_ref,
+                    "material_binding": material_binding,
                 },
             )
             connection.execute(
@@ -4848,8 +4865,17 @@ class StateStore:
             raise ConflictError("dispatch transition epoch is stale")
         live_material_digest, unused_summary = inspect_workspace(workspace)
         del unused_summary
-        if authorization.get("prior_material_digest") != live_material_digest:
+        if not _dispatch_transition_material_is_current(
+            connection,
+            session_id,
+            authorization,
+            workspace,
+            live_material_digest,
+        ):
             raise ConflictError("dispatch transition live material changed")
+        material_binding = "digest"
+        if authorization.get("prior_material_digest") != live_material_digest:
+            material_binding = "checkpoint-collapse"
         command = connection.execute(
             "SELECT command_type, payload_json FROM commands WHERE command_id = ?",
             (command_id,),
@@ -4890,6 +4916,7 @@ class StateStore:
                 "invalidation_id": invalidation_id,
                 "command_id": command_id,
                 "epoch_id": str(authorization.get("epoch_id", "")),
+                "material_binding": material_binding,
             },
         )
         cursor = connection.execute(
@@ -9392,6 +9419,34 @@ def _dispatch_transition_anchor(
         "prior_reconciliation_id": reconciliation_id,
         "prior_reconciliation_resolution": reconciliation_resolution,
     }
+
+
+def _dispatch_transition_material_is_current(
+    connection: sqlite3.Connection,
+    session_id: str,
+    authorization: dict[str, Any],
+    workspace: Path,
+    live_material_digest: str,
+) -> bool:
+    if authorization.get("prior_material_digest") == live_material_digest:
+        return True
+    checkpoint_id = str(authorization.get("prior_checkpoint_id", ""))
+    checkpoint = connection.execute(
+        """
+        SELECT base_commit, patch_digest, untracked_digest
+        FROM checkpoints
+        WHERE checkpoint_id = ? AND session_id = ?
+        """,
+        (checkpoint_id, session_id),
+    ).fetchone()
+    if checkpoint is None:
+        return False
+    return workspace_matches_checkpoint_collapse(
+        workspace,
+        base_commit=str(checkpoint["base_commit"]),
+        patch_digest=str(checkpoint["patch_digest"]),
+        untracked_digest=str(checkpoint["untracked_digest"]),
+    )
 
 
 def _dispatch_transition_epoch_is_active(

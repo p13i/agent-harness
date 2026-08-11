@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from agent_harness.workspace import (
     create_worktree,
     remove_worktree,
     restore_checkpoint,
+    workspace_matches_checkpoint_collapse,
     workspace_summary,
 )
 
@@ -67,6 +69,54 @@ def test_checkpoint_restores_tracked_and_untracked_files(
     assert (target / "new.txt").read_text(encoding="utf-8") == "new\n"
     assert (target / "new-link").is_symlink()
     assert (target / "new-link").readlink() == Path("new.txt")
+
+
+def test_workspace_proves_only_an_exact_checkpoint_collapse(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    repository(source)
+    current = session(source)
+    blobs = BlobStore(tmp_path / "blobs")
+    (source / "tracked.txt").write_text("accepted\n", encoding="utf-8")
+    checkpoint = checkpoint_workspace(
+        current,
+        blobs,
+        sequence=1,
+        provider="codex",
+        native_session_id="native",
+        context_text="context",
+    )
+    arguments = {
+        "base_commit": checkpoint.base_commit,
+        "patch_digest": checkpoint.patch_digest,
+        "untracked_digest": checkpoint.untracked_digest,
+    }
+    assert not workspace_matches_checkpoint_collapse(source, **arguments)
+
+    git(source, "add", "tracked.txt")
+    git(source, "commit", "-qm", "collapse")
+    assert workspace_matches_checkpoint_collapse(source, **arguments)
+
+    (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    assert not workspace_matches_checkpoint_collapse(source, **arguments)
+    git(source, "restore", "tracked.txt")
+    assert not workspace_matches_checkpoint_collapse(
+        source,
+        **{**arguments, "patch_digest": "0" * 64},
+    )
+    assert not workspace_matches_checkpoint_collapse(
+        source,
+        **{**arguments, "untracked_digest": "0" * 64},
+    )
+
+    special = source / "special"
+    os.mkfifo(special)
+    assert not workspace_matches_checkpoint_collapse(source, **arguments)
+    special.unlink()
+
+    git(source, "commit", "--allow-empty", "-qm", "later")
+    assert not workspace_matches_checkpoint_collapse(source, **arguments)
 
 
 def test_workspace_rejects_collisions_mismatches_and_git_failures(
