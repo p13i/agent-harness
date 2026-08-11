@@ -7176,11 +7176,23 @@ class StateStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT COUNT(*) AS count FROM command_envelopes
-                WHERE provider = ? AND profile = 'unattended'
-                AND state IN ('reserved', 'running', 'fault-ready', 'recovering')
+                SELECT COUNT(*) AS count
+                FROM command_envelopes AS envelope
+                JOIN commands AS command
+                    ON command.command_id = envelope.command_id
+                WHERE envelope.provider = ?
+                AND envelope.profile = 'unattended'
+                AND envelope.state IN (
+                    'reserved', 'running', 'fault-ready', 'recovering'
+                )
+                AND command.status IN (?, ?, ?)
                 """,
-                (provider,),
+                (
+                    provider,
+                    CommandStatus.QUEUED,
+                    CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                    CommandStatus.DISPATCHING,
+                ),
             ).fetchone()
         return int(row["count"])
 
@@ -7192,13 +7204,21 @@ class StateStore:
                 FROM command_envelopes AS envelope
                 JOIN sessions AS session
                     ON session.session_id = envelope.session_id
+                JOIN commands AS command
+                    ON command.command_id = envelope.command_id
                 WHERE session.goal_id = ?
                 AND envelope.state IN (
                     'reserved', 'running', 'fault-ready', 'recovering'
                 )
                 AND envelope.provider != ''
+                AND command.status IN (?, ?, ?)
                 """,
-                (goal_id,),
+                (
+                    goal_id,
+                    CommandStatus.QUEUED,
+                    CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                    CommandStatus.DISPATCHING,
+                ),
             ).fetchone()
         return int(row["count"])
 

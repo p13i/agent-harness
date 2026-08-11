@@ -1695,6 +1695,47 @@ def test_safety_envelope_guard_and_lease_are_durable(
     store.close()
 
 
+def test_terminal_command_envelope_does_not_consume_concurrency(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "terminal-envelope.sqlite3")
+    created = session(tmp_path)
+    store.create_session(created)
+    goal = create_goal(created.session_id, "Release terminal reservations.")
+    store.create_goal(goal)
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "attempt provider work"},
+        "terminal-envelope",
+    )
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        {"max_attempts": 1},
+    )
+    store.update_command_envelope(
+        command.command_id,
+        provider="kimi",
+        state="reserved",
+    )
+
+    assert store.active_unattended_provider_count("kimi") == 1
+    assert store.active_goal_command_count(goal.goal_id) == 1
+
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE commands SET status = ? WHERE command_id = ?",
+            (CommandStatus.FAILED, command.command_id),
+        )
+
+    assert store.command_envelope(command.command_id)["state"] == "reserved"
+    assert store.active_unattended_provider_count("kimi") == 0
+    assert store.active_goal_command_count(goal.goal_id) == 0
+    store.close()
+
+
 @pytest.mark.parametrize("same_provider", [True, False])
 def test_route_admission_is_atomic_across_store_connections(
     tmp_path: Path,
