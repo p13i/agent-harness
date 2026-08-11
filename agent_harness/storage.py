@@ -7046,12 +7046,25 @@ class StateStore:
             if profile == "unattended":
                 provider_row = connection.execute(
                     """
-                    SELECT COUNT(*) AS count FROM command_envelopes
-                    WHERE provider = ? AND profile = 'unattended'
-                    AND state IN ('reserved', 'running', 'fault-ready', 'recovering')
-                    AND command_id != ?
+                    SELECT COUNT(*) AS count
+                    FROM command_envelopes AS active_envelope
+                    JOIN commands AS active_command
+                        ON active_command.command_id = active_envelope.command_id
+                    WHERE active_envelope.provider = ?
+                    AND active_envelope.profile = 'unattended'
+                    AND active_envelope.state IN (
+                        'reserved', 'running', 'fault-ready', 'recovering'
+                    )
+                    AND active_command.status IN (?, ?, ?)
+                    AND active_envelope.command_id != ?
                     """,
-                    (provider, command_id),
+                    (
+                        provider,
+                        CommandStatus.QUEUED,
+                        CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                        CommandStatus.DISPATCHING,
+                        command_id,
+                    ),
                 ).fetchone()
                 if provider_row is not None and int(provider_row["count"]) >= 1:
                     return {
@@ -7066,14 +7079,23 @@ class StateStore:
                     FROM command_envelopes AS active_envelope
                     JOIN sessions AS active_session
                         ON active_session.session_id = active_envelope.session_id
+                    JOIN commands AS active_command
+                        ON active_command.command_id = active_envelope.command_id
                     WHERE active_session.goal_id = ?
                     AND active_envelope.state IN (
                         'reserved', 'running', 'fault-ready', 'recovering'
                     )
                     AND active_envelope.provider != ''
+                    AND active_command.status IN (?, ?, ?)
                     AND active_envelope.command_id != ?
                     """,
-                    (goal_id, command_id),
+                    (
+                        goal_id,
+                        CommandStatus.QUEUED,
+                        CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                        CommandStatus.DISPATCHING,
+                        command_id,
+                    ),
                 ).fetchone()
                 if goal_row is not None and int(goal_row["count"]) >= max_concurrency:
                     return {

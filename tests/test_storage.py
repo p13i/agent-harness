@@ -1733,6 +1733,33 @@ def test_terminal_command_envelope_does_not_consume_concurrency(
     assert store.command_envelope(command.command_id)["state"] == "reserved"
     assert store.active_unattended_provider_count("kimi") == 0
     assert store.active_goal_command_count(goal.goal_id) == 0
+
+    next_command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "attempt replacement provider work"},
+        "replacement-envelope",
+    )
+    store.create_command_envelope(
+        next_command.command_id,
+        created.session_id,
+        "unattended",
+        {"max_attempts": 1},
+    )
+    store.register_worker(created.session_id, 123, "replacement-worker")
+    admission = store.reserve_route_admission(
+        next_command.command_id,
+        "kimi",
+        "unattended",
+        worker_incarnation="replacement-worker",
+        goal_id=goal.goal_id,
+        max_concurrency=1,
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+    )
+
+    assert admission["admitted"] is True
+    assert store.active_unattended_provider_count("kimi") == 1
+    assert store.active_goal_command_count(goal.goal_id) == 1
     store.close()
 
 
