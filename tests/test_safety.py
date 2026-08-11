@@ -1193,3 +1193,149 @@ def test_kimi_repeated_identical_tool_pairs_still_trip_the_cycle_guard() -> None
                 guard.observe(event)
 
     assert guard.violation() == "repeated-tool"
+
+
+def test_terminal_turn_accounting_cannot_stop_the_turn_it_reports() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_total_tokens=1_000))
+    guard.begin_attempt(100)
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            status="complete",
+            metadata={
+                "input_tokens": 900,
+                "output_tokens": 400,
+                "total_tokens": 1_300,
+            },
+        )
+    )
+
+    # The overage is charged to the envelope, and the completed turn
+    # keeps its result.
+    assert guard.violation() == "total-tokens"
+    assert guard.snapshot()["consumption"]["total_tokens"] == 1_300
+    assert guard.live_violation() == ""
+    assert guard.terminal_violation() == ""
+
+
+def test_accounting_before_the_terminal_turn_still_stops_the_turn() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_total_tokens=1_000))
+    guard.begin_attempt(100)
+    guard.observe(
+        ProviderEvent(
+            "usage.updated",
+            metadata={
+                "input_tokens": 900,
+                "output_tokens": 400,
+                "total_tokens": 1_300,
+            },
+        )
+    )
+
+    assert guard.live_violation() == "total-tokens"
+
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            status="complete",
+            metadata={"total_tokens": 1_300},
+        )
+    )
+
+    assert guard.live_violation() == "total-tokens"
+    assert guard.terminal_violation() == "total-tokens"
+
+
+def test_incomplete_terminal_event_keeps_accounting_enforcement() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_total_tokens=1_000))
+    guard.begin_attempt(100)
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            status="failed",
+            metadata={
+                "input_tokens": 900,
+                "output_tokens": 400,
+                "total_tokens": 1_300,
+            },
+        )
+    )
+
+    assert guard.live_violation() == "total-tokens"
+    assert guard.terminal_violation() == "total-tokens"
+
+
+def test_terminal_precedence_keeps_a_wedged_provider_interruptible() -> None:
+    clock = Clock()
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(
+        replace(base, stagnation_seconds=10),
+        monotonic=clock,
+    )
+    guard.begin_attempt(100)
+    guard.observe(ProviderEvent("turn.completed", status="complete"))
+    clock.advance(10)
+
+    assert guard.live_violation() == "stagnation"
+    assert guard.terminal_violation() == ""
+
+
+def test_over_budget_terminal_usage_cannot_shadow_a_wedged_provider() -> None:
+    clock = Clock()
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(
+        replace(
+            base,
+            max_total_tokens=1_000,
+            max_seconds=100,
+            stagnation_seconds=10,
+        ),
+        monotonic=clock,
+    )
+    guard.begin_attempt(100)
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            status="complete",
+            metadata={
+                "input_tokens": 900,
+                "output_tokens": 400,
+                "total_tokens": 1_300,
+            },
+        )
+    )
+
+    # The terminal event both retains the accounting reason and stops
+    # this turn from being converted to a failure.
+    assert guard.violation() == "total-tokens"
+    assert guard.live_violation() == ""
+
+    # The provider wedges instead of returning its result.
+    clock.advance(10)
+
+    assert guard.live_violation() == "stagnation"
+
+    clock.advance(90)
+
+    assert guard.live_violation() == "seconds"
+    # The snapshot still reports the post-terminal accounting.
+    snapshot = guard.snapshot()
+    assert snapshot["violation"] == "total-tokens"
+    assert snapshot["consumption"]["total_tokens"] == 1_300
+    assert snapshot["consumption"]["elapsed_seconds"] == 100
+    assert guard.terminal_violation() == ""
+
+
+def test_a_new_attempt_clears_the_previous_terminal_result() -> None:
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(replace(base, max_total_tokens=1_000))
+    guard.begin_attempt(100)
+    assert guard.note_provider_terminal() == ""
+    assert guard.note_provider_terminal() == ""
+
+    guard.begin_attempt(2_000)
+
+    assert guard.terminal_violation() == "total-tokens"

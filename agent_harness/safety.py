@@ -21,6 +21,30 @@ LIVE_SMOKE = "live-smoke"
 PROFILES = frozenset({INTERACTIVE, UNATTENDED, LIVE_SMOKE})
 MINIMUM_STATE_FREE_BYTES = 2 * 1024 * 1024 * 1024
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+# Providers spell a completed turn differently; every spelling ends the
+# turn, while any other status on the event leaves it incomplete.
+COMPLETED_TURN_STATUSES = frozenset(
+    {
+        "",
+        "complete",
+        "completed",
+        "success",
+        "ok",
+    }
+)
+# Violations that consumption accounting raises. Accounting can still
+# arrive after a terminal provider result, so only these reasons are
+# subject to terminal precedence.
+ACCOUNTING_VIOLATIONS = frozenset(
+    {
+        "context-tokens",
+        "output-tokens",
+        "total-tokens",
+        "tool-calls",
+        "child-agents",
+        "dollars",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -448,6 +472,8 @@ class TurnGuard:
         self._completed_tool_pair = ""
         self._seen_child_ids: set[str] = set()
         self._violation = ""
+        self._provider_terminal = False
+        self._pre_terminal_violation = ""
         self._warning_sent = False
         self._attempt_estimated_total = 0
         self._attempt_estimated_output = 0
@@ -465,6 +491,8 @@ class TurnGuard:
         charge_reported_cost: bool = True,
     ) -> str:
         self.consumption.attempts += 1
+        self._provider_terminal = False
+        self._pre_terminal_violation = ""
         submitted = max(0, context_tokens)
         self.consumption.context_tokens += submitted
         self._attempt_estimated_total = submitted
@@ -479,6 +507,8 @@ class TurnGuard:
     def observe(self, event: ProviderEvent) -> str:
         if event.event_type == "usage.updated":
             self._observe_usage(event.metadata)
+        if _completed_turn(event):
+            self.note_provider_terminal()
         if event.event_type == "turn.completed":
             self._observe_usage(event.metadata)
         if event.event_type == "turn.failed":
@@ -546,6 +576,44 @@ class TurnGuard:
             self.consumption.child_agents,
             consumed,
         )
+
+    def note_provider_terminal(self) -> str:
+        """Latch the guard state a terminal provider result inherits.
+
+        Usage reported with or after a terminal result accounts for
+        work the turn already finished. It still charges the envelope,
+        but it describes no work left to stop.
+        """
+        if not self._provider_terminal:
+            self._pre_terminal_violation = self.violation()
+            self._provider_terminal = True
+        return self._pre_terminal_violation
+
+    def live_violation(self) -> str:
+        """Return the violation that may still interrupt provider work.
+
+        ``violation`` retains the first reason it records, so a reason
+        raised before the terminal result is also the pre-terminal
+        reason. Accounting reasons raised after it describe finished
+        work. A provider that never returns after its terminal event
+        is still running, so the time limits are re-read behind a
+        retained post-terminal accounting reason instead of being
+        shadowed by it.
+        """
+        violation = self.violation()
+        if not self._provider_terminal:
+            return violation
+        if violation not in ACCOUNTING_VIOLATIONS:
+            return violation
+        if self._pre_terminal_violation:
+            return self._pre_terminal_violation
+        return self._time_violation()
+
+    def terminal_violation(self) -> str:
+        """Return the violation that may fail a delivered result."""
+        if not self._provider_terminal:
+            return self.violation()
+        return self._pre_terminal_violation
 
     def violation(self) -> str:
         if self._violation:
@@ -617,6 +685,7 @@ class TurnGuard:
         if self._violation != "stagnation":
             raise ValueError("hard safety violations cannot recover")
         self._violation = ""
+        self._pre_terminal_violation = ""
         self._last_progress = self._monotonic()
         self._tool_pairs.clear()
         self._pending_tools.clear()
@@ -631,6 +700,16 @@ class TurnGuard:
             "warning": self._warning_sent,
             "violation": self._violation,
         }
+
+    def _time_violation(self) -> str:
+        """Re-read the time limits independently of the retained reason."""
+        now = self._monotonic()
+        self.consumption.elapsed_seconds = self._elapsed_offset + now - self._started
+        if self.consumption.elapsed_seconds >= self.limits.max_seconds:
+            return "seconds"
+        if now - self._last_progress >= self.limits.stagnation_seconds:
+            return "stagnation"
+        return ""
 
     def _observe_usage(self, value: object) -> None:
         normalized = normalize_usage(value)
@@ -726,6 +805,12 @@ def _is_grok_tool_progress(event: ProviderEvent) -> bool:
     if isinstance(tool_call_id, str) and tool_call_id:
         return True
     return False
+
+
+def _completed_turn(event: ProviderEvent) -> bool:
+    if event.event_type != "turn.completed":
+        return False
+    return event.status.strip().casefold() in COMPLETED_TURN_STATUSES
 
 
 def _tool_started(event_type: str) -> bool:

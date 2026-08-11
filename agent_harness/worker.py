@@ -1594,7 +1594,7 @@ class SessionWorker:
                     await self._control(control)
                 child_gate_state = self.store.child_launch_gate(command_id)
                 guard.note_child_admissions(int(child_gate_state["consumed"]))
-                violation = guard.violation()
+                violation = guard.live_violation()
                 if violation:
                     await self._interrupt_guarded_turn(
                         adapter,
@@ -1649,6 +1649,12 @@ class SessionWorker:
                 raise WorkerOwnershipLostError(
                     "worker incarnation lost result ownership"
                 )
+            # Adapters that never emit a terminal event still deliver a
+            # complete result here. Latch terminal precedence before the
+            # result usage is charged so that accounting cannot fail a
+            # turn the provider already finished.
+            if result.status == "complete":
+                guard.note_provider_terminal()
             guard.observe(
                 ProviderEvent(
                     "usage.updated",
@@ -1753,7 +1759,7 @@ class SessionWorker:
         if decision.credits_engaged and not guard.consumption.exact_dollars:
             terminal_guard_reason = "dollar-accounting"
         if not terminal_guard_reason:
-            terminal_guard_reason = guard.violation()
+            terminal_guard_reason = guard.terminal_violation()
         checkpoint = pre_dispatch_checkpoint
         completed_material_digest = ""
         if terminal_guard_reason or (

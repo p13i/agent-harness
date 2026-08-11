@@ -2112,6 +2112,15 @@ async def test_stagnation_after_acceptance_requires_reconciliation(
         def violation(self) -> str:
             return "stagnation"
 
+        def note_provider_terminal(self) -> str:
+            return self.violation()
+
+        def live_violation(self) -> str:
+            return self.violation()
+
+        def terminal_violation(self) -> str:
+            return self.violation()
+
         def warning_due(self) -> bool:
             return False
 
@@ -4805,6 +4814,135 @@ async def test_e2e_noncomplete_terminal_guard_never_anchors_a_transition(
         assert anchor["reason"] == (
             "dispatch transition requires exactly one reconciliation"
         )
+    finally:
+        rig.close()
+
+
+class TerminalUsageAdapter(ScriptedAdapter):
+    """Reports the whole turn's usage on the terminal turn event."""
+
+    async def run_turn(self, **values: Any) -> ProviderResult:
+        pre_prompt_gate = values["pre_prompt_gate"]
+        if pre_prompt_gate is not None:
+            await pre_prompt_gate()
+        event_handler = values["event_handler"]
+        await event_handler(
+            ProviderEvent(
+                "provider.prompt.accepted",
+                status="accepted",
+                native_session_id="claude-native-session",
+            )
+        )
+        await event_handler(
+            ProviderEvent(
+                "agent.message",
+                text="claude implemented the stage",
+                status="complete",
+            )
+        )
+        usage = {
+            "input_tokens": 110_000,
+            "output_tokens": 10_000,
+            "total_tokens": 120_000,
+        }
+        await event_handler(
+            ProviderEvent(
+                "turn.completed",
+                status="complete",
+                metadata={"usage": usage},
+                native_session_id="claude-native-session",
+            )
+        )
+        return ProviderResult(
+            provider="claude",
+            native_session_id="claude-native-session",
+            native_turn_id="claude-turn",
+            status="complete",
+            usage=usage,
+        )
+
+
+@pytest.mark.asyncio
+async def test_e2e_terminal_turn_usage_never_fails_a_completed_result(
+    tmp_path: Path,
+) -> None:
+    claude = TerminalUsageAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Implement the stage and report usage at the end.",
+            provider="claude",
+            safety_limits={"max_total_tokens": 2_000},
+        )
+
+        assert receipt.status == "complete", receipt.result
+        assert receipt.result["checkpoint_id"]
+        # The turn the provider finished keeps its result, and the
+        # overage that only its terminal event reported is still
+        # charged to the command envelope.
+        safety = receipt.result["safety"]
+        assert safety["violation"] == "total-tokens"
+        assert safety["consumption"]["total_tokens"] == 120_000
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["state"] == "complete"
+        assert envelope["consumption"]["total_tokens"] == 120_000
+        events = rig.store.all_events(rig.session.session_id)
+        assert not [event for event in events if event.event_type == "guard.tripped"]
+        assert not [event for event in events if event.event_type == "turn.failed"]
+        assert not rig.store.guard_incidents(rig.session.session_id)
+        assert not rig.store.pending_reconciliations(rig.session.session_id)
+        assert claude.interruptions == 0
+        assert len(rig.store.attempts(rig.session.session_id)) == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_usage_before_the_terminal_turn_still_stops_the_turn(
+    tmp_path: Path,
+) -> None:
+    class EarlyUsageAdapter(TerminalUsageAdapter):
+        async def run_turn(self, **values: Any) -> ProviderResult:
+            event_handler = values["event_handler"]
+            await event_handler(
+                ProviderEvent(
+                    "provider.prompt.accepted",
+                    status="accepted",
+                    native_session_id="claude-native-session",
+                )
+            )
+            await event_handler(
+                ProviderEvent(
+                    "usage.updated",
+                    metadata={
+                        "input_tokens": 110_000,
+                        "output_tokens": 10_000,
+                        "total_tokens": 120_000,
+                    },
+                )
+            )
+            await asyncio.sleep(0.25)
+            return await super().run_turn(**values)
+
+    claude = EarlyUsageAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Implement the stage and report usage early.",
+            provider="claude",
+            safety_limits={"max_total_tokens": 2_000},
+        )
+
+        assert receipt.status == "failed", receipt.result
+        assert receipt.result["code"] == "E_SAFETY_GUARD"
+        assert receipt.result["reconciliation_id"]
+        assert claude.interruptions == 1
+        incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert incidents[0]["reason"] == "total-tokens"
     finally:
         rig.close()
 
