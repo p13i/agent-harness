@@ -599,18 +599,22 @@ class TurnGuard:
         if event.event_type == "agent.child.started":
             self.consumption.child_agents += self._new_child_start_count(event)
         if _tool_completed(event.event_type):
-            completed = _event_fingerprint(event)
             identity = _tool_identity(event)
             pending = self._pending_tools.get(identity, [])
-            started = ""
-            task_output_poll = False
-            if pending:
-                started, task_output_poll = pending.pop(0)
+            if not pending:
+                # A completion with no pending start proves no tool call
+                # of its own: the pair would carry the completion alone,
+                # so two identical unmatched completions read as one
+                # replayed call. Cancelled child lifecycle events arrive
+                # exactly that way, carrying a child id and no start
+                # identity. Only a matched start records a pair.
+                return self.violation()
+            started, task_output_poll = pending.pop(0)
             if not pending:
                 self._pending_tools.pop(identity, None)
             if task_output_poll and _task_output_is_running(event):
                 return self.violation()
-            pair = started + ":" + completed
+            pair = started + ":" + _event_fingerprint(event)
             self._completed_tool_pair = pair
             self._observe_tool_pair(pair)
         return self.violation()

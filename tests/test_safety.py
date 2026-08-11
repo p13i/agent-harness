@@ -10,6 +10,8 @@ import pytest
 
 from agent_harness.errors import SafetyGuardError
 from agent_harness.providers.base import ProviderEvent
+from agent_harness.providers.claude import _normalized_child_event
+from agent_harness.providers.normalize import claude_payload
 from agent_harness.providers.normalize import grok_payload
 from agent_harness.providers.normalize import kimi_payload
 from agent_harness.safety import (
@@ -538,6 +540,52 @@ def test_guard_records_completed_task_output() -> None:
     )
 
     assert guard.take_completed_tool_pair()
+
+
+def test_unmatched_tool_completions_record_no_semantic_pair() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(100)
+    cancelled = ProviderEvent(
+        "tool.completed",
+        status="cancelled",
+        metadata={"child_id": "child-1"},
+    )
+
+    for unused in range(2):
+        del unused
+        guard.observe(cancelled)
+        assert guard.take_completed_tool_pair() == ""
+
+    assert guard.violation() == ""
+
+
+def test_duplicate_cancelled_child_notifications_record_no_semantic_pair() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(100)
+    child_tool_ids: set[str] = set()
+
+    for payload in (
+        {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "child-1",
+            "status": "cancelled",
+        },
+        {
+            "type": "system",
+            "subtype": "task_updated",
+            "task_id": "child-1",
+            "patch": {"status": "cancelled"},
+        },
+    ):
+        for event in claude_payload(payload):
+            normalized = _normalized_child_event(event, child_tool_ids)
+            assert normalized.event_type == "tool.completed"
+            assert normalized.metadata == {"child_id": "child-1"}
+            guard.observe(normalized)
+            assert guard.take_completed_tool_pair() == ""
+
+    assert guard.violation() == ""
 
 
 def test_guard_ignores_volatile_provider_ids_in_tool_fingerprints() -> None:
