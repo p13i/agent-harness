@@ -6527,6 +6527,160 @@ async def test_reconciliation_discovery_reuses_and_guards_its_checkpoint(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_stop_resolves_without_discovery_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = JourneyRig(tmp_path)
+    try:
+        manager, record, command = await _ambiguous_reconciliation(rig)
+        assert record.audit["discovery_checkpoint_id"]
+        undiscovered_audit = {
+            key: value
+            for key, value in record.audit.items()
+            if key != "discovery_checkpoint_id"
+        }
+        with rig.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE reconciliations SET audit_json = ?
+                WHERE reconciliation_id = ?
+                """,
+                (
+                    json.dumps(
+                        undiscovered_audit,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    record.reconciliation_id,
+                ),
+            )
+        pending = rig.store.reconciliation(record.reconciliation_id)
+        assert pending.status == "pending"
+        assert "discovery_checkpoint_id" not in pending.audit
+
+        workspace = Path(rig.session.worktree)
+        (workspace / "file.txt").write_text(
+            "drifted after discovery\n",
+            encoding="utf-8",
+        )
+        (workspace / "drifted-effect.txt").write_text(
+            "retain this material\n",
+            encoding="utf-8",
+        )
+        drifted_script = workspace / "drifted-effect.sh"
+        drifted_script.write_text("#!/bin/sh\n", encoding="utf-8")
+        drifted_script.chmod(0o755)
+        drifted_digest, unused_summary = inspect_workspace(workspace)
+        del unused_summary
+        assert drifted_digest != pending.current_workspace_digest
+        session_id = rig.session.session_id
+        checkpoints_before = [
+            item.checkpoint_id for item in rig.store.checkpoints(session_id)
+        ]
+        inspected: list[str] = []
+        checkpointed: list[str] = []
+
+        def refuse_inspection(target: Path) -> tuple[str, str]:
+            inspected.append(str(target))
+            raise AssertionError("stop inspected live workspace material")
+
+        def refuse_checkpoint(*unused_args: Any, **unused_kwargs: Any) -> None:
+            del unused_args
+            del unused_kwargs
+            checkpointed.append("checkpoint")
+            raise AssertionError("stop checkpointed live workspace material")
+
+        monkeypatch.setattr(
+            reconciliation_module,
+            "inspect_workspace",
+            refuse_inspection,
+        )
+        monkeypatch.setattr(
+            reconciliation_module,
+            "checkpoint_workspace",
+            refuse_checkpoint,
+        )
+
+        with pytest.raises(
+            ConflictError,
+            match="observed workspace digest is stale",
+        ):
+            await manager.resolve(
+                pending.reconciliation_id,
+                ReconciliationDecision.STOP,
+                drifted_digest,
+            )
+        stopped = await manager.resolve(
+            pending.reconciliation_id,
+            ReconciliationDecision.STOP,
+            pending.current_workspace_digest,
+        )
+        replayed = await manager.resolve(
+            pending.reconciliation_id,
+            ReconciliationDecision.STOP,
+            pending.current_workspace_digest,
+        )
+
+        assert inspected == []
+        assert checkpointed == []
+        assert replayed == stopped
+        assert stopped.status == "resolved"
+        assert stopped.resolution == "stop"
+        assert stopped.current_workspace_digest == pending.current_workspace_digest
+        assert stopped.audit["observed_workspace_digest"] == (
+            pending.current_workspace_digest
+        )
+        settled_digest, unused_summary = inspect_workspace(workspace)
+        del unused_summary
+        assert settled_digest == drifted_digest
+        assert (workspace / "file.txt").read_text(encoding="utf-8") == (
+            "drifted after discovery\n"
+        )
+        assert (workspace / "drifted-effect.txt").read_text(encoding="utf-8") == (
+            "retain this material\n"
+        )
+        assert drifted_script.stat().st_mode & 0o777 == 0o755
+        assert [
+            item.checkpoint_id for item in rig.store.checkpoints(session_id)
+        ] == checkpoints_before
+        settled_session = rig.store.get_session(session_id)
+        assert settled_session.lifecycle == "stopped"
+        assert settled_session.attention == "idle"
+        for certification in (
+            "checkpoint_id",
+            "discovery_checkpoint_id",
+            "discovery_workspace_digest",
+            "resolution_checkpoint_id",
+            "resolution_workspace_digest",
+            "restored_checkpoint_id",
+        ):
+            assert certification not in stopped.audit
+        receipt = stopped.audit["topology_receipt"]
+        assert receipt["attempt_state"] == "ambiguous"
+        assert receipt["turn_state"] == "ambiguous"
+        assert receipt["dispatch_state"] == "ambiguous"
+        assert receipt["envelope_state"] == "paused"
+        assert receipt["guard_reason"] == "ambiguous-provider-dispatch"
+        assert "completion_evidence" not in receipt
+        assert "command_status" not in receipt
+        assert "projected_at" not in receipt
+        settled_command = rig.store.get_command(command.command_id)
+        assert settled_command.status == "failed"
+        assert settled_command.result["code"] == "E_NEEDS_RECONCILIATION"
+        proof = proof_snapshot(rig.store, session_id)
+        reconciliation = proof["reconciliations"][0]
+        assert reconciliation["discovery_checkpoint_id"] == ""
+        assert reconciliation["discovery_checkpoint_bound"] is False
+        assert reconciliation["resolution_checkpoint_id"] == ""
+        assert reconciliation["resolution_checkpoint_bound"] is False
+        assert reconciliation["resolution_material_certified"] is False
+        assert reconciliation["recovery_material_certified"] is False
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_resolution_rejects_material_that_moves(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

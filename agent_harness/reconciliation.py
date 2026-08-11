@@ -146,12 +146,19 @@ class ReconciliationManager:
         operation: str = "",
     ) -> ReconciliationRecord:
         validate_reconciliation_audit(audit)
+        # Read the requested decision before discovery. Stopping keeps
+        # the live material exactly as the interrupted turn left it, so
+        # it must not depend on a discovery checkpoint that the turn
+        # never recorded and that this call would have to take against
+        # material that already moved.
+        selected = _decision(decision)
         record = self.store.reconciliation(reconciliation_id)
-        if record.status != ReconciliationStatus.RESOLVED and not str(
-            record.audit.get("discovery_checkpoint_id", "")
+        if (
+            selected != ReconciliationDecision.STOP
+            and record.status != ReconciliationStatus.RESOLVED
+            and not str(record.audit.get("discovery_checkpoint_id", ""))
         ):
             record = await self._ensure_discovery_checkpoint(record)
-        selected = _decision(decision)
         if record.status == ReconciliationStatus.RESOLVED:
             if (
                 record.resolution == selected
