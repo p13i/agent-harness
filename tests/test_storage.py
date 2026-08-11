@@ -4324,6 +4324,221 @@ def test_accept_current_declines_a_command_it_does_not_own(
     store.close()
 
 
+def _accepted_unvalidated_dispatch(tmp_path: Path) -> SimpleNamespace:
+    """Accept a dispatching command no `turn.completed` ever certified."""
+    rig = _ambiguous_live_dispatch(tmp_path, record_completion=False)
+    _execute(
+        rig,
+        "UPDATE commands SET status = ?, result_json = '{}' WHERE command_id = ?",
+        (CommandStatus.DISPATCHING, rig.command.command_id),
+    )
+    resolved = rig.store.resolve_reconciliation_record(
+        rig.record.reconciliation_id,
+        "accept-current",
+        "digest-current",
+        _resolution_audit(rig),
+    )
+    assert "command_status" not in _topology(rig, resolved)
+    assert rig.store.get_command(rig.command.command_id).status == (
+        CommandStatus.DISPATCHING
+    )
+    return rig
+
+
+def _execute(
+    rig: SimpleNamespace,
+    statement: str,
+    parameters: tuple[Any, ...],
+) -> None:
+    with rig.store.transaction() as connection:
+        connection.execute(statement, parameters)
+
+
+def _set_column(rig: SimpleNamespace, column: str, value: str) -> None:
+    _execute(
+        rig,
+        "UPDATE reconciliations SET " + column + " = ? WHERE reconciliation_id = ?",
+        (value, rig.record.reconciliation_id),
+    )
+
+
+def _set_audit(rig: SimpleNamespace, **overrides: Any) -> None:
+    audit = dict(rig.store.reconciliation(rig.record.reconciliation_id).audit)
+    audit.update(overrides)
+    _set_column(rig, "audit_json", json.dumps(audit, sort_keys=True))
+
+
+def _set_receipt(rig: SimpleNamespace, **overrides: Any) -> None:
+    audit = rig.store.reconciliation(rig.record.reconciliation_id).audit
+    receipt = dict(audit["topology_receipt"])
+    receipt.update(overrides)
+    _set_audit(rig, topology_receipt=receipt)
+
+
+def _anchor_decision(rig: SimpleNamespace) -> dict[str, str]:
+    """Read the stranded anchor itself, or the message that refused it."""
+    with rig.store.transaction() as connection:
+        prior = connection.execute(
+            "SELECT * FROM commands WHERE command_id = ?",
+            (rig.command.command_id,),
+        ).fetchone()
+        try:
+            return storage_module._dispatch_transition_anchor(
+                connection,
+                prior,
+                rig.resolution_checkpoint_id,
+                rig.workspace_digest,
+            )
+        except ConflictError as error:
+            return {"reason": error.detail.message}
+
+
+def test_accepted_reconciliation_anchors_an_unvalidated_dispatching_command(
+    tmp_path: Path,
+) -> None:
+    rig = _accepted_unvalidated_dispatch(tmp_path)
+
+    anchor = _anchor_decision(rig)
+
+    assert anchor == {
+        "prior_command_type": "message",
+        "prior_anchor_kind": "resolved-reconciliation",
+        "prior_reconciliation_id": rig.record.reconciliation_id,
+        "prior_reconciliation_resolution": "accept-current",
+    }
+    # Anchoring certifies the operator decision and settles nothing: the
+    # unvalidated topology stays exactly where the reconciliation left it.
+    assert rig.store.get_command(rig.command.command_id).status == (
+        CommandStatus.DISPATCHING
+    )
+    assert [item.status for item in rig.store.attempts(rig.session.session_id)] == [
+        "ambiguous"
+    ]
+    assert rig.store.command_envelope(rig.command.command_id)["state"] == "paused"
+    assert (
+        rig.store.project_resolved_reconciliation(rig.record.reconciliation_id) is None
+    )
+    assert not [
+        item
+        for item in rig.store.all_events(rig.session.session_id)
+        if item.event_type in {"turn.completed", "reconciliation.projected"}
+    ]
+    # A second decision for this command cannot even be recorded, so the
+    # exactly-one guard is only ever reachable from below.
+    assert "command_id TEXT NOT NULL UNIQUE" in storage_module.SCHEMA
+    rig.store.close()
+
+
+_UNBOUND_TOPOLOGY = "dispatch transition accepted topology is not bound"
+
+
+@pytest.mark.parametrize(
+    "mutate,reason",
+    [
+        (
+            lambda rig: _execute(
+                rig,
+                "DELETE FROM reconciliations WHERE command_id = ?",
+                (rig.command.command_id,),
+            ),
+            "dispatch transition requires exactly one reconciliation",
+        ),
+        (
+            lambda rig: _set_column(rig, "status", "pending"),
+            "dispatch transition reconciliation is unresolved",
+        ),
+        (
+            lambda rig: _set_column(rig, "resolution", "stop"),
+            "dispatch transition reconciliation resolution is unsafe",
+        ),
+        (
+            lambda rig: _set_audit(rig, resolution_checkpoint_id=new_uuid()),
+            "dispatch transition reconciliation checkpoint is not latest",
+        ),
+        (
+            lambda rig: _set_audit(rig, resolution_workspace_digest="short"),
+            "dispatch transition reconciliation material is not current",
+        ),
+        (
+            lambda rig: _set_audit(rig, resolution_workspace_digest="f" * 64),
+            "dispatch transition reconciliation material is not current",
+        ),
+        (
+            lambda rig: _execute(
+                rig,
+                "UPDATE command_dispatches SET crossed_boundary = 0"
+                " WHERE command_id = ?",
+                (rig.command.command_id,),
+            ),
+            "dispatch transition accepted boundary is not exact",
+        ),
+        (
+            lambda rig: _execute(
+                rig,
+                "UPDATE turns SET attempt_id = ? WHERE turn_id = ?",
+                (new_uuid(), rig.turn_id),
+            ),
+            "dispatch transition accepted boundary is not exact",
+        ),
+        (
+            lambda rig: _set_audit(rig, dispatch_identity={}),
+            _UNBOUND_TOPOLOGY,
+        ),
+        (
+            lambda rig: _execute(
+                rig,
+                "UPDATE command_dispatches SET state = 'complete' WHERE command_id = ?",
+                (rig.command.command_id,),
+            ),
+            _UNBOUND_TOPOLOGY,
+        ),
+        (
+            lambda rig: _execute(
+                rig,
+                "UPDATE provider_attempts SET status = 'complete' WHERE attempt_id = ?",
+                (rig.attempt.attempt_id,),
+            ),
+            _UNBOUND_TOPOLOGY,
+        ),
+        (
+            lambda rig: _execute(
+                rig,
+                "UPDATE turns SET status = 'complete' WHERE turn_id = ?",
+                (rig.turn_id,),
+            ),
+            _UNBOUND_TOPOLOGY,
+        ),
+        (
+            lambda rig: _set_receipt(rig, turn_id=new_uuid()),
+            _UNBOUND_TOPOLOGY,
+        ),
+        (
+            lambda rig: _set_receipt(rig, command_status="complete"),
+            _UNBOUND_TOPOLOGY,
+        ),
+        (
+            lambda rig: _set_receipt(rig, completion_evidence={"turn_id": "any"}),
+            _UNBOUND_TOPOLOGY,
+        ),
+    ],
+)
+def test_stranded_anchor_refuses_every_unproven_acceptance(
+    tmp_path: Path,
+    mutate: Any,
+    reason: str,
+) -> None:
+    rig = _accepted_unvalidated_dispatch(tmp_path)
+    assert "reason" not in _anchor_decision(rig)
+
+    mutate(rig)
+
+    assert _anchor_decision(rig) == {"reason": reason}
+    assert rig.store.get_command(rig.command.command_id).status == (
+        CommandStatus.DISPATCHING
+    )
+    rig.store.close()
+
+
 def _strand_resolved_reconciliation(rig: SimpleNamespace) -> None:
     """Rewrite the resolution the way the pre-projection build left it."""
     store = rig.store

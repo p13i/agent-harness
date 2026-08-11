@@ -3771,16 +3771,7 @@ class StateStore:
             if str(session["attention"]) == Attention.WORKING:
                 base["reason"] = "session-is-working"
                 return base
-            active = self._connection.execute(
-                """
-                SELECT COUNT(*) AS count FROM commands
-                WHERE session_id = ? AND status IN (
-                    'queued', 'awaiting-xhigh-authorization', 'dispatching'
-                )
-                """,
-                (session_id,),
-            ).fetchone()
-            if active is not None and int(active["count"]) > 0:
+            if _dispatch_transition_active_commands(self._connection, session_id) > 0:
                 base["reason"] = "active-command"
                 return base
             goal = self._connection.execute(
@@ -3956,16 +3947,7 @@ class StateStore:
                 return result
             if str(session["attention"]) == Attention.WORKING:
                 raise ConflictError("dispatch invalidation requires quiescence")
-            active = connection.execute(
-                """
-                SELECT COUNT(*) AS count FROM commands
-                WHERE session_id = ? AND status IN (
-                    'queued', 'awaiting-xhigh-authorization', 'dispatching'
-                )
-                """,
-                (session_id,),
-            ).fetchone()
-            if active is not None and int(active["count"]) > 0:
+            if _dispatch_transition_active_commands(connection, session_id) > 0:
                 raise ConflictError("dispatch invalidation has an active command")
             transition_schema = (
                 "p13i/agent-harness/dispatch-generation-transition-authorization/v1"
@@ -9376,6 +9358,167 @@ def _dispatch_transition_terminal_receipt(
     }
 
 
+def _dispatch_transition_resolved_reconciliation(
+    connection: sqlite3.Connection,
+    prior: sqlite3.Row,
+    latest_checkpoint_id: str,
+    live_material_digest: str,
+) -> sqlite3.Row:
+    """Return the one safely resolved reconciliation this command owns.
+
+    The decision must be explicit and current: exactly one
+    reconciliation, an ``accept-current`` or ``restore-pre-turn``
+    resolution, the latest certified checkpoint, and a protected
+    resolution digest that still equals the live workspace material.
+    """
+    reconciliations = connection.execute(
+        """
+        SELECT * FROM reconciliations WHERE command_id = ?
+        ORDER BY created_at, reconciliation_id
+        """,
+        (str(prior["command_id"]),),
+    ).fetchall()
+    if len(reconciliations) != 1:
+        raise ConflictError("dispatch transition requires exactly one reconciliation")
+    reconciliation = reconciliations[0]
+    if str(reconciliation["status"]) != ReconciliationStatus.RESOLVED:
+        raise ConflictError("dispatch transition reconciliation is unresolved")
+    if str(reconciliation["resolution"]) not in {
+        ReconciliationDecision.ACCEPT_CURRENT,
+        ReconciliationDecision.RESTORE_PRE_TURN,
+    }:
+        raise ConflictError("dispatch transition reconciliation resolution is unsafe")
+    audit = _load_object(str(reconciliation["audit_json"]))
+    if str(audit.get("resolution_checkpoint_id", "")) != latest_checkpoint_id:
+        raise ConflictError(
+            "dispatch transition reconciliation checkpoint is not latest"
+        )
+    resolution_material = str(audit.get("resolution_workspace_digest", ""))
+    if not _is_material_digest(resolution_material) or (
+        resolution_material != live_material_digest
+    ):
+        raise ConflictError(
+            "dispatch transition reconciliation material is not current"
+        )
+    return reconciliation
+
+
+def _dispatch_transition_stranded_reconciliation(
+    connection: sqlite3.Connection,
+    prior: sqlite3.Row,
+    latest_checkpoint_id: str,
+    live_material_digest: str,
+) -> sqlite3.Row:
+    """Anchor a command an accepted reconciliation left dispatching.
+
+    An explicit resolution can accept material no ``turn.completed``
+    ever certified. Completion stays unproven, so nothing here settles
+    the command, attempt, turn, or dispatch: the operator decision alone
+    carries the next declared stage. The unvalidated topology must
+    therefore still read exactly as the reconciliation left it, bound to
+    this command and session by one crossed provider boundary, and its
+    receipt must claim no completion this build never observed.
+    """
+    reconciliation = _dispatch_transition_resolved_reconciliation(
+        connection,
+        prior,
+        latest_checkpoint_id,
+        live_material_digest,
+    )
+    command_id = str(prior["command_id"])
+    session_id = str(prior["session_id"])
+    dispatches = connection.execute(
+        """
+        SELECT d.attempt_id, d.turn_id, d.checkpoint_id,
+            d.state AS dispatch_state, a.status AS attempt_state,
+            t.status AS turn_state
+        FROM command_dispatches AS d
+        JOIN provider_attempts AS a ON a.attempt_id = d.attempt_id
+            AND a.session_id = d.session_id
+        JOIN turns AS t ON t.turn_id = d.turn_id
+            AND t.attempt_id = d.attempt_id AND t.session_id = d.session_id
+        WHERE d.command_id = ? AND d.session_id = ? AND d.crossed_boundary = 1
+        ORDER BY d.created_at, d.attempt_id
+        """,
+        (command_id, session_id),
+    ).fetchall()
+    if len(dispatches) != 1:
+        raise ConflictError("dispatch transition accepted boundary is not exact")
+    dispatch = dispatches[0]
+    audit = _load_object(str(reconciliation["audit_json"]))
+    identity = _object_or_empty(audit.get("dispatch_identity"))
+    receipt = _object_or_empty(audit.get("topology_receipt"))
+    if {
+        "reconciliation_session_id": str(reconciliation["session_id"]),
+        "attempt_id": str(identity.get("attempt_id", "")),
+        "turn_id": str(identity.get("turn_id", "")),
+        "checkpoint_id": str(identity.get("checkpoint_id", "")),
+        "dispatch_state": str(dispatch["dispatch_state"]),
+        "attempt_state": str(dispatch["attempt_state"]),
+        "turn_state": str(dispatch["turn_state"]),
+        "receipt_binds": _topology_receipt_binds(
+            receipt,
+            reconciliation_id=str(reconciliation["reconciliation_id"]),
+            session_id=session_id,
+            command_id=command_id,
+            attempt_id=str(dispatch["attempt_id"]),
+            turn_id=str(dispatch["turn_id"]),
+        ),
+        # The command is still dispatching precisely because completion
+        # was never proven. A receipt that already claims one
+        # contradicts that, so this refuses rather than inherit an
+        # outcome nothing observed.
+        "receipt_projects": bool(
+            receipt.get("command_status") or receipt.get("completion_evidence")
+        ),
+    } != {
+        "reconciliation_session_id": session_id,
+        "attempt_id": str(dispatch["attempt_id"]),
+        "turn_id": str(dispatch["turn_id"]),
+        "checkpoint_id": str(dispatch["checkpoint_id"]),
+        "dispatch_state": "ambiguous",
+        "attempt_state": "ambiguous",
+        "turn_state": "ambiguous",
+        "receipt_binds": True,
+        "receipt_projects": False,
+    }:
+        raise ConflictError("dispatch transition accepted topology is not bound")
+    return reconciliation
+
+
+def _dispatch_transition_active_commands(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> int:
+    """Count the commands that still hold live dispatch capacity.
+
+    A dispatching command whose reconciliation was explicitly resolved
+    is stranded, not running: its leases are released and its topology
+    is settled ambiguous, so it does not block a transition off itself.
+    The anchor revalidates that whole shape before certifying anything.
+    """
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS count FROM commands
+        WHERE session_id = ? AND status IN (
+            'queued', 'awaiting-xhigh-authorization', 'dispatching'
+        )
+        AND NOT (status = 'dispatching' AND EXISTS (
+            SELECT 1 FROM reconciliations AS r
+            WHERE r.command_id = commands.command_id
+            AND r.session_id = commands.session_id
+            AND r.status = 'resolved'
+            AND r.resolution IN ('accept-current', 'restore-pre-turn')
+        ))
+        """,
+        (session_id,),
+    ).fetchone()
+    count = 0
+    if row is not None:
+        count = int(row["count"])
+    return count
+
+
 def _dispatch_transition_anchor(
     connection: sqlite3.Connection,
     prior: sqlite3.Row,
@@ -9416,43 +9559,25 @@ def _dispatch_transition_anchor(
         "E_NEEDS_RECONCILIATION",
         "E_SAFETY_GUARD",
     }:
-        reconciliations = connection.execute(
-            """
-            SELECT * FROM reconciliations WHERE command_id = ?
-            ORDER BY created_at, reconciliation_id
-            """,
-            (str(prior["command_id"]),),
-        ).fetchall()
-        if len(reconciliations) != 1:
-            raise ConflictError(
-                "dispatch transition requires exactly one reconciliation"
-            )
-        reconciliation = reconciliations[0]
-        if str(reconciliation["status"]) != ReconciliationStatus.RESOLVED:
-            raise ConflictError("dispatch transition reconciliation is unresolved")
-        reconciliation_resolution = str(reconciliation["resolution"])
-        if reconciliation_resolution not in {
-            ReconciliationDecision.ACCEPT_CURRENT,
-            ReconciliationDecision.RESTORE_PRE_TURN,
-        }:
-            raise ConflictError(
-                "dispatch transition reconciliation resolution is unsafe"
-            )
-        audit = _load_object(str(reconciliation["audit_json"]))
-        if str(audit.get("resolution_checkpoint_id", "")) != (latest_checkpoint_id):
-            raise ConflictError(
-                "dispatch transition reconciliation checkpoint is not latest"
-            )
-        resolution_material = str(audit.get("resolution_workspace_digest", ""))
-        if (
-            len(resolution_material) != 64
-            or resolution_material != live_material_digest
-        ):
-            raise ConflictError(
-                "dispatch transition reconciliation material is not current"
-            )
+        reconciliation = _dispatch_transition_resolved_reconciliation(
+            connection,
+            prior,
+            latest_checkpoint_id,
+            live_material_digest,
+        )
         anchor_kind = "resolved-reconciliation"
         reconciliation_id = str(reconciliation["reconciliation_id"])
+        reconciliation_resolution = str(reconciliation["resolution"])
+    elif status == CommandStatus.DISPATCHING:
+        reconciliation = _dispatch_transition_stranded_reconciliation(
+            connection,
+            prior,
+            latest_checkpoint_id,
+            live_material_digest,
+        )
+        anchor_kind = "resolved-reconciliation"
+        reconciliation_id = str(reconciliation["reconciliation_id"])
+        reconciliation_resolution = str(reconciliation["resolution"])
     else:
         raise ConflictError("dispatch transition prior command is not eligible")
     return {

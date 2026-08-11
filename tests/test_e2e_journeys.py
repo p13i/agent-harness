@@ -4823,6 +4823,127 @@ async def test_e2e_terminal_guard_checkpoint_carries_one_review_stage(
 
 
 @pytest.mark.asyncio
+async def test_e2e_accepted_unvalidated_dispatch_carries_one_review_stage(
+    tmp_path: Path,
+) -> None:
+    """An accepted decision hands off work no completion ever certified."""
+    external_ref = {
+        "orchestrator": "p13i/machines/cs-builder",
+        "job_id": "builder-accepted-unvalidated",
+    }
+    rig = JourneyRig(tmp_path, external_ref=external_ref)
+    workspace = Path(rig.session.worktree)
+    next_turn_ref = {"step_id": "review", "agent_role": "reviewer"}
+    next_command_payload = {
+        "text": "Review the accepted but unvalidated stage.",
+        "provider": "codex",
+        "turn_ref": next_turn_ref,
+    }
+    policy = _install_transition_policy(
+        rig,
+        allowed_agent_roles=["reviewer"],
+        allowed_step_prefixes=["review"],
+        transitions=[
+            {
+                "sequence": 1,
+                "next_turn_ref": next_turn_ref,
+                "next_command_digest": command_envelope_digest(
+                    "message",
+                    next_command_payload,
+                    "unattended",
+                ),
+            }
+        ],
+    )
+    rig.store.set_session_safety(rig.session.session_id, "unattended")
+    rig.prime_capacity()
+    try:
+        manager, record, command = await _ambiguous_reconciliation(rig)
+        # The guard stopped the turn after the boundary but before any
+        # terminal record, and the command was re-claimed behind the
+        # open reconciliation, so it never left dispatching.
+        with rig.store.transaction() as connection:
+            connection.execute(
+                "UPDATE commands SET status = 'dispatching', result_json = '{}'"
+                " WHERE command_id = ?",
+                (command.command_id,),
+            )
+        assert not [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "turn.completed"
+        ]
+
+        resolved = await manager.resolve(
+            record.reconciliation_id,
+            ReconciliationDecision.ACCEPT_CURRENT,
+            record.current_workspace_digest,
+            audit={"actor": "journey"},
+        )
+
+        # No turn.completed exists, so nothing may claim the command,
+        # attempt, or turn finished. The projection agrees and declines.
+        assert resolved.resolution == "accept-current"
+        assert "command_status" not in resolved.audit["topology_receipt"]
+        assert (
+            rig.store.project_resolved_reconciliation(record.reconciliation_id) is None
+        )
+        assert rig.store.get_command(command.command_id).status == "dispatching"
+
+        anchor = rig.store.dispatch_transition_anchor(rig.session.session_id)
+        assert anchor["eligible"] is True, anchor["reason"]
+        assert anchor["prior_anchor_kind"] == "resolved-reconciliation"
+        assert anchor["prior_command_id"] == command.command_id
+        assert anchor["prior_command_status"] == "dispatching"
+        assert anchor["prior_reconciliation_id"] == record.reconciliation_id
+        assert anchor["prior_reconciliation_resolution"] == "accept-current"
+        assert anchor["prior_checkpoint_id"] == (
+            rig.store.checkpoints(rig.session.session_id)[-1].checkpoint_id
+        )
+        assert anchor["prior_material_digest"] == inspect_workspace(workspace)[0]
+
+        transition = _advance_orchestration_generation(
+            rig,
+            command.command_id,
+            next_turn_ref,
+            "accepted-unvalidated-to-review",
+            policy,
+            1,
+            next_command_payload,
+        )
+        reviewed = await rig.message(**next_command_payload)
+
+        assert reviewed.status == "complete", reviewed.result
+        consumed = [
+            event
+            for event in rig.store.all_events(rig.session.session_id)
+            if event.event_type == "dispatch.generation.transition.consumed"
+        ]
+        assert len(consumed) == 1
+        assert consumed[0].metadata["invalidation_id"] == transition["invalidation_id"]
+        assert consumed[0].metadata["command_id"] == reviewed.command_id
+
+        # Authorizing the reviewer never validated the stage it followed.
+        assert rig.store.get_command(command.command_id).status == "dispatching"
+        stranded = rig.store.attempts(rig.session.session_id)[0]
+        assert stranded.status == "ambiguous"
+        assert rig.store.command_envelope(command.command_id)["state"] == "paused"
+        topology = rig.store._connection.execute(
+            """
+            SELECT turns.status AS turn_state,
+                command_dispatches.state AS dispatch_state
+            FROM turns JOIN command_dispatches USING(turn_id)
+            WHERE command_dispatches.attempt_id = ?
+            """,
+            (stranded.attempt_id,),
+        ).fetchone()
+        assert topology["turn_state"] == "ambiguous"
+        assert topology["dispatch_state"] == "ambiguous"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider_status", ["failed", "cancelled"])
 async def test_e2e_noncomplete_terminal_guard_never_anchors_a_transition(
     tmp_path: Path,
