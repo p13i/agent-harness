@@ -483,6 +483,62 @@ def test_guard_trips_repeated_tool_pair() -> None:
     assert guard.violation() == "repeated-tool"
 
 
+def test_guard_allows_active_task_output_polls() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(100)
+    started = ProviderEvent(
+        "tool.started",
+        text="TaskOutput",
+        metadata={
+            "name": "TaskOutput",
+            "input": {"task_id": "build-1"},
+        },
+    )
+    completed = ProviderEvent(
+        "tool.completed",
+        text=(
+            "retrieval_status: not_ready\n"
+            "task_id: build-1\n"
+            "status: running\n"
+        ),
+    )
+
+    for unused in range(5):
+        del unused
+        guard.observe(started)
+        guard.observe(completed)
+        assert guard.take_completed_tool_pair() == ""
+
+    assert guard.violation() == ""
+
+
+def test_guard_records_completed_task_output() -> None:
+    guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
+    guard.begin_attempt(100)
+    guard.observe(
+        ProviderEvent(
+            "tool.started",
+            text="TaskOutput",
+            metadata={
+                "name": "TaskOutput",
+                "input": {"task_id": "build-1"},
+            },
+        )
+    )
+    guard.observe(
+        ProviderEvent(
+            "tool.completed",
+            text=(
+                "retrieval_status: ready\n"
+                "task_id: build-1\n"
+                "status: completed\n"
+            ),
+        )
+    )
+
+    assert guard.take_completed_tool_pair()
+
+
 def test_guard_ignores_volatile_provider_ids_in_tool_fingerprints() -> None:
     guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
     guard.begin_attempt(100)

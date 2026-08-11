@@ -468,7 +468,7 @@ class TurnGuard:
         self._elapsed_offset = max(0.0, float(consumption.elapsed_seconds))
         self._last_progress = self._started
         self._tool_pairs: list[str] = []
-        self._pending_tools: dict[str, list[str]] = {}
+        self._pending_tools: dict[str, list[tuple[str, bool]]] = {}
         self._completed_tool_pair = ""
         self._seen_child_ids: set[str] = set()
         self._violation = ""
@@ -527,7 +527,10 @@ class TurnGuard:
             self.consumption.tool_calls += 1
             identity = _tool_identity(event)
             self._pending_tools.setdefault(identity, []).append(
-                _event_fingerprint(event)
+                (
+                    _event_fingerprint(event),
+                    _is_task_output_poll(event),
+                )
             )
         if event.event_type == "tool.progress":
             if _is_grok_tool_progress(event):
@@ -539,10 +542,13 @@ class TurnGuard:
             identity = _tool_identity(event)
             pending = self._pending_tools.get(identity, [])
             started = ""
+            task_output_poll = False
             if pending:
-                started = pending.pop(0)
+                started, task_output_poll = pending.pop(0)
             if not pending:
                 self._pending_tools.pop(identity, None)
+            if task_output_poll and _task_output_is_running(event):
+                return self.violation()
             pair = started + ":" + completed
             self._completed_tool_pair = pair
             self._observe_tool_pair(pair)
@@ -827,6 +833,29 @@ def _tool_completed(event_type: str) -> bool:
         "tool.command.completed",
         "tool.command_execution.completed",
     }
+
+
+def _is_task_output_poll(event: ProviderEvent) -> bool:
+    metadata = event.metadata
+    if not isinstance(metadata, dict):
+        return False
+    name = metadata.get("name", "")
+    if not isinstance(name, str):
+        return False
+    normalized = "".join(
+        character
+        for character in name.casefold()
+        if character.isalnum()
+    )
+    return normalized == "taskoutput"
+
+
+def _task_output_is_running(event: ProviderEvent) -> bool:
+    statuses = {line.strip().casefold() for line in event.text.splitlines()}
+    return (
+        "retrieval_status: not_ready" in statuses
+        and "status: running" in statuses
+    )
 
 
 def _event_fingerprint(event: ProviderEvent) -> str:
