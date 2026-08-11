@@ -61,6 +61,25 @@ PROOF_SNAPSHOT_RETENTION_HOURS = 336
 TRANSITION_CONTROL_COMMANDS = frozenset(
     {"interrupt", "pause", "resume", "stop", "steer"}
 )
+# The refusals a control command records before it can reach the
+# session. The worker returns on each of these ahead of every adapter
+# call, event, checkpoint, and workspace read, so a control that carries
+# one declared no stage and left no material behind it. Every other
+# control failure, recognized or not, is treated as material.
+INERT_CONTROL_FAILURES = frozenset({"E_CONTROL_TARGET", "E_NO_ACTIVE_TURN"})
+# The whole result such a refusal records. This is an exact shape, not a
+# list of forbidden claims: an unrecognized extra key could carry
+# material no reader here knows how to weigh, so anything but these two
+# fields is read as a control that did something.
+INERT_CONTROL_RESULT_KEYS = frozenset({"code", "message"})
+# The metadata keys that name the command an event is about. A
+# `target_command_id` names the command an event acted upon rather than
+# the command that acted, so it never attributes an effect to a control.
+CONTROL_EVENT_BINDINGS = (
+    "control_command_id",
+    "command_id",
+    "prior_command_id",
+)
 TERMINAL_LIFECYCLES = frozenset(
     {
         Lifecycle.STOPPED,
@@ -3794,13 +3813,7 @@ class StateStore:
             ):
                 base["reason"] = "missing-external-reference"
                 return base
-            prior = self._connection.execute(
-                """
-                SELECT * FROM commands WHERE session_id = ?
-                ORDER BY created_at DESC, command_id DESC LIMIT 1
-                """,
-                (session_id,),
-            ).fetchone()
+            prior = _dispatch_transition_predecessor(self._connection, session_id)
             if prior is None:
                 base["reason"] = "missing-prior-command"
                 return base
@@ -3979,13 +3992,7 @@ class StateStore:
                 ).fetchone()
                 if prior is None or str(prior["session_id"]) != session_id:
                     raise ConflictError("dispatch transition prior command is unknown")
-                latest = connection.execute(
-                    """
-                    SELECT command_id FROM commands WHERE session_id = ?
-                    ORDER BY created_at DESC, command_id DESC LIMIT 1
-                    """,
-                    (session_id,),
-                ).fetchone()
+                latest = _dispatch_transition_predecessor(connection, session_id)
                 if latest is None or str(latest["command_id"]) != prior_command_id:
                     raise ConflictError(
                         "dispatch transition prior command is not latest"
@@ -9517,6 +9524,105 @@ def _dispatch_transition_active_commands(
     if row is not None:
         count = int(row["count"])
     return count
+
+
+def _dispatch_transition_control_is_inert(
+    connection: sqlite3.Connection,
+    command: sqlite3.Row,
+) -> bool:
+    """Report whether a control command left the stage exactly as found.
+
+    A transition anchors on the last command that declared a stage. A
+    control the worker refused before it reached the session declares
+    nothing, so it must not shadow the command it followed. The refusal
+    has to prove itself three ways: it recorded exactly the refusal
+    result the worker writes, nothing in the store admitted it to a
+    provider or reserved anything for it, and no event credits it with
+    an effect. Anything short of that proof, including an unrecognized
+    control failure or one unknown extra result field, stays material
+    and anchors the transition itself.
+    """
+    if str(command["status"]) != CommandStatus.FAILED:
+        return False
+    if str(command["command_type"]) not in TRANSITION_CONTROL_COMMANDS:
+        return False
+    result = _load_object(str(command["result_json"]))
+    if set(result) != INERT_CONTROL_RESULT_KEYS:
+        return False
+    code = result.get("code")
+    if not isinstance(code, str) or code not in INERT_CONTROL_FAILURES:
+        return False
+    message = result.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return False
+    command_id = str(command["command_id"])
+    bound = connection.execute(
+        """
+        SELECT (
+            (SELECT COUNT(*) FROM command_dispatches WHERE command_id = ?)
+            + (SELECT COUNT(*) FROM reconciliations WHERE command_id = ?)
+            + (SELECT COUNT(*) FROM process_leases WHERE command_id = ?)
+            + (SELECT COUNT(*) FROM guard_incidents WHERE command_id = ?)
+            + (SELECT COUNT(*) FROM context_deliveries WHERE command_id = ?)
+            + (SELECT COUNT(*) FROM command_envelopes WHERE command_id = ?)
+            + (SELECT COUNT(*) FROM child_launch_gates WHERE command_id = ?)
+            + (
+                SELECT COUNT(*) FROM dispatch_transition_ledger
+                WHERE prior_command_id = ? OR reserved_command_id = ?
+                    OR consumed_command_id = ?
+            )
+            + (
+                SELECT COUNT(*) FROM xhigh_authorization_receipts
+                WHERE command_id = ?
+            )
+        ) AS count
+        """,
+        (command_id,) * 11,
+    ).fetchone()
+    if bound is None:
+        return False
+    if int(bound["count"]) > 0:
+        return False
+    attributions = " OR ".join(
+        "json_extract(metadata_json, '$." + name + "') = ?"
+        for name in CONTROL_EVENT_BINDINGS
+    )
+    attributed = connection.execute(
+        """
+        SELECT COUNT(*) AS count FROM events
+        WHERE session_id = ? AND json_valid(metadata_json)
+        AND ("""
+        + attributions
+        + ")",
+        (str(command["session_id"]),) + (command_id,) * len(CONTROL_EVENT_BINDINGS),
+    ).fetchone()
+    if attributed is None:
+        return False
+    return int(attributed["count"]) == 0
+
+
+def _dispatch_transition_predecessor(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> sqlite3.Row | None:
+    """Return the newest command a transition may anchor on.
+
+    Commands stay in their recorded newest-first order. The walk stops
+    at the first command that declared anything, so it can only ever
+    step over a trailing run of refused controls, and a session holding
+    nothing else anchors nothing.
+    """
+    commands = connection.execute(
+        """
+        SELECT * FROM commands WHERE session_id = ?
+        ORDER BY created_at DESC, command_id DESC
+        """,
+        (session_id,),
+    )
+    for command in commands:
+        if not _dispatch_transition_control_is_inert(connection, command):
+            return command
+    return None
 
 
 def _dispatch_transition_anchor(

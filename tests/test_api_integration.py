@@ -3705,6 +3705,94 @@ def test_durable_dispatch_invalidations_require_a_quiescent_anchor(
         service.close()
 
 
+def test_durable_dispatch_invalidations_anchor_through_a_refused_control(
+    tmp_path: Path,
+) -> None:
+    """A control the worker refused never shadows a live anchor."""
+    service, current, policy, next_turn_ref, next_command_digest = (
+        _transition_fixture(tmp_path)
+    )
+    base = _managed_transition_payload(
+        service,
+        current.session_id,
+        policy,
+        next_turn_ref,
+        next_command_digest,
+    )
+    authorization = base["authorization"]
+    assert isinstance(authorization, dict)
+
+    def invalidate(key: str) -> dict[str, object]:
+        return service.store.create_dispatch_invalidation(
+            current.session_id,
+            reason=str(base["reason"]),
+            authorization=authorization,
+            request_digest=normalized_digest(base),
+            idempotency_key=key,
+            prior_command_id=str(base["prior_command_id"]),
+            next_turn_ref=base["next_turn_ref"],
+            authorization_digest=normalized_digest(authorization),
+        )
+
+    try:
+        control = service.store.enqueue_command(
+            current.session_id,
+            "interrupt",
+            {"target_command_id": str(base["prior_command_id"])},
+            "interrupt-after-anchor",
+        )
+        # An unrecognized control failure stays material, so it is still
+        # the command this session last declared.
+        service.store.resolve_command(
+            control.command_id,
+            "failed",
+            {"code": "E_COMMAND", "message": "unsupported command type"},
+        )
+        unrecognized = service.store.dispatch_transition_anchor(current.session_id)
+        assert unrecognized["eligible"] is False
+        with pytest.raises(ConflictError, match="is not latest"):
+            invalidate("latest-unrecognized-control")
+
+        # The refusal the worker records before it reaches the session
+        # declares nothing, so the stage below it still anchors here.
+        service.store.resolve_command(
+            control.command_id,
+            "failed",
+            {
+                "code": "E_CONTROL_TARGET",
+                "message": "interrupt target is not the active command",
+            },
+        )
+        anchor = service.store.dispatch_transition_anchor(current.session_id)
+        assert anchor["eligible"] is True, anchor["reason"]
+        assert anchor["prior_command_id"] == base["prior_command_id"]
+
+        receipt = invalidate("latest-refused-control")
+        assert receipt["prior_command_id"] == base["prior_command_id"]
+        assert receipt["prior_command_type"] == anchor["prior_command_type"]
+        # Anchoring past the refusal leaves it exactly where it was.
+        refused = service.store.get_command(control.command_id)
+        assert refused.status == "failed"
+        assert refused.result["code"] == "E_CONTROL_TARGET"
+
+        # A transition-ledger binding makes the same control material,
+        # even when its result and other persisted rows claim nothing.
+        with service.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE dispatch_transition_ledger
+                SET state = 'reserved', reserved_command_id = ?
+                WHERE invalidation_id = ?
+                """,
+                (control.command_id, receipt["invalidation_id"]),
+            )
+        bound = service.store.dispatch_transition_anchor(current.session_id)
+        assert bound["eligible"] is False
+        assert bound["reason"] == "dispatch transition prior command is not eligible"
+    finally:
+        service.close()
+
+
 def test_contract_adoption_rejects_untyped_or_retargeted_envelopes(
     tmp_path: Path,
 ) -> None:

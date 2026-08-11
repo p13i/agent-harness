@@ -2336,6 +2336,563 @@ def test_terminal_checkpoint_anchor_rejects_every_unproven_boundary(
     state.store.close()
 
 
+def _control_shadowed_anchor(root: Path, name: str) -> SimpleNamespace:
+    """Reproduce the recorded post-control-command transition shape.
+
+    A guard-stopped message crossed the provider boundary, left one
+    ambiguous topology behind one reconciliation, and was accepted at
+    the latest checkpoint against the live workspace. The operator's
+    interrupt then arrived too late to name an active command, so the
+    worker refused it before touching the session and the newest
+    command in the session declares no stage at all.
+    """
+    workspace = root / (name + "-workspace")
+    _workspace_repository(workspace)
+    store = StateStore(root / (name + ".sqlite3"))
+    created = replace(
+        session(workspace),
+        external_ref={
+            "orchestrator": "p13i/machines/cs-builder",
+            "job_id": name,
+        },
+    )
+    store.create_session(created)
+    store.create_goal(
+        create_goal(
+            created.session_id,
+            "Hand an accepted ambiguous stage to the review stage.",
+            constraints=("dispatch-generation-transition-epoch:test-epoch",),
+        )
+    )
+    command = store.enqueue_command(
+        created.session_id,
+        "message",
+        {"text": "implement the stage", "provider": "kimi"},
+        name + "-implement",
+    )
+    store.create_command_envelope(
+        command.command_id,
+        created.session_id,
+        "unattended",
+        {"max_dollars": 0.0},
+    )
+    assert store.claim_command(created.session_id) is not None
+    attempt = ProviderAttempt(
+        attempt_id=new_uuid(),
+        session_id=created.session_id,
+        provider="kimi",
+        native_session_id="kimi-native",
+        model="default",
+        effort="high",
+        auth_mode="subscription",
+        status="running",
+        started_at=utc_now(),
+        ended_at="",
+    )
+    store.create_attempt(attempt)
+    turn_id = store.start_turn(created.session_id, attempt.attempt_id)
+    pre_dispatch = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=store.last_sequence(created.session_id),
+        provider="kimi",
+        native_session_id="kimi-native",
+        base_commit=_git(workspace, "rev-parse", "HEAD"),
+        patch_digest="pre-patch",
+        untracked_digest="pre-untracked",
+        context_digest="pre-context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(pre_dispatch)
+    store.record_dispatch_checkpoint(
+        command.command_id,
+        attempt.attempt_id,
+        turn_id,
+        pre_dispatch.checkpoint_id,
+    )
+    store.mark_provider_boundary(attempt.attempt_id)
+    lease = store.create_process_lease(
+        created.session_id,
+        "kimi",
+        "unattended",
+        utc_now(),
+    )
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE process_leases SET command_id = ?, attempt_id = ?,
+                state = 'active' WHERE lease_id = ?
+            """,
+            (command.command_id, attempt.attempt_id, lease["lease_id"]),
+        )
+    (workspace / "implemented.txt").write_text(
+        "productive implementation\n",
+        encoding="utf-8",
+    )
+    material_digest, unused_summary = inspect_workspace(workspace)
+    del unused_summary
+    recovery = store.recover_interrupted_commands(
+        created.session_id,
+        material_digest,
+        "summary-current",
+    )
+    assert len(recovery.reconciliations) == 1
+    record = recovery.reconciliations[0]
+    # A guard, not the transport, is what stopped this turn, so the
+    # command keeps the guard code the recorded session carried.
+    store.set_reconciliation_command_error(
+        record.reconciliation_id,
+        "E_SAFETY_GUARD",
+        "execution safety guard stopped kimi: context-window",
+    )
+    resolution = Checkpoint(
+        checkpoint_id=new_uuid(),
+        session_id=created.session_id,
+        sequence=pre_dispatch.sequence + 1,
+        provider="kimi",
+        native_session_id="kimi-native",
+        base_commit=_git(workspace, "rev-parse", "HEAD"),
+        patch_digest="accepted-patch",
+        untracked_digest="accepted-untracked",
+        context_digest="accepted-context",
+        created_at=utc_now(),
+    )
+    store.add_checkpoint(resolution)
+    store.resolve_reconciliation_record(
+        record.reconciliation_id,
+        "accept-current",
+        material_digest,
+        {
+            "actor": "operator",
+            "resolution_checkpoint_id": resolution.checkpoint_id,
+            "resolution_workspace_digest": material_digest,
+        },
+    )
+    store.update_session(
+        created.session_id,
+        lifecycle="paused",
+        attention="idle",
+    )
+    return SimpleNamespace(
+        store=store,
+        session=created,
+        workspace=workspace,
+        command=command,
+        attempt=attempt,
+        turn_id=turn_id,
+        record=record,
+        checkpoint=resolution,
+        material_digest=material_digest,
+    )
+
+
+def _trailing_control(
+    rig: SimpleNamespace,
+    command_type: str,
+    status: str,
+    result: dict[str, Any],
+    key: str,
+) -> str:
+    """Record the control command that trails the accepted stage."""
+    control = rig.store.enqueue_command(
+        rig.session.session_id,
+        command_type,
+        {"target_command_id": rig.command.command_id},
+        key,
+    )
+    rig.store.resolve_command(control.command_id, status, result)
+    return control.command_id
+
+
+_REFUSED_INTERRUPT = {
+    "code": "E_CONTROL_TARGET",
+    "message": "interrupt target is not the active command",
+}
+
+
+def _anchor_of(rig: SimpleNamespace) -> dict[str, Any]:
+    return rig.store.dispatch_transition_anchor(rig.session.session_id)
+
+
+def test_accepted_stage_anchors_through_a_refused_trailing_control(
+    tmp_path: Path,
+) -> None:
+    """The recorded two-command shape: a refused control trails an accept."""
+    rig = _control_shadowed_anchor(tmp_path, "control-shadowed")
+    prior = rig.store.get_command(rig.command.command_id)
+    assert prior.command_type == "message"
+    assert prior.status == CommandStatus.FAILED
+    assert prior.result["code"] == "E_SAFETY_GUARD"
+    assert "provider_terminal" not in prior.result
+    assert _anchor_of(rig)["eligible"] is True
+
+    control_id = _trailing_control(
+        rig,
+        "interrupt",
+        CommandStatus.FAILED,
+        dict(_REFUSED_INTERRUPT),
+        "control-shadowed-interrupt",
+    )
+
+    # Exactly the recorded shape: one accepted ambiguous stage under one
+    # refused control, oldest to newest.
+    with rig.store.transaction() as connection:
+        assert [
+            (str(item["command_type"]), str(item["status"]))
+            for item in connection.execute(
+                """
+                SELECT command_type, status FROM commands
+                WHERE session_id = ? ORDER BY created_at, command_id
+                """,
+                (rig.session.session_id,),
+            ).fetchall()
+        ] == [("message", "failed"), ("interrupt", "failed")]
+        assert [
+            (int(item["crossed_boundary"]), str(item["state"]))
+            for item in connection.execute(
+                "SELECT crossed_boundary, state FROM command_dispatches"
+                " WHERE session_id = ?",
+                (rig.session.session_id,),
+            ).fetchall()
+        ] == [(1, "ambiguous")]
+        assert [
+            str(item["status"])
+            for item in connection.execute(
+                "SELECT status FROM turns WHERE session_id = ?",
+                (rig.session.session_id,),
+            ).fetchall()
+        ] == ["ambiguous"]
+    assert [
+        (item["command_id"], item["state"])
+        for item in rig.store.process_leases(rig.session.session_id)
+    ] == [(rig.command.command_id, "released")]
+
+    anchor = _anchor_of(rig)
+    assert anchor["eligible"] is True, anchor["reason"]
+    assert anchor["reason"] == ""
+    assert anchor["prior_command_id"] == rig.command.command_id
+    assert anchor["prior_command_status"] == CommandStatus.FAILED
+    assert anchor["prior_anchor_kind"] == "resolved-reconciliation"
+    assert anchor["prior_reconciliation_id"] == rig.record.reconciliation_id
+    assert anchor["prior_reconciliation_resolution"] == "accept-current"
+    assert anchor["prior_checkpoint_id"] == rig.checkpoint.checkpoint_id
+    assert anchor["prior_material_digest"] == rig.material_digest
+    # Anchoring past the refusal settles nothing it stepped over.
+    assert rig.store.get_command(control_id).status == CommandStatus.FAILED
+    assert [item.status for item in rig.store.attempts(rig.session.session_id)] == [
+        "ambiguous"
+    ]
+    assert rig.store.command_envelope(rig.command.command_id)["state"] == "paused"
+    receipt = rig.store.reconciliation(rig.record.reconciliation_id).audit[
+        "topology_receipt"
+    ]
+    assert receipt["turn_state"] == "ambiguous"
+    assert receipt["dispatch_state"] == "ambiguous"
+    assert receipt["envelope_state"] == "paused"
+    assert "command_status" not in receipt
+    assert "completion_evidence" not in receipt
+    rig.store.close()
+
+
+def test_refused_controls_are_the_only_commands_an_anchor_steps_over(
+    tmp_path: Path,
+) -> None:
+    """A run of proven refusals is skipped; the stage below still anchors."""
+    rig = _control_shadowed_anchor(tmp_path, "control-run")
+
+    _trailing_control(
+        rig,
+        "interrupt",
+        CommandStatus.FAILED,
+        dict(_REFUSED_INTERRUPT),
+        "control-run-interrupt",
+    )
+    _trailing_control(
+        rig,
+        "steer",
+        CommandStatus.FAILED,
+        {
+            "code": "E_NO_ACTIVE_TURN",
+            "message": "there is no active turn to steer",
+        },
+        "control-run-steer",
+    )
+
+    anchor = _anchor_of(rig)
+    assert anchor["eligible"] is True, anchor["reason"]
+    assert anchor["prior_command_id"] == rig.command.command_id
+
+    # A session holding nothing but refusals declares no stage, so it
+    # anchors nothing rather than inventing a predecessor.
+    empty = replace(
+        session(rig.workspace),
+        external_ref={
+            "orchestrator": "p13i/machines/cs-builder",
+            "job_id": "control-run-empty",
+        },
+    )
+    rig.store.create_session(empty)
+    rig.store.create_goal(
+        create_goal(
+            empty.session_id,
+            "Hold only a refused control.",
+            constraints=("dispatch-generation-transition-epoch:test-epoch",),
+        )
+    )
+    refused = rig.store.enqueue_command(
+        empty.session_id,
+        "interrupt",
+        {},
+        "control-run-empty-interrupt",
+    )
+    rig.store.resolve_command(
+        refused.command_id,
+        CommandStatus.FAILED,
+        dict(_REFUSED_INTERRUPT),
+    )
+    assert rig.store.dispatch_transition_anchor(empty.session_id)["reason"] == (
+        "missing-prior-command"
+    )
+    rig.store.close()
+
+
+_NOT_ELIGIBLE = "dispatch transition prior command is not eligible"
+
+
+@pytest.mark.parametrize(
+    "command_type,status,result,reason",
+    [
+        # A control that ran is the stage it declared, so it anchors the
+        # transition itself instead of deferring to the command below.
+        (
+            "interrupt",
+            CommandStatus.COMPLETE,
+            {},
+            "",
+        ),
+        # A refusal that still names a checkpoint or material acted on
+        # the stage it followed.
+        (
+            "interrupt",
+            CommandStatus.FAILED,
+            {**_REFUSED_INTERRUPT, "checkpoint_id": "checkpoint"},
+            _NOT_ELIGIBLE,
+        ),
+        (
+            "interrupt",
+            CommandStatus.FAILED,
+            {**_REFUSED_INTERRUPT, "workspace_material_digest": "f" * 64},
+            _NOT_ELIGIBLE,
+        ),
+        # The refusal shape is exact, so an unknown extra field is read
+        # as material this build cannot weigh rather than as noise.
+        (
+            "interrupt",
+            CommandStatus.FAILED,
+            {**_REFUSED_INTERRUPT, "note": "harmless"},
+            _NOT_ELIGIBLE,
+        ),
+        # A missing, empty, or ill-typed message is not the result the
+        # worker writes.
+        (
+            "interrupt",
+            CommandStatus.FAILED,
+            {"code": "E_CONTROL_TARGET"},
+            _NOT_ELIGIBLE,
+        ),
+        (
+            "interrupt",
+            CommandStatus.FAILED,
+            {**_REFUSED_INTERRUPT, "message": "  "},
+            _NOT_ELIGIBLE,
+        ),
+        (
+            "interrupt",
+            CommandStatus.FAILED,
+            {**_REFUSED_INTERRUPT, "message": 7},
+            _NOT_ELIGIBLE,
+        ),
+        # An unrecognized or absent control failure is ambiguous, and
+        # ambiguity is material until something proves otherwise.
+        (
+            "interrupt",
+            CommandStatus.FAILED,
+            {"code": "E_COMMAND", "message": "unsupported command type"},
+            _NOT_ELIGIBLE,
+        ),
+        ("interrupt", CommandStatus.FAILED, {}, _NOT_ELIGIBLE),
+        # A guard-coded control is read as the failure it claims to be,
+        # and answers for a reconciliation it never opened.
+        (
+            "stop",
+            CommandStatus.FAILED,
+            {"code": "E_SAFETY_GUARD", "message": "guard"},
+            "dispatch transition requires exactly one reconciliation",
+        ),
+        # Neither a cancelled control nor a non-control command is a
+        # refusal the worker recorded.
+        (
+            "interrupt",
+            CommandStatus.CANCELLED,
+            dict(_REFUSED_INTERRUPT),
+            _NOT_ELIGIBLE,
+        ),
+        (
+            "message",
+            CommandStatus.FAILED,
+            dict(_REFUSED_INTERRUPT),
+            _NOT_ELIGIBLE,
+        ),
+    ],
+)
+def test_anchor_never_steps_over_a_control_that_touched_the_session(
+    tmp_path: Path,
+    command_type: str,
+    status: str,
+    result: dict[str, Any],
+    reason: str,
+) -> None:
+    rig = _control_shadowed_anchor(tmp_path, "control-material")
+    assert _anchor_of(rig)["prior_command_id"] == rig.command.command_id
+
+    control_id = _trailing_control(
+        rig,
+        command_type,
+        status,
+        result,
+        "control-material-trailing",
+    )
+
+    anchor = _anchor_of(rig)
+    assert anchor["reason"] == reason
+    if reason:
+        # The refused-control walk never reached the accepted stage, so
+        # the trailing command was judged on its own terms and refused.
+        assert anchor["eligible"] is False
+        assert "prior_command_id" not in anchor
+        rig.store.close()
+        return
+    assert anchor["eligible"] is True
+    assert anchor["prior_command_id"] == control_id
+    assert anchor["prior_anchor_kind"] == "control-command"
+    rig.store.close()
+
+
+def _bind_lease(rig: SimpleNamespace, control_id: str) -> None:
+    lease = rig.store.create_process_lease(
+        rig.session.session_id,
+        "kimi",
+        "unattended",
+        utc_now(),
+    )
+    with rig.store.transaction() as connection:
+        connection.execute(
+            "UPDATE process_leases SET command_id = ? WHERE lease_id = ?",
+            (control_id, lease["lease_id"]),
+        )
+
+
+def _bind_envelope(rig: SimpleNamespace, control_id: str) -> None:
+    rig.store.create_command_envelope(
+        control_id,
+        rig.session.session_id,
+        "unattended",
+        {"max_dollars": 0.0},
+    )
+
+
+def _bind_child_gate(rig: SimpleNamespace, control_id: str) -> None:
+    rig.store.create_child_launch_gate(control_id, rig.session.session_id, 1)
+
+
+def _bind_control_event(rig: SimpleNamespace, control_id: str) -> None:
+    rig.store.append_event(
+        rig.session.session_id,
+        "turn.interrupted",
+        status="interrupted",
+        metadata={"control_command_id": control_id},
+    )
+
+
+def _bind_command_event(rig: SimpleNamespace, control_id: str) -> None:
+    rig.store.append_event(
+        rig.session.session_id,
+        "usage.reserved",
+        status="complete",
+        metadata={"command_id": control_id},
+    )
+
+
+def _bind_prior_command_event(rig: SimpleNamespace, control_id: str) -> None:
+    rig.store.append_event(
+        rig.session.session_id,
+        "dispatch.invalidation",
+        status="complete",
+        metadata={"prior_command_id": control_id},
+    )
+
+
+@pytest.mark.parametrize(
+    "bind",
+    [
+        _bind_lease,
+        _bind_envelope,
+        _bind_child_gate,
+        _bind_control_event,
+        _bind_command_event,
+        _bind_prior_command_event,
+    ],
+)
+def test_anchor_never_steps_over_a_refusal_bound_to_session_state(
+    tmp_path: Path,
+    bind: Any,
+) -> None:
+    """Recorded state outranks a result that claims nothing."""
+    rig = _control_shadowed_anchor(tmp_path, "control-bound")
+    control_id = _trailing_control(
+        rig,
+        "interrupt",
+        CommandStatus.FAILED,
+        dict(_REFUSED_INTERRUPT),
+        "control-bound-interrupt",
+    )
+    assert _anchor_of(rig)["prior_command_id"] == rig.command.command_id
+
+    bind(rig, control_id)
+
+    anchor = _anchor_of(rig)
+    assert anchor["reason"] == _NOT_ELIGIBLE
+    assert anchor["eligible"] is False
+    assert "prior_command_id" not in anchor
+    rig.store.close()
+
+
+def test_anchor_steps_over_a_refusal_events_name_only_as_a_target(
+    tmp_path: Path,
+) -> None:
+    """A target names the command an event acted on, not the actor."""
+    rig = _control_shadowed_anchor(tmp_path, "control-target")
+    control_id = _trailing_control(
+        rig,
+        "interrupt",
+        CommandStatus.FAILED,
+        dict(_REFUSED_INTERRUPT),
+        "control-target-interrupt",
+    )
+    rig.store.append_event(
+        rig.session.session_id,
+        "user.steer",
+        role="user",
+        status="complete",
+        metadata={"target_command_id": control_id},
+    )
+
+    anchor = _anchor_of(rig)
+    assert anchor["eligible"] is True, anchor["reason"]
+    assert anchor["prior_command_id"] == rig.command.command_id
+    rig.store.close()
+
+
 def test_needs_reconciliation_still_requires_one_resolved_reconciliation(
     tmp_path: Path,
 ) -> None:
