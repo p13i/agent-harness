@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -6644,6 +6645,355 @@ async def test_output_without_workspace_change_completes_and_counts(
         turn_rows = rig.store.presentation_turn_rows(rig.session.session_id)
         assert [row["turn_status"] for row in turn_rows] == ["complete"]
         assert rig.store.countable_turn_count(rig.session.session_id) == 1
+    finally:
+        rig.close()
+
+
+class ReadingAdapter(ScriptedAdapter):
+    """Holds a lease, streams distinct tool pairs, and reads only.
+
+    No pair repeats and no cycle forms, so the repetition guards stay
+    clear and every completed pair resets the stagnation clock. This is
+    the shape of the turn the material budget exists to stop.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        *,
+        writes: int = 0,
+        accepts: bool = True,
+        pause: float = 0.02,
+    ) -> None:
+        super().__init__(provider)
+        self.writes = writes
+        self.accepts = accepts
+        self.pause = pause
+        self.cycles = 0
+        self.stop = asyncio.Event()
+
+    async def run_turn(
+        self,
+        *,
+        workspace: Path,
+        prompt: str,
+        native_session_id: str,
+        permission_mode: str,
+        model: str,
+        effort: str,
+        event_handler: EventHandler,
+        approval_handler: ApprovalHandler,
+        child_launch_gate: ChildLaunchGate | None = None,
+        pre_prompt_gate: PrePromptGate | None = None,
+    ) -> ProviderResult:
+        del permission_mode
+        del model
+        del approval_handler
+        del child_launch_gate
+        if pre_prompt_gate is not None:
+            await pre_prompt_gate()
+        self.prompts.append(prompt)
+        self.efforts.append(effort)
+        if self.accepts:
+            await event_handler(
+                ProviderEvent(
+                    "provider.prompt.accepted",
+                    status="accepted",
+                    native_session_id=(self.provider_id + "-native-session"),
+                )
+            )
+        while not self.stop.is_set():
+            index = self.cycles
+            self.cycles += 1
+            await event_handler(
+                ProviderEvent(
+                    "tool.started",
+                    text="Read",
+                    metadata={"id": "tool-" + str(index)},
+                )
+            )
+            await event_handler(
+                ProviderEvent(
+                    "tool.completed",
+                    text="body of file " + str(index),
+                    metadata={"tool_use_id": "tool-" + str(index)},
+                )
+            )
+            if index < self.writes:
+                note = workspace / ("note-" + str(index) + ".txt")
+                note.write_text("material " + str(index) + "\n")
+            if self.cycles >= 40:
+                break
+            await asyncio.sleep(self.pause)
+        return ProviderResult(
+            provider=self.provider_id,
+            native_session_id=self.provider_id + "-native-session",
+            native_turn_id=self.provider_id + "-turn",
+            status="complete",
+            usage={"total_tokens": 1},
+        )
+
+    async def interrupt(self) -> None:
+        self.interruptions += 1
+        self.stop.set()
+
+
+@pytest.mark.asyncio
+async def test_tool_active_zero_material_turn_pauses_without_failover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Long enough that the turn outlasts its own budget without relying
+    # on how long an inspection happens to take.
+    claude = ReadingAdapter("claude", pause=0.05)
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    monkeypatch.setattr(worker_module, "MATERIAL_SAMPLE_SECONDS", 0.0)
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Implement the change.",
+            safety_limits={"no_material_seconds": 1},
+        )
+
+        assert receipt.status == "failed", receipt.result
+        incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert [item["reason"] for item in incidents] == ["no-material-progress"]
+        # A turn that produced no material may still have run tools, so
+        # its effects are not provably bounded. Pausing is the only safe
+        # outcome; the recovery ladder must not resend the instruction.
+        assert [item["action"] for item in incidents] == ["pause"]
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [item.provider for item in attempts] == ["claude"]
+        assert codex.prompts == []
+        envelope = rig.store.command_envelope(receipt.command_id)
+        assert envelope["recovery_stage"] == 0
+        assert envelope["consumption"]["attempts"] == 1
+        recoveries = [
+            item
+            for item in rig.store.all_events(rig.session.session_id)
+            if item.event_type == "recovery.started"
+        ]
+        assert recoveries == []
+        # The provider acknowledged the prompt, so the ambiguous outcome
+        # is retained for an operator rather than silently discarded.
+        assert (
+            len(rig.store.pending_reconciliations(rig.session.session_id)) == 1
+        )
+        assert claude.interruptions == 1
+        assert claude.cycles > 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_material_change_keeps_a_tool_active_turn_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude = ReadingAdapter("claude", writes=40)
+    rig = JourneyRig(tmp_path, claude=claude)
+    monkeypatch.setattr(worker_module, "MATERIAL_SAMPLE_SECONDS", 0.0)
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Implement the change.",
+            provider="claude",
+            safety_limits={"no_material_seconds": 1},
+        )
+
+        # Same event shape and same tight budget as the paused turn. The
+        # only difference is that the workspace actually changed.
+        assert receipt.status == "complete", receipt.result
+        assert rig.store.guard_incidents(rig.session.session_id) == []
+        assert claude.interruptions == 0
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_acceptance_zero_material_turn_never_fails_over(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude = ReadingAdapter("claude", accepts=False, pause=0.05)
+    codex = ScriptedAdapter("codex")
+    rig = JourneyRig(tmp_path, claude=claude, codex=codex)
+    monkeypatch.setattr(worker_module, "MATERIAL_SAMPLE_SECONDS", 0.0)
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Implement the change.",
+            safety_limits={"no_material_seconds": 1},
+        )
+
+        # No acceptance arrived, which is the one state the recovery
+        # ladder may resend an instruction from. It still must not:
+        # producing no material is not a recoverable reason, and the
+        # provider ran tools whether or not it acknowledged the prompt.
+        assert receipt.status == "failed", receipt.result
+        assert receipt.result["code"] == "E_SAFETY_GUARD"
+        incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert [item["reason"] for item in incidents] == ["no-material-progress"]
+        assert [item["action"] for item in incidents] == ["pause"]
+        attempts = rig.store.attempts(rig.session.session_id)
+        assert [item.provider for item in attempts] == ["claude"]
+        assert codex.prompts == []
+        recoveries = [
+            item
+            for item in rig.store.all_events(rig.session.session_id)
+            if item.event_type == "recovery.started"
+        ]
+        assert recoveries == []
+        # Nothing was acknowledged, so there is no ambiguous dispatch to
+        # hand an operator either.
+        assert rig.store.pending_reconciliations(rig.session.session_id) == []
+        assert claude.interruptions == 1
+    finally:
+        rig.close()
+
+
+def _not_a_live_sample(
+    loop_thread: threading.Thread,
+    adapter: ReadingAdapter,
+) -> bool:
+    """Report whether an inspection is something other than a sample.
+
+    Dispatch reads the workspace before the provider starts, and the
+    tool-result fingerprint reads it on the event loop thread for every
+    completed pair. Both need a real digest. The live sample is the one
+    inspection that runs off the loop thread while the provider is
+    already streaming, so this is what lets a test fail only that one.
+    """
+
+    if adapter.cycles == 0:
+        return True
+    return threading.current_thread() is loop_thread
+
+
+@pytest.mark.asyncio
+async def test_inspection_race_is_not_material_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failing sample returns far faster than a real inspection, so
+    # the turn has to outlast its own budget on its own account for the
+    # guard to be the thing that stops it.
+    claude = ReadingAdapter("claude", pause=0.05)
+    rig = JourneyRig(tmp_path, claude=claude)
+    monkeypatch.setattr(worker_module, "MATERIAL_SAMPLE_SECONDS", 0.0)
+    real_inspect = worker_module.inspect_workspace
+    loop_thread = threading.current_thread()
+    samples: list[int] = []
+
+    def raced(workspace: Path) -> tuple[str, str]:
+        if _not_a_live_sample(loop_thread, claude):
+            return real_inspect(workspace)
+        samples.append(1)
+        raise HarnessError(
+            "E_WORKSPACE_INSPECTION",
+            "Workspace material changed during inspection",
+            status=409,
+        )
+
+    monkeypatch.setattr(worker_module, "inspect_workspace", raced)
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Implement the change.",
+            provider="claude",
+            safety_limits={"no_material_seconds": 1},
+        )
+
+        # An unreadable sample says nothing about material, so it is
+        # skipped rather than counted. The clock keeps running and the
+        # turn stops for producing nothing, exactly as it would have
+        # without a sampler.
+        assert samples
+        assert receipt.status == "failed", receipt.result
+        incidents = rig.store.guard_incidents(rig.session.session_id)
+        assert [item["reason"] for item in incidents] == ["no-material-progress"]
+        assert claude.interruptions == 1
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_inspection_failure_other_than_a_race_is_not_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude = ReadingAdapter("claude", pause=0.05)
+    rig = JourneyRig(tmp_path, claude=claude)
+    monkeypatch.setattr(worker_module, "MATERIAL_SAMPLE_SECONDS", 0.0)
+    real_inspect = worker_module.inspect_workspace
+    loop_thread = threading.current_thread()
+    samples: list[int] = []
+
+    def broken(workspace: Path) -> tuple[str, str]:
+        if _not_a_live_sample(loop_thread, claude):
+            return real_inspect(workspace)
+        samples.append(1)
+        raise HarnessError(
+            "E_GIT",
+            "Git operation failed during workspace inspection",
+            status=409,
+        )
+
+    monkeypatch.setattr(worker_module, "inspect_workspace", broken)
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Implement the change.",
+            provider="claude",
+            safety_limits={"no_material_seconds": 1},
+        )
+
+        # Only the race is skipped. A repository the sampler cannot
+        # read is a real failure and still surfaces as one.
+        assert samples
+        assert receipt.status == "failed", receipt.result
+        assert receipt.result["code"] == "E_GIT"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+async def test_exempt_workload_never_samples_workspace_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude = ReadingAdapter("claude")
+    rig = JourneyRig(tmp_path, claude=claude)
+    monkeypatch.setattr(worker_module, "MATERIAL_SAMPLE_SECONDS", 0.0)
+    samples: list[int] = []
+    sampler = worker_module.SessionWorker._sample_material_progress
+
+    async def counted(worker: SessionWorker, guard: TurnGuard, session: Any) -> None:
+        samples.append(1)
+        await sampler(worker, guard, session)
+
+    monkeypatch.setattr(
+        worker_module.SessionWorker,
+        "_sample_material_progress",
+        counted,
+    )
+    rig.prime_capacity()
+    try:
+        receipt = await rig.message(
+            "Review the completed change.",
+            provider="claude",
+            workload="review",
+        )
+
+        # A review turn carries no material budget, so the sample has
+        # nothing to decide. Taking it anyway would hand a turn that is
+        # meant to read for its whole budget a new way to fail, on an
+        # inspection its own workload never asked for.
+        assert limits_for("interactive", "review").no_material_seconds == 0
+        assert receipt.status == "complete", receipt.result
+        assert samples == []
+        assert claude.cycles > 1
     finally:
         rig.close()
 

@@ -1186,6 +1186,16 @@ components:
         stagnation_seconds:
           type: integer
           minimum: 1
+        no_material_seconds:
+          type: integer
+          minimum: 0
+          description: >
+            Seconds a turn may run without changing live workspace
+            material. Distinct tool activity does not reset this
+            budget. 0 means the check is off, which is the profile
+            default for the review, research, and read-only
+            workloads only. A request may lower a profile's budget
+            but may not send 0 to turn one off.
         binding_ceiling:
           type: number
           minimum: 0

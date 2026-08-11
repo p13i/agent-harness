@@ -46,6 +46,32 @@ _SUBPROCESS_STREAM_LIMIT = 16 * 1024 * 1024
 
 _DEFAULT_EFFORTS = ("low", "medium", "high", "xhigh")
 
+# Wire types that exist only once Grok is running the turn.
+_TURN_STARTED_TYPES = frozenset(
+    {
+        "end",
+        "text",
+        "thought",
+        "tool_call",
+        "tool_call_update",
+        "usage",
+    }
+)
+
+
+def _turn_started(payload: dict[str, object]) -> bool:
+    """Report whether one Grok line proves the turn itself began.
+
+    The harness treats acceptance as proof the provider holds the
+    instruction, and stops resending it elsewhere on that basis, so it
+    has to come from the turn's own output. ``error`` is terminal and
+    reports a failure rather than a run (see ``grok_payload``), and a
+    type the normalizer does not recognize is as likely to be startup
+    metadata as turn output. Neither is evidence, so neither accepts.
+    """
+
+    return str(payload.get("type", "")) in _TURN_STARTED_TYPES
+
 
 def resolve_grok_binary() -> str | None:
     """Return the first trusted grok binary path, or None."""
@@ -167,6 +193,7 @@ class GrokAdapter(ProviderAdapter):
         session_id = native_session_id
         status = "complete"
         usage: dict[str, object] = {}
+        prompt_accepted = False
         try:
             assert process.stdout is not None
             async for line in process.stdout:
@@ -179,6 +206,20 @@ class GrokAdapter(ProviderAdapter):
                     continue
                 if not isinstance(payload, dict):
                     continue
+                if not prompt_accepted and _turn_started(payload):
+                    # The first line of turn output is the earliest
+                    # proof Grok is running the prompt. Without it the
+                    # harness treats every Grok guard stop as
+                    # pre-acceptance and may resend the instruction to
+                    # another provider after Grok already ran tools.
+                    prompt_accepted = True
+                    await event_handler(
+                        ProviderEvent(
+                            "provider.prompt.accepted",
+                            status="accepted",
+                            native_session_id=session_id,
+                        )
+                    )
                 for event in grok_payload(payload):
                     if event.native_session_id:
                         session_id = event.native_session_id

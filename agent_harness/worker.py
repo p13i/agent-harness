@@ -114,6 +114,9 @@ from agent_harness.workspace_state import inspect_workspace
 CONTROL_COMMANDS = frozenset({"interrupt", "pause", "resume", "stop", "steer"})
 APPROVAL_POLL_LIMIT = 3600
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+# Live material inspection reads the tracked diff and every untracked
+# file, so it is far too expensive for the supervision poll interval.
+MATERIAL_SAMPLE_SECONDS = 30.0
 
 
 def _handoff_prompt_reserve(max_context_tokens: int) -> int:
@@ -1380,6 +1383,7 @@ class SessionWorker:
         lease_pid = 0
         lease_pid_start = ""
         last_lease_heartbeat = time.monotonic()
+        last_material_sample = time.monotonic()
         fault_probe = payload.get("proof_fault_probe")
         if not isinstance(fault_probe, dict):
             fault_probe = {}
@@ -1586,6 +1590,17 @@ class SessionWorker:
                             expires_at=_lease_expiry(),
                         )
                         last_lease_heartbeat = now
+                if (
+                    guard.limits.no_material_seconds > 0
+                    and time.monotonic() - last_material_sample
+                    >= MATERIAL_SAMPLE_SECONDS
+                ):
+                    # A turn with no material budget has nothing to
+                    # learn from the sample, and taking it anyway would
+                    # give a review or read-only turn a way to fail on
+                    # an inspection it never needed.
+                    last_material_sample = time.monotonic()
+                    await self._sample_material_progress(guard, session)
                 control = self.store.claim_command(
                     self.session_id,
                     CONTROL_COMMANDS,
@@ -2353,6 +2368,40 @@ class SessionWorker:
             await asyncio.gather(run_task, return_exceptions=True)
         except BaseException:
             pass
+
+    async def _sample_material_progress(
+        self,
+        guard: TurnGuard,
+        session: Session,
+    ) -> None:
+        """Re-read live workspace material during a running turn.
+
+        Only Codex reports ``file.change`` items, so every other
+        provider would otherwise never re-check material after dispatch.
+        This sample is provider-neutral and keeps the ``file.change``
+        fast path intact for the provider that does report.
+
+        ``E_WORKSPACE_INSPECTION`` covers every entry the walk could
+        not read, from a file a provider is rewriting to a directory it
+        may not enter, so it says nothing about whether material
+        changed and cannot stand in for a digest. A sample that could
+        not be taken is skipped: the budget keeps running and the next
+        sample decides. Only a changed digest advances the clock. Any
+        other inspection failure, a broken repository among them, still
+        propagates.
+        """
+
+        try:
+            digest, unused_summary = await asyncio.to_thread(
+                inspect_workspace,
+                Path(session.worktree),
+            )
+            del unused_summary
+        except HarnessError as error:
+            if error.detail.code != "E_WORKSPACE_INSPECTION":
+                raise
+            return
+        guard.note_material_progress(digest)
 
     async def _guard_checkpoint(
         self,

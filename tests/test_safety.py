@@ -24,6 +24,7 @@ from agent_harness.safety import (
     has_exact_cost,
     limits_for,
     lower_effort,
+    no_material_budget,
     normalize_cost,
     normalize_usage,
     require_state_headroom,
@@ -804,6 +805,210 @@ def test_guard_warning_recovery_and_nonrepeating_cycles() -> None:
     assert stagnating.violation() == ""
 
 
+def test_material_budget_exempts_only_read_only_workloads() -> None:
+    implementation = limits_for(UNATTENDED, "implementation")
+    debugging = limits_for(UNATTENDED, "debugging")
+    operations = limits_for(UNATTENDED, "operations")
+    smoke = limits_for(LIVE_SMOKE, "implementation")
+    interactive = limits_for(INTERACTIVE, "implementation")
+
+    # Unattended implementation work owes its first material inside
+    # five minutes. The other profiles keep their own budgets.
+    assert implementation.no_material_seconds == 300
+    assert debugging.no_material_seconds == 300
+    assert interactive.no_material_seconds == 1_800
+    assert operations.no_material_seconds == 720
+    assert smoke.no_material_seconds == 240
+
+    # Reading for a long time is the correct behavior for these
+    # workloads, so the budget is explicitly off rather than merely
+    # generous.
+    for name in ("review", "code-review", "code review", "research", "read-only"):
+        assert limits_for(UNATTENDED, name).no_material_seconds == 0
+    assert no_material_budget("implementation", 300) == 300
+    assert no_material_budget("code-review", 300) == 0
+
+    # A misspelled or unrecognized workload routes to the writing
+    # limits, so it must not also collect the exemption. Reaching the
+    # writing budget through a typo is the failure this rules out.
+    for name in ("implementaion", "reveiw", "spelunking", "planning"):
+        assert limits_for(UNATTENDED, name).no_material_seconds == 300
+
+    # The budget must be reachable before the wall-clock stop, or it
+    # can never explain why a turn was stopped.
+    for limits in (implementation, debugging, interactive, operations, smoke):
+        assert limits.no_material_seconds < limits.max_seconds
+
+
+def test_distinct_tool_activity_cannot_reset_the_material_clock() -> None:
+    clock = Clock()
+    limits = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.begin_attempt(1_000)
+    guard.establish_material_state("workspace-a")
+
+    # Every pair is distinct, so neither the repeated-tool nor the
+    # repeated-cycle guard fires, and no step is long enough to
+    # stagnate. This is the exact shape of a lease-healthy,
+    # tool-active turn that changes nothing.
+    for index in range(40):
+        clock.advance(60)
+        guard.observe(
+            ProviderEvent(
+                "tool.started",
+                text="Read",
+                metadata={"id": "tool-" + str(index)},
+            )
+        )
+        guard.observe(
+            ProviderEvent(
+                "tool.completed",
+                text="body of file " + str(index),
+                metadata={"tool_use_id": "tool-" + str(index)},
+            )
+        )
+        if guard.violation():
+            break
+
+    assert guard.violation() == "no-material-progress"
+    assert guard.consumption.tool_calls == 5
+    assert clock.value - 100.0 == limits.no_material_seconds
+
+
+def _material_clock_limits() -> object:
+    """Real implementation limits with only the clocks under test small.
+
+    The other budgets stay at their profile values so a mechanics test
+    cannot pass by tripping ``seconds`` or ``stagnation`` first.
+    """
+
+    return replace(
+        limits_for(UNATTENDED, "implementation"),
+        no_material_seconds=100,
+        stagnation_seconds=1_000,
+    )
+
+
+def test_material_progress_resets_the_material_clock() -> None:
+    clock = Clock()
+    limits = _material_clock_limits()
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.establish_material_state("workspace-a")
+
+    clock.advance(99)
+    assert guard.note_material_progress("workspace-b") is True
+    assert guard.violation() == ""
+
+    clock.advance(99)
+    assert guard.violation() == ""
+
+    # An unchanged digest is not progress and cannot extend the budget.
+    assert guard.note_material_progress("workspace-b") is False
+    clock.advance(1)
+    assert guard.violation() == "no-material-progress"
+
+
+def test_no_material_progress_cannot_recover_or_change_provider() -> None:
+    clock = Clock()
+    limits = _material_clock_limits()
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.establish_material_state("workspace-a")
+    clock.advance(100)
+
+    assert guard.violation() == "no-material-progress"
+    with pytest.raises(ValueError, match="hard safety"):
+        guard.recover()
+    assert guard.violation() == "no-material-progress"
+
+
+def test_stagnation_recovery_cannot_reset_the_material_clock() -> None:
+    clock = Clock()
+    limits = replace(
+        limits_for(UNATTENDED, "implementation"),
+        stagnation_seconds=10,
+        no_material_seconds=100,
+    )
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.establish_material_state("workspace-a")
+
+    # Recovering from stagnation restarts the stagnation clock only.
+    # The material budget keeps running, so a recovered turn cannot
+    # buy unlimited additional no-material time.
+    clock.advance(10)
+    assert guard.violation() == "stagnation"
+    guard.recover()
+    assert guard.violation() == ""
+
+    clock.advance(90)
+    assert guard.violation() == "no-material-progress"
+
+
+def test_material_clock_starts_at_the_dispatch_baseline() -> None:
+    clock = Clock()
+    limits = _material_clock_limits()
+    guard = TurnGuard(limits, monotonic=clock)
+
+    # Routing, context compilation, and checkpointing happen between
+    # guard construction and dispatch. That time belongs to the
+    # harness, not to the provider's material budget.
+    clock.advance(100)
+    guard.establish_material_state("workspace-a")
+    assert guard.violation() == ""
+
+    clock.advance(100)
+    assert guard.violation() == "no-material-progress"
+
+
+def test_only_a_changed_digest_advances_the_material_clock() -> None:
+    clock = Clock()
+    limits = _material_clock_limits()
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.establish_material_state("workspace-a")
+
+    # The guard exposes no way to certify material progress without a
+    # digest. A sample that fails leaves the clock running, so an
+    # unreadable workspace can never buy a turn more time.
+    assert not hasattr(guard, "note_material_churn")
+    clock.advance(99)
+    assert guard.note_material_progress("workspace-a") is False
+    clock.advance(1)
+    assert guard.violation() == "no-material-progress"
+
+
+def test_material_budget_disabled_never_trips() -> None:
+    clock = Clock()
+    limits = limits_for(UNATTENDED, "review")
+    guard = TurnGuard(limits, monotonic=clock)
+    guard.establish_material_state("workspace-a")
+
+    assert limits.no_material_seconds == 0
+    clock.advance(limits.max_seconds - 1)
+    assert guard.violation() == "stagnation"
+
+
+def test_material_budget_can_be_tightened_but_never_turned_off() -> None:
+    limits = limits_for(UNATTENDED, "implementation")
+
+    tightened = tighten_limits(limits, {"no_material_seconds": 60})
+    assert tightened.no_material_seconds == 60
+    assert tighten_limits(tightened, {"no_material_seconds": 1})
+
+    # 0 turns the guard off rather than tightening it, so a mandatory
+    # budget must reject it exactly as it rejects a wider one.
+    with pytest.raises(ValueError, match="below its minimum"):
+        tighten_limits(limits, {"no_material_seconds": 0})
+    with pytest.raises(ValueError, match="cannot widen"):
+        tighten_limits(limits, {"no_material_seconds": 10_000})
+
+    # An exempt workload has no budget to tighten. 0 is its current
+    # value, so it stays a no-op, and anything above it widens.
+    exempt = limits_for(UNATTENDED, "review")
+    kept = tighten_limits(exempt, {"no_material_seconds": 0})
+    assert kept.no_material_seconds == 0
+    with pytest.raises(ValueError, match="cannot widen"):
+        tighten_limits(exempt, {"no_material_seconds": 1})
+
+
 def test_noop_file_change_cannot_clear_repetition_history() -> None:
     guard = TurnGuard(limits_for(UNATTENDED, "implementation"))
     guard.establish_material_state("workspace-a")
@@ -1382,6 +1587,48 @@ def test_over_budget_terminal_usage_cannot_shadow_a_wedged_provider() -> None:
     assert snapshot["violation"] == "total-tokens"
     assert snapshot["consumption"]["total_tokens"] == 1_300
     assert snapshot["consumption"]["elapsed_seconds"] == 100
+    assert guard.terminal_violation() == ""
+
+
+def test_post_terminal_accounting_cannot_disguise_a_silent_turn() -> None:
+    clock = Clock()
+    base = limits_for(UNATTENDED, "implementation")
+    guard = TurnGuard(
+        replace(
+            base,
+            max_total_tokens=1_000,
+            max_seconds=1_000,
+            stagnation_seconds=10,
+            no_material_seconds=100,
+        ),
+        monotonic=clock,
+    )
+    guard.begin_attempt(100)
+    guard.establish_material_state("workspace-a")
+    guard.observe(
+        ProviderEvent(
+            "turn.completed",
+            status="complete",
+            metadata={
+                "input_tokens": 900,
+                "output_tokens": 400,
+                "total_tokens": 1_300,
+            },
+        )
+    )
+
+    # The accounting reason is retained, so the live reason has to be
+    # re-read from the clocks rather than taken from it.
+    assert guard.violation() == "total-tokens"
+
+    # The provider wedges instead of returning, and both time clocks
+    # expire together.
+    clock.advance(100)
+
+    # Reporting stagnation here would hand a turn that produced nothing
+    # the one reason the recovery ladder may retry and change provider
+    # on, using a post-terminal accounting reason as the cover.
+    assert guard.live_violation() == "no-material-progress"
     assert guard.terminal_violation() == ""
 
 

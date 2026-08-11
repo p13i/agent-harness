@@ -38,11 +38,62 @@ from agent_harness.providers.base import ProviderResult
 from agent_harness.providers.base import ProviderStatus
 from agent_harness.providers.base import provider_environment
 from agent_harness.providers.normalize import kimi_payload
+from agent_harness.providers.normalize import payload_text
 from agent_harness.process_control import ProcessGroupIdentity
 from agent_harness.process_control import process_group_identity
 from agent_harness.process_control import terminate_process_group
 
 KIMI_CODE_PACKAGE = "@moonshot-ai/kimi-code"
+
+# Roles whose lines carry turn content rather than run metadata.
+_TURN_STARTED_ROLES = frozenset({"assistant", "tool", "user"})
+_RESUME_HINT = "session.resume_hint"
+
+
+def _carries_tool_calls(payload: dict[str, object]) -> bool:
+    """Report whether a line carries an OpenAI-shaped ``tool_calls`` array.
+
+    Mirrors the gate the normalizer applies before it mints tool starts
+    (see ``_kimi_tool_starts``), so a line this accepts is a line that
+    reaches the worker as tool activity.
+    """
+
+    tool_calls = payload.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False
+    for call in tool_calls:
+        if isinstance(call, dict):
+            return True
+    return False
+
+
+def _turn_started(payload: dict[str, object]) -> bool:
+    """Report whether one Kimi line proves the turn itself began.
+
+    The harness treats acceptance as proof the provider holds the
+    instruction, and stops resending it elsewhere on that basis, so it
+    has to come from the turn's own output. A launched process is not
+    that: an unconfigured model alias fails the run before a turn ever
+    starts (see ``models``). Neither is a ``meta`` line, which reports
+    on the run rather than on the turn -- except for the closing resume
+    hint, which only a session that ran emits.
+
+    Kimi announces a tool call on an assistant line whose ``content``
+    is empty, so text alone is not the test. That line is the one that
+    matters most: a turn stopped by a guard right after running a tool
+    must not be resent to another provider. An assistant line with
+    neither text nor tool calls remains an empty frame and proves
+    nothing.
+    """
+
+    role = str(payload.get("role", ""))
+    if role == "meta":
+        return str(payload.get("type", "")) == _RESUME_HINT
+    if role not in _TURN_STARTED_ROLES:
+        return False
+    if payload_text(payload.get("content")):
+        return True
+    return _carries_tool_calls(payload)
 
 
 def _launch_argv(prompt: str, model: str, session_id: str) -> list[str]:
@@ -123,6 +174,7 @@ class KimiAdapter(ProviderAdapter):
 
         session_id = native_session_id
         status = "complete"
+        prompt_accepted = False
         try:
             assert process.stdout is not None
             async for line in process.stdout:
@@ -135,6 +187,20 @@ class KimiAdapter(ProviderAdapter):
                     continue
                 if not isinstance(payload, dict):
                     continue
+                if not prompt_accepted and _turn_started(payload):
+                    # The first line of turn output is the earliest
+                    # proof Kimi is running the prompt. Without it the
+                    # harness treats every Kimi guard stop as
+                    # pre-acceptance and may resend the instruction to
+                    # another provider after Kimi already ran tools.
+                    prompt_accepted = True
+                    await event_handler(
+                        ProviderEvent(
+                            "provider.prompt.accepted",
+                            status="accepted",
+                            native_session_id=session_id,
+                        )
+                    )
                 for event in kimi_payload(payload):
                     if event.native_session_id:
                         session_id = event.native_session_id

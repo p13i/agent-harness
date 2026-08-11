@@ -2411,10 +2411,147 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
     asyncio.run(scenario())
 
     assert [e.event_type for e in seen] == [
+        "provider.prompt.accepted",
         "agent.message",
         "tool.started",
         "tool.completed",
         "turn.completed",
+    ]
+
+
+def test_kimi_acknowledges_prompt_acceptance_only_on_turn_output(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    parsed = [
+        b"not json\n",
+        b"[1, 2]\n",
+        b"\n",
+        b'{"role":"assistant","content":"first"}\n',
+        b'{"role":"assistant","content":"second"}\n',
+        b'{"role":"meta","type":"session.resume_hint","session_id":"session_z"}\n',
+    ]
+    unparsable = [b"not json\n", b"[1, 2]\n"]
+    no_turn = [
+        b'{"role":"meta","type":"session.started","session_id":"session_a"}\n',
+        b'{"role":"assistant","content":""}\n',
+        b'{"role":"error","content":"config.invalid"}\n',
+    ]
+    resume_only = [
+        b'{"role":"meta","type":"session.resume_hint","session_id":"session_z"}\n',
+    ]
+    tools_only = [
+        b'{"role":"assistant","content":"","tool_calls":[{"id":"call_1",'
+        b'"type":"function","function":{"name":"Read",'
+        b'"arguments":"{\\"file_path\\":\\"README.md\\"}"}}]}\n',
+    ]
+
+    def process_for(lines: list[bytes]):
+        class Stdout:
+            def __aiter__(self):
+                async def gen():
+                    for line in lines:
+                        yield line
+
+                return gen()
+
+        class Stderr:
+            async def read(self) -> bytes:
+                return b""
+
+        class Process:
+            stdout = Stdout()
+            stderr = Stderr()
+
+            async def wait(self) -> int:
+                return 0
+
+        return Process()
+
+    pending = [parsed, unparsable, no_turn, resume_only, tools_only]
+
+    async def fake_exec(*_argv, **_kwargs):
+        return process_for(pending.pop(0))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    seen: list[ProviderEvent] = []
+
+    async def handler(event: ProviderEvent) -> None:
+        seen.append(event)
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def run() -> None:
+        await kimi.KimiAdapter().run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="",
+            permission_mode="full",
+            model="kimi-code/k3",
+            effort="",
+            event_handler=handler,
+            approval_handler=approvals,
+        )
+
+    asyncio.run(run())
+
+    # Acceptance is emitted once, ahead of the first normalized event,
+    # and is not repeated on later lines. Without it the worker treats
+    # every Kimi guard stop as pre-acceptance and may resend the
+    # instruction to another provider after Kimi already ran tools.
+    accepted = [e for e in seen if e.event_type == "provider.prompt.accepted"]
+    assert len(accepted) == 1
+    assert accepted[0].status == "accepted"
+    assert [e.event_type for e in seen] == [
+        "provider.prompt.accepted",
+        "agent.message",
+        "agent.message",
+        "turn.completed",
+    ]
+
+    seen.clear()
+    asyncio.run(run())
+
+    # A stream that never parses never acknowledges: exec success alone
+    # is not proof Kimi consumed the prompt.
+    assert seen == []
+
+    seen.clear()
+    asyncio.run(run())
+
+    # Neither is a startup meta line, an empty message frame, nor a
+    # line reporting a failure. Acknowledging any of those would mark a
+    # turn that never ran as delivered and strand the command with an
+    # operator instead of failing it over.
+    assert [e.event_type for e in seen] == [
+        "provider.event",
+        "provider.event",
+        "provider.event",
+    ]
+
+    seen.clear()
+    asyncio.run(run())
+
+    # The closing resume hint only a run session emits does acknowledge,
+    # so a turn that produced no message is still not mistaken for one
+    # that never started.
+    assert [e.event_type for e in seen] == [
+        "provider.prompt.accepted",
+        "turn.completed",
+    ]
+
+    seen.clear()
+    asyncio.run(run())
+
+    # Kimi announces a tool call on an assistant line whose content is
+    # empty, so the frame that carries no text still acknowledges. A
+    # turn stopped by a guard right after running a tool must not be
+    # resent to another provider.
+    assert [e.event_type for e in seen] == [
+        "provider.prompt.accepted",
+        "tool.started",
     ]
 
 
@@ -2926,10 +3063,126 @@ def test_grok_run_turn_streams_and_reports_the_session(
 
     asyncio.run(scenario())
 
-    assert [e.event_type for e in seen] == ["agent.message", "turn.completed"]
+    assert [e.event_type for e in seen] == [
+        "provider.prompt.accepted",
+        "agent.message",
+        "turn.completed",
+    ]
     assert captured[0][0] == "/usr/local/bin/grok"
     assert "--always-approve" in captured[0]
     assert launch_options[0]["limit"] == 16 * 1024 * 1024
+
+
+def test_grok_acknowledges_prompt_acceptance_only_on_turn_output(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    parsed = [
+        b"not json\n",
+        b"[1, 2]\n",
+        b'{"type":"text","data":"first"}\n',
+        b'{"type":"text","data":"second"}\n',
+        b'{"type":"end","stopReason":"end_turn","sessionId":"session_z"}\n',
+    ]
+    unparsable = [b"not json\n", b"[1, 2]\n"]
+    no_turn = [
+        b'{"type":"session_start","sessionId":"session_a"}\n',
+        b'{"type":"error","message":"model not found","sessionId":"session_a"}\n',
+    ]
+    tools_only = [
+        b'{"type":"tool_call","toolName":"Read","toolCallId":"call_1"}\n',
+    ]
+
+    def process_for(lines: list[bytes]):
+        class Stdout:
+            def __aiter__(self):
+                async def gen():
+                    for line in lines:
+                        yield line
+
+                return gen()
+
+        class Stderr:
+            async def read(self) -> bytes:
+                return b""
+
+        class Process:
+            stdout = Stdout()
+            stderr = Stderr()
+
+            async def wait(self) -> int:
+                return 0
+
+        return Process()
+
+    pending = [parsed, unparsable, no_turn, tools_only]
+
+    async def fake_exec(*_argv, **_kwargs):
+        return process_for(pending.pop(0))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(grok, "resolve_grok_binary", lambda: "/usr/local/bin/grok")
+
+    seen: list[ProviderEvent] = []
+
+    async def handler(event: ProviderEvent) -> None:
+        seen.append(event)
+
+    async def approvals(_name: str, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def run() -> None:
+        await grok.GrokAdapter().run_turn(
+            workspace=tmp_path,
+            prompt="do it",
+            native_session_id="",
+            permission_mode="full",
+            model="grok-4.5",
+            effort="medium",
+            event_handler=handler,
+            approval_handler=approvals,
+        )
+
+    asyncio.run(run())
+
+    accepted = [e for e in seen if e.event_type == "provider.prompt.accepted"]
+    assert len(accepted) == 1
+    assert accepted[0].status == "accepted"
+    assert [e.event_type for e in seen] == [
+        "provider.prompt.accepted",
+        "agent.message",
+        "agent.message",
+        "turn.completed",
+    ]
+
+    seen.clear()
+    asyncio.run(run())
+
+    assert seen == []
+
+    seen.clear()
+    asyncio.run(run())
+
+    # Startup metadata and the structured error payload are both
+    # unrecognized as turn output, so neither acknowledges. The error
+    # still reaches the worker as the terminal failure it is.
+    assert [e.event_type for e in seen] == [
+        "provider.event",
+        "turn.failed",
+    ]
+
+    seen.clear()
+    asyncio.run(run())
+
+    # A tool call is turn output, and it is the line that matters most:
+    # a turn stopped by a guard right after running a tool must not be
+    # resent to another provider. Acceptance is decided on the wire type
+    # rather than on what the line normalizes to, so it holds whether or
+    # not the normalizer gives tool activity its own event.
+    assert [e.event_type for e in seen] == [
+        "provider.prompt.accepted",
+        "tool.started",
+    ]
 
 
 def test_grok_run_turn_gates_on_a_positive_child_limit(

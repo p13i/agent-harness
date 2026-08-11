@@ -45,6 +45,19 @@ ACCOUNTING_VIOLATIONS = frozenset(
         "dollars",
     }
 )
+NO_MATERIAL_EXEMPT_WORKLOADS = frozenset(
+    {
+        "code review",
+        "code-review",
+        "code_review",
+        "read only",
+        "read-only",
+        "read_only",
+        "readonly",
+        "research",
+        "review",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +75,7 @@ class SafetyLimits:
     binding_ceiling: float
     default_effort: str
     max_attempts: int
+    no_material_seconds: int = 0
     repeated_tool_limit: int = 3
     repeated_cycle_limit: int = 2
 
@@ -111,6 +125,34 @@ def require_state_headroom(
     return free_bytes
 
 
+def no_material_budget(workload: str, profile_seconds: int) -> int:
+    """Seconds a turn may run without changing live workspace material.
+
+    Liveness and material progress are independent. A provider can hold
+    its lease, stream messages, and complete distinct tool calls for the
+    whole wall-clock budget while the workspace never changes, so the
+    stagnation clock cannot answer whether an implementation is
+    producing anything.
+
+    The exemption is an explicit read-only allowlist, never a list of
+    the workloads that write. A misspelled or unrecognized workload
+    routes to the writing limits, so keying the exemption off a writing
+    list would hand a typo the one value that turns a mandatory guard
+    off. Only a workload that names itself review, research, or
+    read-only earns the 0, because reading for a long time is the
+    correct behavior there.
+
+    Each profile passes its own budget. Every one of them stays under
+    that profile's ``max_seconds``, so a materially silent turn stops
+    on this guard, which names the reason, rather than on the wall
+    clock, which does not.
+    """
+
+    if workload in NO_MATERIAL_EXEMPT_WORKLOADS:
+        return 0
+    return profile_seconds
+
+
 def limits_for(profile: str, workload: str) -> SafetyLimits:
     profile = validate_profile(profile)
     normalized_workload = workload.strip().casefold()
@@ -131,6 +173,7 @@ def limits_for(profile: str, workload: str) -> SafetyLimits:
             binding_ceiling=50.0,
             default_effort="low",
             max_attempts=1,
+            no_material_seconds=no_material_budget(normalized_workload, 240),
         )
     if profile == INTERACTIVE:
         return SafetyLimits(
@@ -147,6 +190,7 @@ def limits_for(profile: str, workload: str) -> SafetyLimits:
             binding_ceiling=90.0,
             default_effort="high",
             max_attempts=3,
+            no_material_seconds=no_material_budget(normalized_workload, 1_800),
         )
     if normalized_workload in {"operations", "operation", "sre"}:
         return SafetyLimits(
@@ -163,6 +207,10 @@ def limits_for(profile: str, workload: str) -> SafetyLimits:
             binding_ceiling=90.0,
             default_effort="medium",
             max_attempts=3,
+            # Operations runs the shortest wall clock of the profiles
+            # that carry a budget, so its own has to stay well inside
+            # that clock to be reachable at all.
+            no_material_seconds=no_material_budget(normalized_workload, 720),
         )
     return SafetyLimits(
         profile=profile,
@@ -178,6 +226,10 @@ def limits_for(profile: str, workload: str) -> SafetyLimits:
         binding_ceiling=90.0,
         default_effort="high",
         max_attempts=3,
+        # Unattended implementation work carries a durable five-minute
+        # first-material contract, so this profile's budget is that
+        # contract rather than a share of its wall clock.
+        no_material_seconds=no_material_budget(normalized_workload, 300),
     )
 
 
@@ -240,10 +292,18 @@ def tighten_limits(
         "max_tool_calls": 0,
         "max_child_agents": 0,
         "stagnation_seconds": 1,
+        "no_material_seconds": 0,
         "max_attempts": 1,
         "repeated_tool_limit": 1,
         "repeated_cycle_limit": 1,
     }
+    if limits.no_material_seconds > 0:
+        # 0 is the one value that turns this guard off rather than
+        # tightening it, so a profile that mandates a material budget
+        # cannot be talked out of it by a per-command limit. Where the
+        # workload is already exempt the minimum stays 0, which is the
+        # current value and therefore only ever a no-op.
+        integer_minimums["no_material_seconds"] = 1
     numeric_fields = {"max_dollars", "binding_ceiling"}
     unknown = set(requested) - set(integer_minimums) - numeric_fields
     if unknown:
@@ -467,6 +527,7 @@ class TurnGuard:
         self._started = monotonic()
         self._elapsed_offset = max(0.0, float(consumption.elapsed_seconds))
         self._last_progress = self._started
+        self._last_material_progress = self._started
         self._tool_pairs: list[str] = []
         self._pending_tools: dict[str, list[tuple[str, bool]]] = {}
         self._completed_tool_pair = ""
@@ -563,6 +624,7 @@ class TurnGuard:
         if not digest:
             raise ValueError("material state digest is required")
         self._material_state_digest = digest
+        self._last_material_progress = self._monotonic()
 
     def note_material_progress(self, digest: str) -> bool:
         if not digest:
@@ -571,6 +633,7 @@ class TurnGuard:
             return False
         self._material_state_digest = digest
         self._last_progress = self._monotonic()
+        self._last_material_progress = self._last_progress
         self._tool_pairs.clear()
         self._recent_tool_progress_fingerprints.clear()
         return True
@@ -645,6 +708,16 @@ class TurnGuard:
             and self.consumption.dollars > self.limits.max_dollars
         ):
             self._violation = "dollars"
+        elif (
+            self.limits.no_material_seconds > 0
+            and now - self._last_material_progress >= self.limits.no_material_seconds
+        ):
+            # Ordered ahead of stagnation on purpose. Stagnation is the
+            # one reason the shared-envelope recovery ladder may retry
+            # and change provider. A turn that produced no material may
+            # still have run tools, so when both clocks expire together
+            # the non-recoverable reason has to win.
+            self._violation = "no-material-progress"
         elif now - self._last_progress >= self.limits.stagnation_seconds:
             self._violation = "stagnation"
         return self._violation
@@ -713,6 +786,15 @@ class TurnGuard:
         self.consumption.elapsed_seconds = self._elapsed_offset + now - self._started
         if self.consumption.elapsed_seconds >= self.limits.max_seconds:
             return "seconds"
+        # Held ahead of stagnation for the reason ``violation`` holds it
+        # there: stagnation is recoverable and this is not. A retained
+        # accounting reason must not be the thing that lets a materially
+        # silent turn come back as a recoverable one.
+        if (
+            self.limits.no_material_seconds > 0
+            and now - self._last_material_progress >= self.limits.no_material_seconds
+        ):
+            return "no-material-progress"
         if now - self._last_progress >= self.limits.stagnation_seconds:
             return "stagnation"
         return ""
