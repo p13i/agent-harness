@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Linux /proc/<pid>/stat numbers its fields from one. Field 3 (state)
+# is the first field after the parenthesized comm, so field N sits at
+# index N - 3 of the fields that follow comm.
+_STAT_STATE_INDEX = 0
+_STAT_STARTTIME_INDEX = 19
+
+
 @dataclass(frozen=True)
 class ProcessGroupIdentity:
     pid: int
@@ -54,6 +61,11 @@ async def terminate_process_group(
                 # The leader and every group member are already gone.
                 await _reap_terminated_process(process, kill_timeout)
                 return
+        except ValueError:
+            # An identity that cannot be established must never be
+            # signaled as though it still belonged to this process.
+            await _reap_terminated_process(process, kill_timeout)
+            return
         else:
             if current != identity:
                 # PID was reused after the original leader exited.
@@ -206,10 +218,16 @@ def _process_group_members(pgid: int) -> tuple[ProcessGroupMemberIdentity, ...]:
             continue
         if pid <= 0 or observed_pgid != pgid:
             continue
+        try:
+            pid_start = _process_start(pid)
+        except ValueError:
+            # A member whose identity cannot be established is never
+            # recorded, so it is never signaled.
+            continue
         members.append(
             ProcessGroupMemberIdentity(
                 pid=pid,
-                pid_start=_process_start(pid),
+                pid_start=pid_start,
             )
         )
     return tuple(members)
@@ -222,7 +240,11 @@ def _signal_group_members(
 ) -> None:
     del pgid
     for member in members:
-        if _process_start(member.pid) != member.pid_start:
+        try:
+            current_start = _process_start(member.pid)
+        except ValueError:
+            continue
+        if current_start != member.pid_start:
             continue
         try:
             os.kill(member.pid, selected_signal)
@@ -231,18 +253,18 @@ def _signal_group_members(
 
 
 def _member_is_alive(member: ProcessGroupMemberIdentity) -> bool:
-    if _process_start(member.pid) != member.pid_start:
-        return False
-    stat_path = Path("/proc") / str(member.pid) / "stat"
     try:
-        stat_text = stat_path.read_text(encoding="utf-8")
-    except OSError:
-        stat_text = ""
-    unused_prefix, separator, suffix = stat_text.rpartition(") ")
-    del unused_prefix
-    if separator:
-        fields = suffix.split()
-        if fields and fields[0] in {"X", "Z"}:
+        current_start = _process_start(member.pid)
+    except ValueError:
+        # Identity cannot be established, so this member cannot be
+        # claimed as the recorded one.
+        return False
+    if current_start != member.pid_start:
+        return False
+    stat_text = _read_proc_stat(member.pid)
+    if stat_text is not None:
+        fields = _proc_stat_fields_after_comm(stat_text)
+        if fields and fields[_STAT_STATE_INDEX] in {"X", "Z"}:
             return False
     try:
         os.kill(member.pid, 0)
@@ -253,14 +275,41 @@ def _member_is_alive(member: ProcessGroupMemberIdentity) -> bool:
     return True
 
 
-def _process_start(pid: int) -> str:
+def _read_proc_stat(pid: int) -> str | None:
     stat_path = Path("/proc") / str(pid) / "stat"
     try:
-        fields = stat_path.read_text(encoding="utf-8").split()
+        return stat_path.read_text(encoding="utf-8")
     except OSError:
-        fields = []
-    if len(fields) > 21:
-        return fields[21]
+        return None
+
+
+def _proc_stat_fields_after_comm(stat_text: str) -> tuple[str, ...] | None:
+    """Return the /proc/<pid>/stat fields that follow field 2 (comm).
+
+    Field 2 is parenthesized and may hold spaces and closing
+    parentheses, so the line cannot be split as a whole. Every field
+    after comm is the single state character or a number, so the
+    final ')' always closes comm. Data without a parenthesized comm
+    is malformed and yields no fields.
+    """
+    prefix, separator, suffix = stat_text.rpartition(")")
+    if not separator:
+        return None
+    if "(" not in prefix:
+        return None
+    return tuple(suffix.split())
+
+
+def _process_start(pid: int) -> str:
+    stat_text = _read_proc_stat(pid)
+    if stat_text is not None:
+        fields = _proc_stat_fields_after_comm(stat_text)
+        if fields is None or len(fields) <= _STAT_STARTTIME_INDEX:
+            # Readable but unparsable stat data cannot identify the
+            # process, and a fallback value would let an unrelated
+            # process match a recorded identity.
+            raise ValueError("process stat data is malformed")
+        return fields[_STAT_STARTTIME_INDEX]
     completed = subprocess.run(
         ["ps", "-o", "lstart=", "-p", str(pid)],
         capture_output=True,

@@ -1410,6 +1410,33 @@ async def test_process_group_control_is_identity_bound_and_bounded(
         kill_timeout=3.0,
     )
     assert reused_waits == [3.0]
+
+    def malformed_identity(unused_pid: int) -> object:
+        del unused_pid
+        raise ValueError("process stat data is malformed")
+
+    unexpected_signals: list[signal.Signals] = []
+    monkeypatch.setattr(
+        process_control_module,
+        "process_group_identity",
+        malformed_identity,
+    )
+    monkeypatch.setattr(
+        process_control_module,
+        "_signal_group",
+        lambda unused_pgid, selected_signal: unexpected_signals.append(
+            selected_signal
+        ),
+    )
+    reused_waits.clear()
+    await process_control_module.terminate_process_group(
+        process,  # type: ignore[arg-type]
+        identity,
+        kill_timeout=3.0,
+    )
+    assert reused_waits == [3.0]
+    assert unexpected_signals == []
+
     monkeypatch.setattr(
         process_control_module,
         "process_group_identity",
@@ -1797,6 +1824,226 @@ async def test_recorded_process_control_and_wait_boundaries(
         )
 
 
+def _proc_stat_line(pid: int, comm: str, starttime: str) -> str:
+    """Build a Linux /proc/<pid>/stat line with the given comm."""
+    # Field 3 (state) through field 21 precede field 22 (starttime),
+    # and later fields follow it.
+    after_comm = ["S"]
+    after_comm.extend(str(field) for field in range(4, 22))
+    after_comm.append(starttime)
+    after_comm.extend(("0", "0"))
+    return str(pid) + " (" + comm + ") " + " ".join(after_comm) + "\n"
+
+
+def _stat_reader(stat_text: str) -> Callable[..., str]:
+    def read(*unused: object, **unused_values: object) -> str:
+        del unused
+        del unused_values
+        return stat_text
+
+    return read
+
+
+def _forbidden_run(*unused: object, **unused_values: object) -> object:
+    del unused
+    del unused_values
+    raise AssertionError("readable stat data must not fall back to ps")
+
+
+def test_process_start_reads_proc_stat_comm_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Field 2 (comm) may hold spaces and closing parentheses, so the
+    # stat line cannot be split as a whole.
+    for comm in ("bash", "my agent worker", "agent (worker)", "weird)comm", ")"):
+        with monkeypatch.context() as context:
+            context.setattr(
+                process_control_module.Path,
+                "read_text",
+                _stat_reader(_proc_stat_line(41, comm, "919191")),
+            )
+            context.setattr(
+                process_control_module.subprocess,
+                "run",
+                _forbidden_run,
+            )
+            assert process_control_module._process_start(41) == "919191"
+
+    truncated = "41 (my agent) " + " ".join(str(field) for field in range(19))
+    malformed = (
+        "",
+        "41 bash S 1 2 3",
+        "41 bash) S 1 2 3",
+        "41 (bash",
+        "41 (bash) S 1",
+        truncated,
+    )
+    for stat_text in malformed:
+        with monkeypatch.context() as context:
+            context.setattr(
+                process_control_module.Path,
+                "read_text",
+                _stat_reader(stat_text),
+            )
+            context.setattr(
+                process_control_module.subprocess,
+                "run",
+                _forbidden_run,
+            )
+            with pytest.raises(ValueError, match="malformed"):
+                process_control_module._process_start(41)
+
+
+@pytest.mark.asyncio
+async def test_recorded_termination_binds_to_parsed_proc_stat_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_control_module.os, "getpgid", lambda pid: pid)
+    signals: list[tuple[int, signal.Signals]] = []
+
+    def record_signal(pgid: int, selected_signal: signal.Signals) -> None:
+        signals.append((pgid, selected_signal))
+
+    async def group_exit(unused_pgid: int, unused_timeout: float) -> bool:
+        del unused_pgid
+        del unused_timeout
+        return True
+
+    monkeypatch.setattr(process_control_module, "_signal_group", record_signal)
+    monkeypatch.setattr(process_control_module, "_wait_group_exit", group_exit)
+    monkeypatch.setattr(
+        process_control_module.Path,
+        "read_text",
+        _stat_reader(_proc_stat_line(41, "agent (worker) one", "919191")),
+    )
+    assert await process_control_module.terminate_recorded_process_group(
+        41,
+        "919191",
+    ) == ("terminated")
+    assert signals == [(41, signal.SIGTERM)]
+
+    signals.clear()
+    assert await process_control_module.terminate_recorded_process_group(
+        41,
+        "424242",
+    ) == ("identity-changed")
+    assert signals == []
+
+    monkeypatch.setattr(
+        process_control_module.Path,
+        "read_text",
+        _stat_reader("41 (agent (worker)) S 1 2 3"),
+    )
+    assert await process_control_module.terminate_recorded_process_group(
+        41,
+        "919191",
+    ) == ("identity-invalid")
+    assert signals == []
+
+
+def test_group_member_identity_failures_are_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unparsable_start(pid: int) -> str:
+        if pid == 43:
+            raise ValueError("process stat data is malformed")
+        return "start-" + str(pid)
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            process_control_module.subprocess,
+            "run",
+            lambda *unused, **unused_values: SimpleNamespace(
+                returncode=0,
+                stdout="41 41\n43 41\n",
+            ),
+        )
+        context.setattr(process_control_module, "_process_start", unparsable_start)
+        # A member whose identity cannot be parsed is never recorded.
+        assert process_control_module._process_group_members(41) == (
+            process_control_module.ProcessGroupMemberIdentity(41, "start-41"),
+        )
+
+    member_signals: list[int] = []
+    member = process_control_module.ProcessGroupMemberIdentity(41, "start-41")
+    unparsable_member = process_control_module.ProcessGroupMemberIdentity(
+        43,
+        "start-43",
+    )
+    with monkeypatch.context() as context:
+        context.setattr(process_control_module, "_process_start", unparsable_start)
+        context.setattr(
+            process_control_module.os,
+            "kill",
+            lambda pid, unused_signal: member_signals.append(pid),
+        )
+        process_control_module._signal_group_members(
+            41,
+            (member, unparsable_member),
+            signal.SIGKILL,
+        )
+        assert member_signals == [41]
+        assert process_control_module._member_is_alive(unparsable_member) is False
+        assert (
+            process_control_module._member_is_alive(
+                process_control_module.ProcessGroupMemberIdentity(41, "other"),
+            )
+            is False
+        )
+        context.setattr(
+            process_control_module.Path,
+            "read_text",
+            _stat_reader("41 (agent (worker)) Z 1 2 3"),
+        )
+        assert process_control_module._member_is_alive(member) is False
+        context.setattr(
+            process_control_module.Path,
+            "read_text",
+            _stat_reader(_proc_stat_line(41, "agent (worker)", "919191")),
+        )
+        assert process_control_module._member_is_alive(member) is True
+
+
+@pytest.mark.asyncio
+async def test_recorded_termination_signals_only_the_isolated_group() -> None:
+    sleeper = "import time; time.sleep(60)"
+    target = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        sleeper,
+        start_new_session=True,
+    )
+    bystander = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        sleeper,
+        start_new_session=True,
+    )
+    try:
+        identity = process_control_module.process_group_identity(target.pid)
+        bystander_pgid = os.getpgid(bystander.pid)
+        assert identity.pgid == target.pid
+        assert bystander_pgid != identity.pgid
+        assert os.getpgid(os.getpid()) != identity.pgid
+        assert await process_control_module.terminate_recorded_process_group(
+            target.pid,
+            identity.pid_start,
+            terminate_timeout=5.0,
+            kill_timeout=5.0,
+        ) == ("terminated")
+        await asyncio.wait_for(target.wait(), timeout=5.0)
+        # The unrelated group and its leader were never signaled.
+        assert bystander.returncode is None
+        assert process_control_module._group_exists(bystander_pgid) is True
+        os.kill(bystander.pid, 0)
+    finally:
+        bystander.kill()
+        await bystander.wait()
+        if target.returncode is None:
+            target.kill()
+            await target.wait()
+
+
 @pytest.mark.asyncio
 async def test_process_group_poll_signal_and_start_boundaries(
     monkeypatch: pytest.MonkeyPatch,
@@ -1861,11 +2108,9 @@ async def test_process_group_poll_signal_and_start_boundaries(
         context.setattr(
             process_control_module.Path,
             "read_text",
-            lambda *unused, **unused_values: " ".join(
-                str(index) for index in range(22)
-            ),
+            lambda *unused, **unused_values: _proc_stat_line(41, "bash", "919191"),
         )
-        assert process_control_module._process_start(41) == "21"
+        assert process_control_module._process_start(41) == "919191"
 
     def unreadable(*unused: object, **unused_values: object) -> str:
         del unused
