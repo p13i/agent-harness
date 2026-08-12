@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
+import os
 import runpy
 import sqlite3
 import sys
@@ -50,6 +52,9 @@ class Stream:
 
     def close(self) -> None:
         self.closed = True
+
+    async def wait_closed(self) -> None:
+        return
 
 
 class Process:
@@ -2301,24 +2306,65 @@ def test_kimi_payload_normalizes_the_flat_envelope() -> None:
 # --yolo is rejected together with --prompt, so the launcher must not
 # pass it; tool permissions come from ~/.kimi-code/config.toml.
 def test_kimi_launch_argv_omits_yolo_and_pins_the_package() -> None:
-    argv = kimi._launch_argv("do it", "kimi-code/k3", "session_abc")
+    argv = kimi._launch_argv("kimi-code/k3", "session_abc")
 
     assert "--yolo" not in argv
-    assert argv[:6] == [
+    assert argv[:7] == [
         "npx",
         "--yes",
         "--package",
         "@moonshot-ai/kimi-code",
-        "kimi",
-        "--prompt",
+        "node",
+        "--eval",
+        kimi._KIMI_PROMPT_BRIDGE,
     ]
-    assert argv[-4:] == [
+    assert argv[-3:] == ["--", "kimi-code/k3", "session_abc"]
+    assert "--prompt" not in argv
+    assert kimi._launch_argv("", "")[-3:] == ["--", "", ""]
+
+
+def test_kimi_stdin_bridge_accepts_a_large_prompt(tmp_path: Path) -> None:
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    fake_module = bin_directory / "fake-kimi.mjs"
+    fake_module.write_text(
+        "console.log(JSON.stringify(process.argv.slice(2)));\n",
+        encoding="utf-8",
+    )
+    (bin_directory / "kimi").symlink_to(fake_module.name)
+    prompt = "provider-switch context\n" * 20_000
+    environment = dict(os.environ)
+    environment["PATH"] = (
+        str(bin_directory) + os.pathsep + environment.get("PATH", "")
+    )
+
+    async def scenario() -> list[str]:
+        process = await asyncio.create_subprocess_exec(
+            "node",
+            "--eval",
+            kimi._KIMI_PROMPT_BRIDGE,
+            "--",
+            "kimi-code/k3",
+            "session_abc",
+            env=environment,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate(prompt.encode("utf-8"))
+        assert process.returncode == 0, stderr.decode("utf-8", "replace")
+        return json.loads(stdout)
+
+    assert asyncio.run(scenario()) == [
+        "--prompt",
+        prompt,
+        "--output-format",
+        "stream-json",
         "--model",
         "kimi-code/k3",
         "--session",
         "session_abc",
     ]
-    assert "--session" not in kimi._launch_argv("do it", "", "")
 
 
 def test_kimi_status_and_models(monkeypatch, tmp_path: Path) -> None:
@@ -2374,14 +2420,20 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
             return b""
 
     class Process:
+        stdin = Stream([])
         stdout = Stdout()
         stderr = Stderr()
 
         async def wait(self) -> int:
             return 0
 
-    async def fake_exec(*_argv, **_kwargs):
-        return Process()
+    process = Process()
+    launched: list[object] = []
+
+    async def fake_exec(*argv, **kwargs):
+        launched.extend(argv)
+        launched.append(kwargs)
+        return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
@@ -2394,9 +2446,10 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
         return {}
 
     async def scenario() -> None:
+        prompt = "review material\n" * 20_000
         result = await kimi.KimiAdapter().run_turn(
             workspace=tmp_path,
-            prompt="do it",
+            prompt=prompt,
             native_session_id="",
             permission_mode="full",
             model="kimi-code/k3",
@@ -2407,6 +2460,10 @@ def test_kimi_run_turn_streams_and_reports_the_session(monkeypatch, tmp_path) ->
         assert result.status == "complete"
         # The session id arrives on the trailing meta line, not up front.
         assert result.native_session_id == "session_z"
+        assert process.stdin.writes == [prompt.encode("utf-8")]
+        assert process.stdin.closed
+        assert prompt not in launched
+        assert launched[-1]["stdin"] == asyncio.subprocess.PIPE
 
     asyncio.run(scenario())
 
@@ -2460,6 +2517,7 @@ def test_kimi_acknowledges_prompt_acceptance_only_on_turn_output(
                 return b""
 
         class Process:
+            stdin = Stream([])
             stdout = Stdout()
             stderr = Stderr()
 
@@ -2574,6 +2632,7 @@ def test_kimi_run_turn_gates_on_a_positive_child_limit(
             return b""
 
     class Process:
+        stdin = Stream([])
         stdout = Stdout()
         stderr = Stderr()
 
@@ -2653,6 +2712,7 @@ def test_kimi_run_turn_reports_a_nonzero_exit_as_a_failed_turn(
             return b"kimi: config.invalid\n"
 
     class Process:
+        stdin = Stream([])
         stdout = Stdout()
         stderr = Stderr()
 
@@ -2713,6 +2773,7 @@ def test_kimi_run_turn_terminates_the_process_when_the_handler_rejects_an_event(
 
     class Process:
         pid = 42
+        stdin = Stream([])
         stdout = Stdout()
         stderr = Stderr()
 
@@ -2783,6 +2844,7 @@ def test_kimi_run_turn_terminates_detached_children_after_normal_completion(
     class Process:
         pid = 42
         returncode: int | None = None
+        stdin = Stream([])
         stdout = Stdout()
         stderr = Stderr()
 
@@ -2859,6 +2921,7 @@ def test_kimi_run_turn_waits_for_cleanup_when_cancelled(
     class Process:
         pid = 42
         returncode: int | None = None
+        stdin = Stream([])
         stdout = Stdout()
         stderr = Stderr()
 

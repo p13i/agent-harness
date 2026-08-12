@@ -545,9 +545,23 @@ async def test_kimi_accepts_neutral_hooks_and_uses_process_containment(
         async def read(self) -> bytes:
             return b""
 
+    class PromptStdin:
+        def write(self, unused_value: bytes) -> None:
+            del unused_value
+
+        async def drain(self) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+        async def wait_closed(self) -> None:
+            return
+
     class Process:
         pid = 42
         returncode: int | None = None
+        stdin = PromptStdin()
         stdout = EmptyStdout()
         stderr = EmptyStderr()
 

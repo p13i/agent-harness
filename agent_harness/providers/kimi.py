@@ -45,6 +45,57 @@ from agent_harness.process_control import terminate_process_group
 
 KIMI_CODE_PACKAGE = "@moonshot-ai/kimi-code"
 
+# Linux limits each exec argument to 128 KiB even when ARG_MAX is larger.
+# Provider-switch handoffs can legitimately exceed that, so a small Node
+# bridge reads the prompt from stdin before loading Kimi's installed CLI in
+# the same process. The prompt therefore never enters the process argv,
+# environment, or filesystem.
+_KIMI_PROMPT_BRIDGE = r"""
+const fs = require("node:fs");
+const path = require("node:path");
+const url = require("node:url");
+
+async function main() {
+  process.stdin.setEncoding("utf8");
+  let prompt = "";
+  for await (const chunk of process.stdin) {
+    prompt += chunk;
+  }
+
+  const executable = process.env.PATH
+    .split(path.delimiter)
+    .map((directory) => path.join(directory, "kimi"))
+    .find((candidate) => fs.existsSync(candidate));
+  if (!executable) {
+    throw new Error("npx did not expose the Kimi executable");
+  }
+
+  const target = fs.realpathSync(executable);
+  const model = process.argv[1] || "";
+  const sessionId = process.argv[2] || "";
+  process.argv = [
+    process.execPath,
+    target,
+    "--prompt",
+    prompt,
+    "--output-format",
+    "stream-json",
+  ];
+  if (model) {
+    process.argv.push("--model", model);
+  }
+  if (sessionId) {
+    process.argv.push("--session", sessionId);
+  }
+  await import(url.pathToFileURL(target).href);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+""".strip()
+
 # Roles whose lines carry turn content rather than run metadata.
 _TURN_STARTED_ROLES = frozenset({"assistant", "tool", "user"})
 _RESUME_HINT = "session.resume_hint"
@@ -96,23 +147,33 @@ def _turn_started(payload: dict[str, object]) -> bool:
     return _carries_tool_calls(payload)
 
 
-def _launch_argv(prompt: str, model: str, session_id: str) -> list[str]:
+def _launch_argv(model: str, session_id: str) -> list[str]:
     argv = [
         "npx",
         "--yes",
         "--package",
         KIMI_CODE_PACKAGE,
-        "kimi",
-        "--prompt",
-        prompt,
-        "--output-format",
-        "stream-json",
+        "node",
+        "--eval",
+        _KIMI_PROMPT_BRIDGE,
+        "--",
+        model,
+        session_id,
     ]
-    if model:
-        argv.extend(["--model", model])
-    if session_id:
-        argv.extend(["--session", session_id])
     return argv
+
+
+async def _write_prompt(
+    process: asyncio.subprocess.Process,
+    prompt: str,
+) -> None:
+    writer = process.stdin
+    if writer is None:
+        raise RuntimeError("Kimi prompt transport has no stdin pipe")
+    writer.write(prompt.encode("utf-8"))
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
 
 
 class KimiAdapter(ProviderAdapter):
@@ -151,12 +212,12 @@ class KimiAdapter(ProviderAdapter):
         if pre_prompt_gate is not None:
             await pre_prompt_gate()
 
-        argv = _launch_argv(prompt, model, native_session_id)
+        argv = _launch_argv(model, native_session_id)
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=str(workspace),
             env=provider_environment(self.provider_id),
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -176,6 +237,7 @@ class KimiAdapter(ProviderAdapter):
         status = "complete"
         prompt_accepted = False
         try:
+            await _write_prompt(process, prompt)
             assert process.stdout is not None
             async for line in process.stdout:
                 text = line.decode("utf-8", "replace").strip()
