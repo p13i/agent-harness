@@ -853,7 +853,7 @@ def test_guard_warning_recovery_and_nonrepeating_cycles() -> None:
     assert stagnating.violation() == ""
 
 
-def test_material_budget_exempts_only_read_only_workloads() -> None:
+def test_material_budget_exempts_only_non_writing_workloads() -> None:
     implementation = limits_for(UNATTENDED, "implementation")
     debugging = limits_for(UNATTENDED, "debugging")
     operations = limits_for(UNATTENDED, "operations")
@@ -871,15 +871,23 @@ def test_material_budget_exempts_only_read_only_workloads() -> None:
     # Reading for a long time is the correct behavior for these
     # workloads, so the budget is explicitly off rather than merely
     # generous.
-    for name in ("review", "code-review", "code review", "research", "read-only"):
+    for name in (
+        "planning",
+        "review",
+        "code-review",
+        "code review",
+        "research",
+        "read-only",
+    ):
         assert limits_for(UNATTENDED, name).no_material_seconds == 0
     assert no_material_budget("implementation", 300) == 300
+    assert no_material_budget("planning", 300) == 0
     assert no_material_budget("code-review", 300) == 0
 
     # A misspelled or unrecognized workload routes to the writing
     # limits, so it must not also collect the exemption. Reaching the
     # writing budget through a typo is the failure this rules out.
-    for name in ("implementaion", "reveiw", "spelunking", "planning"):
+    for name in ("implementaion", "reveiw", "planing", "spelunking"):
         assert limits_for(UNATTENDED, name).no_material_seconds == 300
 
     # The budget must be reachable before the wall-clock stop, or it

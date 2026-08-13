@@ -54,6 +54,7 @@ NO_MATERIAL_EXEMPT_WORKLOADS = frozenset(
         "read-only",
         "read_only",
         "readonly",
+        "planning",
         "research",
         "review",
     }
@@ -134,13 +135,14 @@ def no_material_budget(workload: str, profile_seconds: int) -> int:
     stagnation clock cannot answer whether an implementation is
     producing anything.
 
-    The exemption is an explicit read-only allowlist, never a list of
+    The exemption is an explicit non-writing allowlist, never a list of
     the workloads that write. A misspelled or unrecognized workload
     routes to the writing limits, so keying the exemption off a writing
     list would hand a typo the one value that turns a mandatory guard
-    off. Only a workload that names itself review, research, or
-    read-only earns the 0, because reading for a long time is the
-    correct behavior there.
+    off. Only a workload that names itself planning, review, research,
+    or read-only earns the 0, because reading for a long time is the
+    correct behavior there. Planning is a proposal-only workload whose
+    deterministic consumer owns any later material writes.
 
     Each profile passes its own budget. Every one of them stays under
     that profile's ``max_seconds``, so a materially silent turn stops
