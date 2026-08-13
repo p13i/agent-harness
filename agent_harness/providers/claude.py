@@ -302,6 +302,9 @@ class ClaudeAdapter(ProviderAdapter):
         extra_args = {"replay-user-messages": None}
         if permission_mode == "full":
             extra_args["dangerously-skip-permissions"] = None
+        setting_sources = None
+        if permission_mode in {"plan", "read-only"}:
+            setting_sources = []
         options = ClaudeAgentOptions(
             tools={"type": "preset", "preset": "claude_code"},
             system_prompt={"type": "preset", "preset": "claude_code"},
@@ -321,6 +324,7 @@ class ClaudeAdapter(ProviderAdapter):
                 ]
             },
             permission_prompt_tool_name=permission_prompt_tool_name,
+            setting_sources=setting_sources,
             include_partial_messages=True,
             enable_file_checkpointing=True,
             extra_args=extra_args,

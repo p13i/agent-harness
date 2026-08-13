@@ -1835,6 +1835,107 @@ def test_claude_run_turn_success_exhaustion_and_sdk_failure(
     asyncio.run(scenario())
 
 
+def test_claude_restricted_turns_isolate_external_settings_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_options: list[Any] = []
+    real_transport = claude.NpxClaudeTransport
+
+    class Transport:
+        def __init__(self, stream: object, options: object) -> None:
+            del stream
+            self.options = options
+
+    class Client:
+        def __init__(self, *, options: Any, transport: Any) -> None:
+            self.options = options
+            self.transport = transport
+            observed_options.append(options)
+
+        async def connect(
+            self,
+            stream: AsyncIterator[dict[str, Any]],
+        ) -> None:
+            assert [value async for value in stream]
+
+        async def receive_response(self) -> AsyncIterator[object]:
+            yield "complete"
+
+        async def disconnect(self) -> None:
+            return
+
+    monkeypatch.setattr(claude, "NpxClaudeTransport", Transport)
+    monkeypatch.setattr(claude, "ClaudeSDKClient", Client)
+    monkeypatch.setattr(
+        claude,
+        "_message_events",
+        lambda unused_message: [ProviderEvent("turn.completed")],
+    )
+    monkeypatch.setattr(
+        claude,
+        "_message_exhausted",
+        lambda unused_message: False,
+    )
+
+    async def scenario() -> None:
+        for mode in ("approval", "full", "plan", "read-only"):
+            adapter = claude.ClaudeAdapter()
+            result = await adapter.run_turn(
+                workspace=tmp_path,
+                prompt="inspect",
+                native_session_id="",
+                permission_mode=mode,
+                model="opus",
+                effort="high",
+                event_handler=_ignore_event,
+                approval_handler=_decline,
+            )
+            assert result.status == "complete"
+
+    asyncio.run(scenario())
+
+    options_by_mode = dict(
+        zip(
+            ("approval", "full", "plan", "read-only"),
+            observed_options,
+            strict=True,
+        )
+    )
+    approval = options_by_mode["approval"]
+    full = options_by_mode["full"]
+    plan = options_by_mode["plan"]
+    read_only = options_by_mode["read-only"]
+    assert approval.setting_sources is None
+    assert full.setting_sources is None
+    assert plan.setting_sources == []
+    assert read_only.setting_sources == []
+    assert approval.permission_mode == "default"
+    assert approval.can_use_tool is not None
+    assert full.permission_mode == "bypassPermissions"
+    assert full.can_use_tool is None
+    assert "dangerously-skip-permissions" in full.extra_args
+    assert plan.permission_mode == "plan"
+    assert read_only.permission_mode == "plan"
+
+    for options in options_by_mode.values():
+        assert set(options.hooks) == {"PreToolUse"}
+        matchers = options.hooks["PreToolUse"]
+        assert len(matchers) == 1
+        assert matchers[0].matcher == "^(Agent|Task|spawn_agent)$"
+        assert len(matchers[0].hooks) == 1
+
+    for options in (approval, full):
+        transport = real_transport(claude._empty_stream(), options)
+        transport._cli_path = "/usr/bin/npx"
+        assert "--setting-sources=" not in transport._build_command()
+
+    for options in (plan, read_only):
+        transport = real_transport(claude._empty_stream(), options)
+        transport._cli_path = "/usr/bin/npx"
+        assert "--setting-sources=" in transport._build_command()
+
+
 def test_claude_resume_fails_when_transcript_is_missing_or_misbound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
