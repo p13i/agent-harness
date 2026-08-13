@@ -79,6 +79,10 @@ def stable_state_headroom(
 
 
 class ScriptedAdapter(ProviderAdapter):
+    supported_permission_modes = frozenset(
+        {"approval", "full", "plan", "read-only"}
+    )
+
     def __init__(
         self,
         provider: str,

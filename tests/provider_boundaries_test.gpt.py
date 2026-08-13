@@ -189,6 +189,13 @@ def test_provider_base_contract_and_environment(
     asyncio.run(adapter.interrupt())
     asyncio.run(adapter.steer("continue"))
     assert adapter.process_identity() == (0, "")
+    assert not adapter.supports_permission_mode("approval")
+    assert claude.ClaudeAdapter().supports_permission_mode("plan")
+    assert codex.CodexAdapter().supports_permission_mode("read-only")
+    assert kimi.KimiAdapter().supports_permission_mode("full")
+    assert not kimi.KimiAdapter().supports_permission_mode("plan")
+    assert grok.GrokAdapter().supports_permission_mode("full")
+    assert not grok.GrokAdapter().supports_permission_mode("plan")
 
     monkeypatch.setattr(
         base.os,

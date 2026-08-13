@@ -1034,6 +1034,7 @@ class SessionWorker:
             required_capabilities=frozenset(
                 str(item) for item in payload.get("required_capabilities", [])
             ),
+            permission_mode=turn_permission_mode,
             provider=routing_provider,
             model=str(payload.get("model", "")),
             effort=str(payload.get("effort", "")),
@@ -1051,13 +1052,18 @@ class SessionWorker:
             policy=evaluator,
             implementation_providers=implementing,
         )
+        adapter = self.adapters[decision.provider]
+        if not adapter.supports_permission_mode(turn_permission_mode):
+            raise ProviderUnavailableError(
+                decision.provider,
+                detail="provider cannot map the requested permission mode",
+            )
         await self._enforce_dispatch_approval(
             decision,
             evaluator,
             command_id,
             guard.limits.profile,
         )
-        adapter = self.adapters[decision.provider]
         native_session_id = self._native_session(decision.provider)
         unavailable_native_session_id = ""
         if native_session_id and not adapter.native_session_available(

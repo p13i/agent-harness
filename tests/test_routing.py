@@ -249,6 +249,9 @@ def test_routing_rejects_capability_and_quality_outliers() -> None:
 
 class SlowAdapter(ProviderAdapter):
     provider_id = "claude"
+    supported_permission_modes = frozenset(
+        {"approval", "full", "plan", "read-only"}
+    )
 
     async def run_turn(self, **kwargs) -> ProviderResult:
         del kwargs
@@ -270,6 +273,9 @@ class SlowAdapter(ProviderAdapter):
 
 class FailingModelAdapter(ProviderAdapter):
     provider_id = "codex"
+    supported_permission_modes = frozenset(
+        {"approval", "full", "plan", "read-only"}
+    )
 
     async def run_turn(self, **kwargs) -> ProviderResult:
         del kwargs

@@ -2620,6 +2620,9 @@ class HarnessService:
             required_capabilities=frozenset(
                 str(item) for item in payload.get("required_capabilities", [])
             ),
+            permission_mode=str(
+                payload.get("permission_mode", session.permission_mode)
+            ),
             provider=str(payload.get("provider", "")),
             model=str(payload.get("model", "")),
             effort=effort,

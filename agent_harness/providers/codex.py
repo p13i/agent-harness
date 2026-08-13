@@ -281,6 +281,9 @@ class CodexAppServer:
 
 class CodexAdapter(ProviderAdapter):
     provider_id = "codex"
+    supported_permission_modes = frozenset(
+        {"approval", "full", "plan", "read-only"}
+    )
 
     def __init__(self) -> None:
         self._active_server: CodexAppServer | None = None

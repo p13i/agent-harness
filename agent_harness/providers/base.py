@@ -68,6 +68,7 @@ class ChildLaunchGate:
 
 class ProviderAdapter(ABC):
     provider_id: str
+    supported_permission_modes: frozenset[str] = frozenset()
 
     @abstractmethod
     async def run_turn(
@@ -112,6 +113,10 @@ class ProviderAdapter(ABC):
         del workspace
         del native_session_id
         return True
+
+    def supports_permission_mode(self, permission_mode: str) -> bool:
+        """Report whether the adapter can map one harness permission mode."""
+        return permission_mode in self.supported_permission_modes
 
 
 _SENSITIVE_NAME = re.compile(

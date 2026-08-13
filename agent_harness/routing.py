@@ -131,6 +131,8 @@ def _rejection_reason(
     if manual_provider and candidate.provider != manual_provider:
         return "another provider was pinned"
     if not candidate.ready:
+        if candidate.unavailable_reason:
+            return candidate.unavailable_reason
         return "provider is not ready"
     if not required.issubset(candidate.capabilities):
         return "required capabilities are unavailable"

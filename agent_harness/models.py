@@ -219,6 +219,7 @@ class RoutingCandidate:
     context_transfer_tokens: int
     usage_sample_id: str = ""
     usage_observed_at: str = ""
+    unavailable_reason: str = ""
 
 
 @dataclass(frozen=True)

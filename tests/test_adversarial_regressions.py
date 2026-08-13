@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -23,18 +24,32 @@ from agent_harness.errors import (
     ConflictError,
     HarnessError,
     NotFoundError,
+    ProviderExhaustedError,
+    ProviderUnavailableError,
     SafetyGuardError,
 )
 from agent_harness.goals import make_evidence
 from agent_harness.ids import new_uuid, utc_now
-from agent_harness.models import Checkpoint, CommandStatus, ProviderAttempt
+from agent_harness.models import (
+    Checkpoint,
+    CommandStatus,
+    ProviderAttempt,
+    RoutingDecision,
+)
 from agent_harness.orchestration import (
     command_envelope_digest,
     legacy_command_envelope_digest,
 )
 from agent_harness.process_control import ProcessGroupIdentity
 from agent_harness.providers import claude, codex, kimi
-from agent_harness.providers.base import ChildLaunchGate, ProviderEvent
+from agent_harness.providers.base import (
+    ChildLaunchGate,
+    ProviderAdapter,
+    ProviderEvent,
+    ProviderModel,
+    ProviderResult,
+    ProviderStatus,
+)
 from agent_harness.safety import (
     SafetyConsumption,
     TurnGuard,
@@ -42,8 +57,10 @@ from agent_harness.safety import (
     effort_requires_xhigh_authorization,
     limits_for,
 )
+from agent_harness.scheduler import Scheduler
 from agent_harness.service import HarnessService
 from agent_harness.storage import StateStore
+from agent_harness.usage import UsageSnapshot
 from agent_harness.worker import SessionWorker
 from tests.test_support import session
 
@@ -56,6 +73,372 @@ def _store(tmp_path: Path) -> tuple[StateStore, Any]:
     created = session(workspace)
     store.create_session(created)
     return store, created
+
+
+def _repository(path: Path) -> None:
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Harness Test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "config",
+            "user.email",
+            "harness@example.invalid",
+        ],
+        check=True,
+    )
+    (path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "seed.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "-m", "seed"],
+        check=True,
+    )
+
+
+class _PermissionProbeAdapter(ProviderAdapter):
+    def __init__(
+        self,
+        provider: str,
+        supported_permission_modes: frozenset[str],
+        *,
+        fail_turns: int = 0,
+    ) -> None:
+        self.provider_id = provider
+        self.supported_permission_modes = supported_permission_modes
+        self.fail_turns = fail_turns
+        self.permission_modes: list[str] = []
+
+    async def run_turn(self, **values: Any) -> ProviderResult:
+        permission_mode = str(values["permission_mode"])
+        self.permission_modes.append(permission_mode)
+        if not self.supports_permission_mode(permission_mode):
+            raise AssertionError("unmappable provider reached run_turn")
+        if self.fail_turns > 0:
+            self.fail_turns -= 1
+            raise ProviderExhaustedError(self.provider_id)
+        event_handler = values["event_handler"]
+        await event_handler(
+            ProviderEvent(
+                "provider.prompt.accepted",
+                status="accepted",
+                native_session_id=self.provider_id + "-native",
+            )
+        )
+        await event_handler(
+            ProviderEvent(
+                "agent.message",
+                text="permission probe complete",
+                status="complete",
+            )
+        )
+        return ProviderResult(
+            provider=self.provider_id,
+            native_session_id=self.provider_id + "-native",
+            native_turn_id=self.provider_id + "-turn",
+            status="complete",
+            usage={"total_tokens": 1},
+        )
+
+    async def models(self, workspace: Path) -> tuple[ProviderModel, ...]:
+        del workspace
+        return (
+            ProviderModel(
+                self.provider_id + "-default",
+                self.provider_id.title(),
+                ("low", "medium", "high", "xhigh"),
+                200_000,
+                default=True,
+            ),
+        )
+
+    def status(self) -> ProviderStatus:
+        return ProviderStatus(
+            provider=self.provider_id,
+            ready=True,
+            detail="permission probe provider",
+            capabilities=frozenset({"approval", "tools", "worktree"}),
+        )
+
+
+def _prime_scheduler(
+    scheduler: Scheduler,
+    bindings: dict[str, float],
+) -> None:
+    scheduler._usage_cache = {
+        provider: UsageSnapshot(
+            provider=provider,
+            binding_percent=binding,
+            credits_engaged=False,
+            payload={},
+        )
+        for provider, binding in bindings.items()
+    }
+    scheduler._usage_at = asyncio.get_running_loop().time()
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_filters_routing_before_provider_admission(
+    tmp_path: Path,
+) -> None:
+    store, created = _store(tmp_path)
+    claude = _PermissionProbeAdapter(
+        "claude",
+        frozenset({"approval", "full", "plan", "read-only"}),
+    )
+    grok = _PermissionProbeAdapter("grok", frozenset({"full"}))
+    scheduler = Scheduler(store, {"claude": claude, "grok": grok})
+    _prime_scheduler(scheduler, {"claude": 80.0, "grok": 0.0})
+
+    plan = await scheduler.choose(
+        created,
+        workload="planning",
+        required_capabilities=frozenset(),
+        permission_mode="plan",
+    )
+    assert plan.provider == "claude"
+    assert plan.rejected == (
+        {
+            "provider": "grok",
+            "model": "grok-default",
+            "reason": "provider cannot map the requested permission mode",
+        },
+    )
+
+    only_grok = Scheduler(store, {"grok": grok})
+    _prime_scheduler(only_grok, {"grok": 0.0})
+    with pytest.raises(ProviderUnavailableError) as unavailable:
+        await only_grok.choose(
+            created,
+            workload="planning",
+            required_capabilities=frozenset(),
+            permission_mode="plan",
+        )
+    assert unavailable.value.rejected[0]["provider"] == "grok"
+    assert unavailable.value.rejected[0]["reason"] == (
+        "provider cannot map the requested permission mode"
+    )
+
+    full = await only_grok.choose(
+        created,
+        workload="implementation",
+        required_capabilities=frozenset(),
+        permission_mode="full",
+    )
+    assert full.provider == "grok"
+
+    with pytest.raises(ProviderUnavailableError) as pinned:
+        await scheduler.choose(
+            created,
+            workload="planning",
+            required_capabilities=frozenset(),
+            permission_mode="plan",
+            provider="grok",
+        )
+    assert {item["provider"] for item in pinned.value.rejected} == {
+        "claude",
+        "grok",
+    }
+    assert claude.permission_modes == []
+    assert grok.permission_modes == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unmappable_provider_consumes_no_attempt_on_initial_or_requeue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _repository(workspace)
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(workspace)
+    store.create_session(created)
+    store.update_session(created.session_id, permission_mode="plan")
+    store.set_session_safety(created.session_id, "interactive")
+    grok = _PermissionProbeAdapter("grok", frozenset({"full"}))
+    scheduler = Scheduler(store, {"grok": grok})
+    _prime_scheduler(scheduler, {"grok": 0.0})
+    worker = SessionWorker(
+        store,
+        BlobStore(tmp_path / "blobs"),
+        scheduler,
+        {"grok": grok},
+        created.session_id,
+    )
+    store.register_worker(created.session_id, 123, worker.incarnation)
+    monkeypatch.setattr(worker_module, "require_state_headroom", lambda *unused: 1)
+    payload = {"text": "Plan without provider execution."}
+    receipt, created_command = store.ensure_message_command(
+        created.session_id,
+        payload,
+        "permission-requeue",
+    )
+    assert created_command
+
+    for expected_created in (True, False):
+        if not expected_created:
+            receipt, created_again = store.ensure_message_command(
+                created.session_id,
+                payload,
+                "permission-requeue",
+            )
+            assert not created_again
+            assert receipt.status == CommandStatus.QUEUED
+        claimed = store.claim_command(created.session_id)
+        assert claimed is not None
+        await worker._message(claimed)
+        failed = store.get_command(receipt.command_id)
+        assert failed.status == CommandStatus.FAILED
+        assert failed.result["code"] == "E_PROVIDER_UNAVAILABLE"
+        assert failed.result["retryable"] is True
+        envelope = store.command_envelope(receipt.command_id)
+        assert envelope["consumption"]["attempts"] == 0
+        assert store.attempts(created.session_id) == []
+        assert store.portable_session(created.session_id)["tables"]["turns"] == []
+        assert grok.permission_modes == []
+
+    store.update_session(created.session_id, permission_mode="full")
+    full, full_created = store.ensure_message_command(
+        created.session_id,
+        {"text": "Execute with full permission."},
+        "permission-full",
+    )
+    assert full_created
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+    await worker._message(claimed)
+    assert store.get_command(full.command_id).status == CommandStatus.COMPLETE
+    assert [attempt.provider for attempt in store.attempts(created.session_id)] == [
+        "grok"
+    ]
+    full_envelope = store.command_envelope(full.command_id)
+    assert full_envelope["consumption"]["attempts"] == 1
+    assert grok.permission_modes == ["full"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_fail_over_to_unmappable_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    _repository(workspace)
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(workspace)
+    store.create_session(created)
+    store.update_session(created.session_id, permission_mode="plan")
+    store.set_session_safety(created.session_id, "interactive")
+    claude = _PermissionProbeAdapter(
+        "claude",
+        frozenset({"approval", "full", "plan", "read-only"}),
+        fail_turns=1,
+    )
+    grok = _PermissionProbeAdapter("grok", frozenset({"full"}))
+    adapters = {"claude": claude, "grok": grok}
+    scheduler = Scheduler(store, adapters)
+    _prime_scheduler(scheduler, {"claude": 80.0, "grok": 0.0})
+    worker = SessionWorker(
+        store,
+        BlobStore(tmp_path / "blobs"),
+        scheduler,
+        adapters,
+        created.session_id,
+    )
+    store.register_worker(created.session_id, 123, worker.incarnation)
+    monkeypatch.setattr(worker_module, "require_state_headroom", lambda *unused: 1)
+    receipt, unused_created = store.ensure_message_command(
+        created.session_id,
+        {"text": "Recover without widening plan permission."},
+        "permission-recovery",
+    )
+    del unused_created
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+
+    await worker._message(claimed)
+
+    failed = store.get_command(receipt.command_id)
+    assert failed.status == CommandStatus.FAILED
+    assert [attempt.provider for attempt in store.attempts(created.session_id)] == [
+        "claude"
+    ]
+    envelope = store.command_envelope(receipt.command_id)
+    assert envelope["consumption"]["attempts"] == 1
+    assert claude.permission_modes == ["plan"]
+    assert grok.permission_modes == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_defense_rejects_unmappable_pinned_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DivergentScheduler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def choose(self, *unused: object, **unused_values: object) -> Any:
+            del unused, unused_values
+            self.calls += 1
+            return RoutingDecision(
+                provider="grok",
+                model="grok-default",
+                effort="high",
+                reason="injected incompatible route",
+                ranked=(),
+                rejected=(),
+            )
+
+    workspace = tmp_path / "workspace"
+    _repository(workspace)
+    store = StateStore(tmp_path / "state.sqlite3")
+    created = session(workspace)
+    store.create_session(created)
+    store.update_session(created.session_id, permission_mode="plan")
+    store.set_session_safety(created.session_id, "interactive")
+    grok = _PermissionProbeAdapter("grok", frozenset({"full"}))
+    scheduler = DivergentScheduler()
+    worker = SessionWorker(
+        store,
+        BlobStore(tmp_path / "blobs"),
+        scheduler,  # type: ignore[arg-type]
+        {"grok": grok},
+        created.session_id,
+    )
+    store.register_worker(created.session_id, 123, worker.incarnation)
+    monkeypatch.setattr(worker_module, "require_state_headroom", lambda *unused: 1)
+    receipt, unused_created = store.ensure_message_command(
+        created.session_id,
+        {
+            "text": "Keep the explicit provider pin fail-closed.",
+            "provider": "grok",
+        },
+        "permission-pinned-defense",
+    )
+    del unused_created
+    claimed = store.claim_command(created.session_id)
+    assert claimed is not None
+
+    await worker._message(claimed)
+
+    failed = store.get_command(receipt.command_id)
+    assert failed.status == CommandStatus.FAILED
+    assert failed.result["code"] == "E_PROVIDER_UNAVAILABLE"
+    assert scheduler.calls == 1
+    assert store.command_envelope(receipt.command_id)["consumption"][
+        "attempts"
+    ] == 0
+    assert store.attempts(created.session_id) == []
+    assert grok.permission_modes == []
+    store.close()
 
 
 def _dispatch(

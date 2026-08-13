@@ -3990,6 +3990,9 @@ def test_workspace_link_normalization_ignores_current_directory_segments(
 
 class BoundaryAdapter(ProviderAdapter):
     provider_id = "codex"
+    supported_permission_modes = frozenset(
+        {"approval", "full", "plan", "read-only"}
+    )
 
     def __init__(
         self,

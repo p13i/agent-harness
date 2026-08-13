@@ -119,6 +119,7 @@ def _launch_argv(
 
 class GrokAdapter(ProviderAdapter):
     provider_id = "grok"
+    supported_permission_modes = frozenset({"full"})
 
     def __init__(self) -> None:
         self._active_process: asyncio.subprocess.Process | None = None

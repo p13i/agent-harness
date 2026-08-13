@@ -178,6 +178,7 @@ async def _write_prompt(
 
 class KimiAdapter(ProviderAdapter):
     provider_id = "kimi"
+    supported_permission_modes = frozenset({"full"})
 
     def __init__(self) -> None:
         self._active_process: asyncio.subprocess.Process | None = None

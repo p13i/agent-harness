@@ -246,6 +246,7 @@ class Scheduler:
         *,
         workload: str,
         required_capabilities: frozenset[str],
+        permission_mode: str = "approval",
         provider: str = "",
         model: str = "",
         effort: str = "",
@@ -354,6 +355,12 @@ class Scheduler:
                     binding = None
             usage_sample = durable_usage.get(provider_id, {})
             safety_ready = status.ready
+            unavailable_reason = ""
+            if not adapter.supports_permission_mode(permission_mode):
+                safety_ready = False
+                unavailable_reason = (
+                    "provider cannot map the requested permission mode"
+                )
             if binding_ceiling is not None:
                 # Automatic routing stays fail-closed when binding
                 # telemetry is missing: an unknown sample must never
@@ -438,6 +445,7 @@ class Scheduler:
                     context_transfer_tokens=context_transfer_tokens,
                     usage_sample_id=str(usage_sample.get("sample_id", "")),
                     usage_observed_at=str(usage_sample.get("observed_at", "")),
+                    unavailable_reason=unavailable_reason,
                 )
             )
         if review_excluded and not candidates:

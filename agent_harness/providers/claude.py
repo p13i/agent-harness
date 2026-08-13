@@ -191,6 +191,9 @@ class NpxClaudeTransport(SubprocessCLITransport):
 
 class ClaudeAdapter(ProviderAdapter):
     provider_id = "claude"
+    supported_permission_modes = frozenset(
+        {"approval", "full", "plan", "read-only"}
+    )
 
     def __init__(self) -> None:
         self._client: ClaudeSDKClient | None = None
