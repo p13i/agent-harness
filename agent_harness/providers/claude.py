@@ -36,6 +36,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk._internal.transport.subprocess_cli import (
     SubprocessCLITransport,
 )
+from claude_agent_sdk.types import ToolsPreset
 
 from agent_harness.child_gate import (
     _admission_key as child_admission_key,
@@ -305,8 +306,14 @@ class ClaudeAdapter(ProviderAdapter):
         setting_sources = None
         if permission_mode in {"plan", "read-only"}:
             setting_sources = []
+        tools: list[str] | ToolsPreset = {
+            "type": "preset",
+            "preset": "claude_code",
+        }
+        if permission_mode == "read-only":
+            tools = []
         options = ClaudeAgentOptions(
-            tools={"type": "preset", "preset": "claude_code"},
+            tools=tools,
             system_prompt={"type": "preset", "preset": "claude_code"},
             permission_mode=permission,
             resume=native_session_id,
@@ -477,8 +484,10 @@ async def _prompt_stream(
 def _permission_mode(permission_mode: str) -> str:
     if permission_mode == "full":
         return "bypassPermissions"
-    if permission_mode in {"plan", "read-only"}:
+    if permission_mode == "plan":
         return "plan"
+    if permission_mode == "read-only":
+        return "default"
     if permission_mode == "approval":
         return "default"
     raise ValueError("unsupported permission mode")

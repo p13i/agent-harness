@@ -1350,7 +1350,7 @@ def test_claude_helpers_and_transport(
 
     assert claude._permission_mode("full") == "bypassPermissions"
     assert claude._permission_mode("plan") == "plan"
-    assert claude._permission_mode("read-only") == "plan"
+    assert claude._permission_mode("read-only") == "default"
     assert claude._permission_mode("approval") == "default"
     with pytest.raises(ValueError):
         claude._permission_mode("invalid")
@@ -1916,7 +1916,9 @@ def test_claude_restricted_turns_isolate_external_settings_hooks(
     assert full.can_use_tool is None
     assert "dangerously-skip-permissions" in full.extra_args
     assert plan.permission_mode == "plan"
-    assert read_only.permission_mode == "plan"
+    assert read_only.permission_mode == "default"
+    assert plan.tools == {"type": "preset", "preset": "claude_code"}
+    assert read_only.tools == []
 
     for options in options_by_mode.values():
         assert set(options.hooks) == {"PreToolUse"}
@@ -1933,7 +1935,24 @@ def test_claude_restricted_turns_isolate_external_settings_hooks(
     for options in (plan, read_only):
         transport = real_transport(claude._empty_stream(), options)
         transport._cli_path = "/usr/bin/npx"
-        assert "--setting-sources=" in transport._build_command()
+        command = transport._build_command()
+        assert "--setting-sources=" in command
+
+    plan_transport = real_transport(claude._empty_stream(), plan)
+    plan_transport._cli_path = "/usr/bin/npx"
+    plan_command = plan_transport._build_command()
+    assert plan_command[plan_command.index("--tools") + 1] == "default"
+    assert plan_command[plan_command.index("--permission-mode") + 1] == "plan"
+
+    read_only_transport = real_transport(claude._empty_stream(), read_only)
+    read_only_transport._cli_path = "/usr/bin/npx"
+    read_only_command = read_only_transport._build_command()
+    assert read_only_command[read_only_command.index("--tools") + 1] == ""
+    assert (
+        read_only_command[read_only_command.index("--permission-mode") + 1]
+        == "default"
+    )
+    assert "--dangerously-skip-permissions" not in read_only_command
 
 
 def test_claude_resume_fails_when_transcript_is_missing_or_misbound(
