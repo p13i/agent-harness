@@ -1549,19 +1549,30 @@ async def test_api_creates_session_and_accepts_message(
         )
         assert conflicting_extension.status == 409
 
-        refused_lease = await client.post(
+        unmeasured_claude_lease = await client.post(
             "/v1/leases",
             headers={
                 **headers,
-                "Idempotency-Key": "integration-lease-refused",
+                "Idempotency-Key": "integration-lease-unmeasured-claude",
             },
             json={
                 "provider": "claude",
                 "execution_profile": "unattended",
             },
         )
-        assert refused_lease.status == 429
-        assert (await refused_lease.json())["error"]["code"] == ("E_SAFETY_GUARD")
+        assert unmeasured_claude_lease.status == 201
+        unmeasured_lease_id = (await unmeasured_claude_lease.json())["lease"][
+            "lease_id"
+        ]
+        released_unmeasured_lease = await client.patch(
+            "/v1/leases/" + unmeasured_lease_id,
+            headers={
+                **headers,
+                "Idempotency-Key": "integration-lease-unmeasured-release",
+            },
+            json={"action": "release"},
+        )
+        assert released_unmeasured_lease.status == 200
         samples = [
             {
                 "observed_at": "invalid",
@@ -1654,7 +1665,11 @@ async def test_api_creates_session_and_accepts_message(
         )
         assert (await attached.json())["lease"]["state"] == "active"
         leases = await client.get("/v1/leases", headers=headers)
-        assert (await leases.json())["leases"][0]["pid"] == 1234
+        lease_values = (await leases.json())["leases"]
+        active_lease = next(
+            item for item in lease_values if item["lease_id"] == lease_id
+        )
+        assert active_lease["pid"] == 1234
         released = await client.patch(
             "/v1/leases/" + lease_id,
             headers={

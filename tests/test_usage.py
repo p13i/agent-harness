@@ -119,7 +119,20 @@ def test_provider_probes_handle_credentials_success_and_errors(
     assert usage._probe_codex().error == "OSError"
 
     monkeypatch.setattr(usage, "_claude_token", lambda: None)
-    assert usage._probe_claude().error == "credentials unavailable"
+    monkeypatch.setattr(
+        usage,
+        "_probe_claude_cli",
+        lambda: UsageSnapshot(
+            "claude",
+            None,
+            False,
+            {},
+            "claude-code usage unavailable",
+        ),
+    )
+    assert usage._probe_claude().error == (
+        "credentials unavailable; claude-code usage unavailable"
+    )
     monkeypatch.setattr(usage, "_claude_token", lambda: "token")
     monkeypatch.setattr(
         usage,
@@ -130,7 +143,193 @@ def test_provider_probes_handle_credentials_success_and_errors(
     )
     assert usage._probe_claude().binding_percent == 40
     monkeypatch.setattr(usage, "_json_get", unavailable)
-    assert usage._probe_claude().error == "OSError"
+    assert usage._probe_claude().error == (
+        "OSError; claude-code usage unavailable"
+    )
+
+
+def test_claude_probe_falls_back_to_headless_local_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(usage, "_claude_token", lambda: "expired-token")
+
+    def unavailable(
+        unused_url: str,
+        unused_headers: dict[str, str],
+    ) -> dict[str, object]:
+        del unused_url
+        del unused_headers
+        raise urllib.error.HTTPError("https://example.invalid", 401, "", {}, None)
+
+    monkeypatch.setattr(usage, "_json_get", unavailable)
+    monkeypatch.setattr(
+        usage,
+        "_probe_claude_cli",
+        lambda: UsageSnapshot(
+            "claude",
+            63.0,
+            False,
+            {
+                "source": "claude-code-local-usage",
+                "windows": [{"label": "week (all models)", "percent": 63.0}],
+            },
+        ),
+    )
+    snapshot = usage._probe_claude()
+    assert snapshot.binding_percent == 63.0
+    assert snapshot.error == ""
+    assert snapshot.payload["source"] == "claude-code-local-usage"
+    assert len(snapshot.payload["live_probe_error_sha256"]) == 64
+
+
+def test_claude_headless_usage_parser_is_closed_and_redacted() -> None:
+    result = """You are currently using your subscription to power your Claude Code usage
+
+Current session: 0% used · resets later
+Current week (all models): 63% used · resets later
+Current week (Fable): 6% used · resets later
+
+private diagnostic material that must not be retained
+"""
+    snapshot = usage._parse_claude_cli_usage(result)
+    assert snapshot.binding_percent == 63.0
+    assert snapshot.credits_engaged is False
+    assert snapshot.payload == {
+        "source": "claude-code-local-usage",
+        "windows": [
+            {"label": "session", "percent": 0.0},
+            {"label": "week (all models)", "percent": 63.0},
+            {"label": "week (Fable)", "percent": 6.0},
+        ],
+    }
+    assert "private" not in str(snapshot.payload)
+
+    missing_subscription = usage._parse_claude_cli_usage(
+        "Current session: 0% used"
+    )
+    assert missing_subscription.binding_percent is None
+    assert "subscription" in missing_subscription.error
+
+    malformed_window = usage._parse_claude_cli_usage(
+        usage.CLAUDE_SUBSCRIPTION_USAGE + "\nCurrent session: 101% used"
+    )
+    assert malformed_window.binding_percent is None
+    assert "windows" in malformed_window.error
+
+
+def test_claude_headless_usage_invocation_is_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run(command: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess:
+        captured["command"] = command
+        captured.update(kwargs)
+        result = (
+            usage.CLAUDE_SUBSCRIPTION_USAGE
+            + "\nCurrent session: 0% used"
+            + "\nCurrent week (all models): 63% used"
+        )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps({"is_error": False, "result": result}),
+            "",
+        )
+
+    monkeypatch.setattr(usage, "_trusted_npx", lambda: "/usr/bin/npx")
+    monkeypatch.setattr(
+        usage,
+        "provider_environment",
+        lambda unused_provider: {
+            "HOME": "/home/operator",
+            "PATH": "/usr/bin:/bin",
+            "npm_config_cache": "/home/operator/.cache/npm",
+        },
+    )
+    monkeypatch.setattr(usage.subprocess, "run", run)
+    snapshot = usage._probe_claude_cli()
+    assert snapshot.binding_percent == 63.0
+    command = captured["command"]
+    assert isinstance(command, tuple)
+    assert command[0] == "/usr/bin/npx"
+    assert usage.CLAUDE_CODE_PACKAGE in command
+    assert "--no-session-persistence" in command
+    assert "--safe-mode" in command
+    assert "--no-chrome" in command
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert command[command.index("--tools") + 1] == ""
+    assert command[-1] == "/usage"
+    assert "shell" not in captured
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["CLAUDE_CODE_SAFE_MODE"] == "1"
+
+
+def test_claude_headless_usage_invocation_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(usage, "_trusted_npx", lambda: None)
+    assert usage._probe_claude_cli().error == "npx unavailable"
+
+    monkeypatch.setattr(usage, "_trusted_npx", lambda: "/usr/bin/npx")
+    monkeypatch.setattr(
+        usage,
+        "provider_environment",
+        lambda unused_provider: {
+            "HOME": "/home/operator",
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+
+    def launch_failure(
+        *unused_args: object,
+        **unused_kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        del unused_args
+        del unused_kwargs
+        raise OSError("private launch detail")
+
+    monkeypatch.setattr(usage.subprocess, "run", launch_failure)
+    assert usage._probe_claude_cli().error == "claude-code usage launch failed"
+
+    def environment_failure(unused_provider: str) -> dict[str, str]:
+        del unused_provider
+        raise RuntimeError("missing node")
+
+    monkeypatch.setattr(usage, "provider_environment", environment_failure)
+    assert usage._probe_claude_cli().error == "claude-code usage launch failed"
+
+    monkeypatch.setattr(
+        usage,
+        "provider_environment",
+        lambda unused_provider: {"PATH": "/usr/bin:/bin"},
+    )
+
+    outputs = (
+        (1, "", "claude-code usage exited nonzero"),
+        (0, "x" * (usage.CLAUDE_CLI_OUTPUT_LIMIT + 1), "exceeded the limit"),
+        (0, "not JSON", "was not JSON"),
+        (0, "[]", "returned an error"),
+        (0, '{"is_error":true}', "returned an error"),
+        (0, '{"is_error":false}', "result was unavailable"),
+    )
+    for returncode, stdout, expected in outputs:
+        monkeypatch.setattr(
+            usage.subprocess,
+            "run",
+            lambda *unused_args, _code=returncode, _stdout=stdout, **unused_kwargs: (
+                subprocess.CompletedProcess(
+                    ["npx"],
+                    _code,
+                    _stdout,
+                    "private stderr",
+                )
+            ),
+        )
+        snapshot = usage._probe_claude_cli()
+        assert expected in snapshot.error
+        assert "private" not in snapshot.error
 
 
 def test_usage_http_and_credential_parsers_are_defensive(

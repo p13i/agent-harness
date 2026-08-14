@@ -1019,6 +1019,115 @@ def test_unattended_dispatch_rejects_when_the_probe_keeps_failing(
     asyncio.run(scenario())
 
 
+def test_unattended_claude_dispatch_proceeds_when_usage_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = UsageSnapshot(
+        provider="claude",
+        binding_percent=None,
+        credits_engaged=False,
+        payload={},
+        error="HTTP 401; claude-code usage unavailable",
+    )
+    probes = 0
+
+    async def probe() -> dict[str, UsageSnapshot]:
+        nonlocal probes
+        probes += 1
+        return {"claude": failed}
+
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        monkeypatch.setattr("agent_harness.scheduler.probe_all", probe)
+        scheduler = Scheduler(store, {"claude": SlowAdapter()})
+        scheduler._usage_cache = {"claude": failed}
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        scheduler._model_cache = {
+            "claude": (
+                ProviderModel(
+                    "claude-fable-5",
+                    "Fable 5",
+                    ("low", "medium"),
+                    None,
+                    default=True,
+                ),
+            )
+        }
+        decision = await scheduler.choose(
+            session(tmp_path),
+            workload="planning",
+            required_capabilities=frozenset(),
+            binding_ceiling=90,
+            execution_profile="unattended",
+            permitted_providers=frozenset({"claude"}),
+        )
+        assert decision.provider == "claude"
+        assert decision.binding_percent is None
+        assert decision.ranked[0]["binding_percent"] is None
+        assert probes == 1
+
+        saturated = UsageSnapshot(
+            provider="claude",
+            binding_percent=95.0,
+            credits_engaged=False,
+            payload={},
+        )
+        scheduler._usage_cache = {"claude": saturated}
+        scheduler._usage_at = asyncio.get_running_loop().time()
+        with pytest.raises(ProviderUnavailableError):
+            await scheduler.choose(
+                session(tmp_path),
+                workload="planning",
+                required_capabilities=frozenset(),
+                binding_ceiling=90,
+                execution_profile="unattended",
+                permitted_providers=frozenset({"claude"}),
+            )
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_claude_status_names_the_usage_unavailable_admission_basis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store = StateStore(tmp_path / "state.sqlite3")
+        store.record_usage(
+            "claude",
+            None,
+            False,
+            {"payload": {}, "error": "HTTP 401"},
+        )
+        scheduler = Scheduler(store, {"claude": SlowAdapter()})
+        scheduler._usage_cache = {
+            "claude": UsageSnapshot(
+                provider="claude",
+                binding_percent=None,
+                credits_engaged=False,
+                payload={},
+                error="HTTP 401",
+            )
+        }
+        monkeypatch.setattr(
+            scheduler,
+            "_start_status_refresh",
+            lambda unused_workspace: None,
+        )
+        status = await scheduler.status(tmp_path)
+        assert status["claude"]["usage"]["admissible"] is True
+        assert status["claude"]["usage"]["binding_percent"] is None
+        assert status["claude"]["usage"]["admission_basis"] == (
+            "usage-unavailable-fallback"
+        )
+        assert status["claude"]["last_error"] == "HTTP 401"
+        store.close()
+
+    asyncio.run(scenario())
+
+
 def test_unattended_pinned_provider_proceeds_when_binding_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

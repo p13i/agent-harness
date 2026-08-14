@@ -2476,6 +2476,60 @@ def test_service_worker_recovery_budget_lease_and_ui_boundaries(
     with pytest.raises(SafetyGuardError, match="binding usage is invalid"):
         negative_service._require_process_lease_capacity("codex", "unattended")
 
+    unavailable_claude = object.__new__(HarnessService)
+    unavailable_claude.store = SimpleNamespace(
+        latest_usage=lambda: {
+            "claude": {
+                "observed_at": service_module.datetime.datetime.now().isoformat(),
+                "binding_percent": None,
+                "credits_engaged": False,
+            }
+        }
+    )
+    unavailable_claude._require_process_lease_capacity("claude", "unattended")
+
+    saturated_claude = object.__new__(HarnessService)
+    saturated_claude.store = SimpleNamespace(
+        latest_usage=lambda: {
+            "claude": {
+                "observed_at": service_module.datetime.datetime.now().isoformat(),
+                "binding_percent": 95,
+                "credits_engaged": False,
+            }
+        }
+    )
+    with pytest.raises(SafetyGuardError, match="safety ceiling"):
+        saturated_claude._require_process_lease_capacity("claude", "unattended")
+
+    no_usage_claude = object.__new__(HarnessService)
+    no_usage_claude.store = SimpleNamespace(latest_usage=lambda: {})
+    no_usage_claude._require_process_lease_capacity("claude", "unattended")
+
+    stale_claude = object.__new__(HarnessService)
+    stale_claude.store = SimpleNamespace(
+        latest_usage=lambda: {
+            "claude": {
+                "observed_at": "2000-01-01T00:00:00+00:00",
+                "binding_percent": 95,
+                "credits_engaged": False,
+            }
+        }
+    )
+    stale_claude._require_process_lease_capacity("claude", "unattended")
+
+    metered_claude = object.__new__(HarnessService)
+    metered_claude.store = SimpleNamespace(
+        latest_usage=lambda: {
+            "claude": {
+                "observed_at": service_module.datetime.datetime.now().isoformat(),
+                "binding_percent": None,
+                "credits_engaged": True,
+            }
+        }
+    )
+    with pytest.raises(SafetyGuardError, match="metered provider credits"):
+        metered_claude._require_process_lease_capacity("claude", "unattended")
+
 
 def test_service_turn_and_budget_extension_boundaries(tmp_path: Path) -> None:
     service = _service(tmp_path)

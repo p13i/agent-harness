@@ -198,12 +198,12 @@ class Scheduler:
         excluded: frozenset[str],
     ) -> dict[str, UsageSnapshot]:
         # Dispatch admission probe-on-miss: when the cache serves a
-        # sample that cannot admit a ceiling-gated non-interactive
-        # dispatch (a provider binding is missing, as after a cold-start
-        # probe failure), refresh once and let the caller re-evaluate
-        # instead of rejecting on the missing sample. Bounded to one
-        # refresh per admission check: when the cache lookup already
-        # probed, its result stands even when the probe errored.
+        # sample whose binding is missing, refresh once and let the
+        # caller re-evaluate. Claude may then proceed with an explicitly
+        # unknown binding; other automatic providers still fail closed.
+        # Bounded to one refresh per admission check: when the cache
+        # lookup already probed, its result stands even when the probe
+        # errored.
         usage_at = self._usage_at
         usage = await self.usage()
         if self._usage_at != usage_at:
@@ -363,16 +363,19 @@ class Scheduler:
                 )
             if binding_ceiling is not None:
                 # Automatic routing stays fail-closed when binding
-                # telemetry is missing: an unknown sample must never
-                # be read as headroom. An explicitly pinned provider
-                # is a named capacity choice, so an unevaluable
-                # ceiling alone cannot refuse it. Known saturation
-                # still blocks the pin in the branch below.
+                # telemetry is missing, except for Claude. Claude's
+                # subscription endpoint is not a provider-execution
+                # prerequisite, and its own local usage command is a
+                # best-effort fallback. Missing telemetry remains
+                # missing in the routing proof rather than being
+                # rewritten as invented headroom. Known saturation
+                # still blocks every provider below.
                 pinned = provider == provider_id
                 if (
                     binding is None
                     and execution_profile != INTERACTIVE
                     and not pinned
+                    and provider_id != "claude"
                 ):
                     safety_ready = False
                     gate_notes[provider_id] = (
@@ -632,12 +635,20 @@ class Scheduler:
                 fresh = _usage_is_fresh(observed_at)
                 binding = snapshot.binding_percent
                 admissible = fresh and not snapshot.credits_engaged
-                if binding is None or binding >= 90.0:
+                if provider == "claude" and binding is None:
+                    admissible = not snapshot.credits_engaged
+                if binding is None and provider != "claude":
                     admissible = False
-                if snapshot.error:
+                if binding is not None and binding >= 90.0:
                     admissible = False
+                if snapshot.error and provider != "claude":
+                    admissible = False
+                admission_basis = "measured-usage"
+                if provider == "claude" and binding is None:
+                    admission_basis = "usage-unavailable-fallback"
                 usage_value.update(
                     {
+                        "admission_basis": admission_basis,
                         "sample_id": str(durable.get("sample_id", "")),
                         "observed_at": observed_at,
                         "fresh": fresh,

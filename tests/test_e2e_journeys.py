@@ -3610,7 +3610,7 @@ async def test_e2e_metered_work_requires_exact_bounded_cost(
 
 
 @pytest.mark.asyncio
-async def test_e2e_unattended_admission_requires_fresh_headroom(
+async def test_e2e_unattended_admission_uses_claude_when_usage_unavailable(
     tmp_path: Path,
 ) -> None:
     rig = JourneyRig(tmp_path)
@@ -3626,10 +3626,12 @@ async def test_e2e_unattended_admission_requires_fresh_headroom(
     try:
         receipt = await rig.message("Run unattended operations.")
 
-        assert receipt.status == "failed"
-        assert receipt.result["code"] == "E_PROVIDER_UNAVAILABLE"
-        assert not rig.adapters["claude"].prompts
+        assert receipt.status == "complete"
+        assert len(rig.adapters["claude"].prompts) == 1
         assert not rig.adapters["codex"].prompts
+        routed = rig.store.routing_decisions(rig.session.session_id)
+        assert routed[0]["provider"] == "claude"
+        assert routed[0]["payload"]["binding_percent"] is None
     finally:
         rig.close()
 

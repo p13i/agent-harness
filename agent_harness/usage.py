@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -17,11 +19,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_harness.providers.base import (
+    provider_environment,
+    provider_npm_cache,
+    trusted_executable,
+)
+
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 # Undocumented endpoint shared with my/tools/usage_monitor.gpt.py; an
 # outage here is endpoint drift, not spent quota.
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+CLAUDE_CODE_PACKAGE = "@anthropic-ai/claude-code@2.1.220"
+CLAUDE_CLI_OUTPUT_LIMIT = 64 * 1024
+CLAUDE_SUBSCRIPTION_USAGE = (
+    "You are currently using your subscription to power your Claude Code usage"
+)
+CLAUDE_USAGE_LINE = re.compile(
+    r"\ACurrent (?P<label>session|week \([^)]+\)): "
+    r"(?P<percent>[0-9]+(?:\.[0-9]+)?)% used(?: · resets .+)?\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -69,10 +86,13 @@ async def _timed_probe(
     provider: str,
     probe: Any,
 ) -> UsageSnapshot:
+    timeout_seconds = 5.0
+    if provider == "claude":
+        timeout_seconds = 20.0
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(probe),
-            timeout=5.0,
+            timeout=timeout_seconds,
         )
     except TimeoutError:
         return UsageSnapshot(
@@ -171,33 +191,197 @@ def _probe_codex() -> UsageSnapshot:
 
 def _probe_claude() -> UsageSnapshot:
     token = _claude_token()
-    if not token:
+    live_error = "credentials unavailable"
+    if token:
+        try:
+            payload = _json_get(
+                CLAUDE_USAGE_URL,
+                {
+                    "Authorization": "Bearer " + token,
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "Accept": "application/json",
+                    "User-Agent": "p13i-agent-harness",
+                },
+            )
+        except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as error:
+            live_error = _safe_error(error)
+        else:
+            return normalize_usage("claude", payload)
+
+    fallback = _probe_claude_cli()
+    if fallback.binding_percent is not None:
+        public_payload = dict(fallback.payload)
+        public_payload["live_probe_error_sha256"] = hashlib.sha256(
+            live_error.encode("utf-8")
+        ).hexdigest()
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=fallback.binding_percent,
+            credits_engaged=fallback.credits_engaged,
+            payload=public_payload,
+        )
+    cli_error = fallback.error
+    if not cli_error:
+        cli_error = "claude-code usage unavailable"
+    return UsageSnapshot(
+        provider="claude",
+        binding_percent=None,
+        credits_engaged=False,
+        payload={},
+        error=live_error + "; " + cli_error,
+    )
+
+
+def _probe_claude_cli() -> UsageSnapshot:
+    npx = _trusted_npx()
+    if npx is None:
         return UsageSnapshot(
             provider="claude",
             binding_percent=None,
             credits_engaged=False,
             payload={},
-            error="credentials unavailable",
+            error="npx unavailable",
+        )
+    command = (
+        npx,
+        "--cache",
+        str(provider_npm_cache()),
+        CLAUDE_CODE_PACKAGE,
+        "--print",
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--no-chrome",
+        "--setting-sources",
+        "",
+        "--tools",
+        "",
+        "--model",
+        "claude-fable-5",
+        "--effort",
+        "low",
+        "/usage",
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            cwd=Path.home(),
+            env=_claude_cli_environment(),
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError, UnicodeError):
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="claude-code usage launch failed",
+        )
+    if completed.returncode != 0:
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="claude-code usage exited nonzero",
+        )
+    encoded = completed.stdout.encode("utf-8")
+    if len(encoded) > CLAUDE_CLI_OUTPUT_LIMIT:
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="claude-code usage output exceeded the limit",
         )
     try:
-        payload = _json_get(
-            CLAUDE_USAGE_URL,
-            {
-                "Authorization": "Bearer " + token,
-                "anthropic-beta": "oauth-2025-04-20",
-                "Accept": "application/json",
-                "User-Agent": "p13i-agent-harness",
-            },
-        )
-    except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as error:
+        envelope = json.loads(completed.stdout)
+    except json.JSONDecodeError:
         return UsageSnapshot(
             provider="claude",
             binding_percent=None,
             credits_engaged=False,
             payload={},
-            error=_safe_error(error),
+            error="claude-code usage output was not JSON",
         )
-    return normalize_usage("claude", payload)
+    if not isinstance(envelope, dict) or envelope.get("is_error") is not False:
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="claude-code usage returned an error",
+        )
+    result = envelope.get("result")
+    if not isinstance(result, str):
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="claude-code usage result was unavailable",
+        )
+    return _parse_claude_cli_usage(result)
+
+
+def _parse_claude_cli_usage(result: str) -> UsageSnapshot:
+    if CLAUDE_SUBSCRIPTION_USAGE not in result:
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="claude-code subscription usage was unavailable",
+        )
+    windows: list[dict[str, Any]] = []
+    for line in result.splitlines():
+        match = CLAUDE_USAGE_LINE.fullmatch(line.strip())
+        if match is None:
+            continue
+        percent = _number(float(match.group("percent")))
+        if percent is None or percent > 100.0:
+            continue
+        windows.append(
+            {
+                "label": match.group("label"),
+                "percent": percent,
+            }
+        )
+    if not windows:
+        return UsageSnapshot(
+            provider="claude",
+            binding_percent=None,
+            credits_engaged=False,
+            payload={},
+            error="claude-code usage windows were unavailable",
+        )
+    return UsageSnapshot(
+        provider="claude",
+        binding_percent=max(float(window["percent"]) for window in windows),
+        credits_engaged=False,
+        payload={
+            "source": "claude-code-local-usage",
+            "windows": windows,
+        },
+    )
+
+
+def _trusted_npx() -> str | None:
+    try:
+        return trusted_executable("npx")
+    except (OSError, RuntimeError):
+        return None
+
+
+def _claude_cli_environment() -> dict[str, str]:
+    environment = provider_environment("claude")
+    environment["CLAUDE_CODE_SAFE_MODE"] = "1"
+    environment["NO_COLOR"] = "1"
+    return environment
 
 
 def _probe_kimi() -> UsageSnapshot:

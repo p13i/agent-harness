@@ -1494,6 +1494,8 @@ class HarnessService:
     ) -> None:
         usage = self.store.latest_usage().get(provider)
         if usage is None:
+            if provider == "claude":
+                return
             raise SafetyGuardError(
                 "fresh provider usage is required",
                 provider,
@@ -1508,14 +1510,23 @@ class HarnessService:
             ) from error
         if observed.tzinfo is None:
             observed = observed.replace(tzinfo=datetime.UTC)
+        if bool(usage.get("credits_engaged", False)):
+            raise SafetyGuardError(
+                "metered provider credits would engage",
+                provider,
+            )
         age = datetime.datetime.now(datetime.UTC) - observed
         if age > datetime.timedelta(seconds=90):
+            if provider == "claude":
+                return
             raise SafetyGuardError(
                 "provider usage is stale",
                 provider,
             )
         binding = _optional_number(usage.get("binding_percent"))
         if binding is None:
+            if provider == "claude":
+                return
             raise SafetyGuardError(
                 "provider binding usage is unavailable",
                 provider,
@@ -1523,11 +1534,6 @@ class HarnessService:
         if binding < 0:
             raise SafetyGuardError(
                 "provider binding usage is invalid",
-                provider,
-            )
-        if bool(usage.get("credits_engaged", False)):
-            raise SafetyGuardError(
-                "metered provider credits would engage",
                 provider,
             )
         ceiling = limits_for(profile, "operations").binding_ceiling
