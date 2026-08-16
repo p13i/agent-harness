@@ -2344,6 +2344,25 @@ class StateStore:
             return True
         return int(crossed["count"]) == 0
 
+    def has_event_type(self, session_id: str, event_type: str) -> bool:
+        """Report whether a session ever recorded one kind of event.
+
+        Answering this by reading the whole history costs the caller
+        every event the session holds. The supervision tick asks it for
+        each session needing input, which on this host meant reading
+        83,828 events every tick to look for one type.
+        """
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE session_id = ? AND event_type = ?
+                LIMIT 1
+                """,
+                (session_id, event_type),
+            ).fetchone()
+        return row is not None
+
     def sessions_with_open_work(self) -> set[str]:
         """Sessions whose work was cut off and needs a worker again.
 

@@ -654,6 +654,13 @@ class HarnessService:
         return self._has_unreachable_event(session.session_id)
 
     def _has_unreachable_event(self, session_id: str) -> bool:
+        # Asked once per needs-input session on every supervision tick.
+        # Reading the whole history to find one event type meant 83,828
+        # events read per tick on this host, which blocked the service
+        # event loop long enough to fail a two-second health probe.
+        query = getattr(self.store, "has_event_type", None)
+        if callable(query):
+            return query(session_id, "session.unreachable")
         for event in self.store.all_events(session_id):
             if event.event_type == "session.unreachable":
                 return True

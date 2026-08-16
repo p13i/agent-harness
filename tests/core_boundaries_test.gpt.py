@@ -2354,6 +2354,53 @@ def test_api_daemon_signal_stream_and_cleanup_boundaries(
         assert not harness_paths.socket.exists()
 
 
+def test_unreachable_lookup_does_not_read_the_whole_history(
+    tmp_path: Path,
+) -> None:
+    """Finding one event type must not cost every event.
+
+    The supervision tick asks this for each session needing input. On
+    the WSL host that meant reading 83,828 events per tick, which
+    blocked the service event loop long enough that a two-second health
+    probe failed on 8 of 30 samples and a queued build went unclaimed.
+    """
+    service = _service(tmp_path / "service")
+    try:
+        session = _create_direct(service, tmp_path / "service")
+        identifier = session.session_id
+
+        assert not service.store.has_event_type(identifier, "session.unreachable")
+        assert not service._has_unreachable_event(identifier)
+
+        service.store.append_event(
+            identifier,
+            "session.unreachable",
+            role="system",
+            text="workspace missing",
+        )
+        assert service.store.has_event_type(identifier, "session.unreachable")
+        assert service._has_unreachable_event(identifier)
+
+        # A different type must not answer for the one asked about.
+        assert not service.store.has_event_type(identifier, "session.absent")
+
+        reads: list[str] = []
+        original = service.store.all_events
+
+        def counting(session_id: str, *args: object, **values: object):
+            reads.append(session_id)
+            return original(session_id, *args, **values)
+
+        service.store.all_events = counting
+        try:
+            assert service._has_unreachable_event(identifier)
+        finally:
+            service.store.all_events = original
+        assert reads == []
+    finally:
+        service.close()
+
+
 def test_worker_recovery_skips_running_sessions_without_a_turn(
     tmp_path: Path,
 ) -> None:
