@@ -2354,6 +2354,63 @@ def test_api_daemon_signal_stream_and_cleanup_boundaries(
         assert not harness_paths.socket.exists()
 
 
+def test_worker_recovery_skips_running_sessions_without_a_turn(
+    tmp_path: Path,
+) -> None:
+    """A session marked RUNNING with no running turn is not running.
+
+    Its worker died mid-flight, the turn was terminalized, and the
+    lifecycle was never corrected, so every supervision tick revived a
+    worker with nothing to resume. On the WSL host 48 such workers were
+    live at once; together with the resting ones they held 8.9 GB and
+    slowed the control socket enough to exceed the builder's two-second
+    health bound, leaving a queued build unclaimed.
+    """
+    service = _service(tmp_path / "service")
+    try:
+        session = _create_direct(service, tmp_path / "service")
+        workers = service.workers
+        assert isinstance(workers, WorkerProbe)
+
+        service.store.update_session(
+            session.session_id,
+            lifecycle=Lifecycle.RUNNING,
+        )
+        workers.sessions.clear()
+        service.recover_workers()
+        assert workers.sessions == []
+        assert service.store.sessions_with_open_work() == set()
+
+        # The same session with a turn still running is exactly what
+        # recovery exists for, so it must come back.
+        turn_id = service.store.start_turn(session.session_id, "attempt-1")
+        assert service.store.sessions_with_open_work() == {session.session_id}
+        workers.sessions.clear()
+        service.recover_workers()
+        assert workers.sessions == [session.session_id]
+
+        service.store.finish_turn(turn_id, "completed")
+        workers.sessions.clear()
+        service.recover_workers()
+        assert workers.sessions == []
+
+        # A paused session is resting, not broken, and keeps its
+        # recovery so a resume does not wait on a cold start.
+        service.store.update_session(
+            session.session_id,
+            lifecycle=Lifecycle.PAUSED,
+        )
+        workers.sessions.clear()
+        service.recover_workers()
+        assert workers.sessions == [session.session_id]
+
+        # A store predating the predicate recovers every supervised
+        # session as before, rather than silently recovering nothing.
+        assert session.session_id in service_module._RECOVER_EVERY_SESSION
+    finally:
+        service.close()
+
+
 def test_service_worker_recovery_budget_lease_and_ui_boundaries(
     tmp_path: Path,
 ) -> None:

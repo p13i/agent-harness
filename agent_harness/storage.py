@@ -2344,6 +2344,36 @@ class StateStore:
             return True
         return int(crossed["count"]) == 0
 
+    def sessions_with_open_work(self) -> set[str]:
+        """Sessions whose work was cut off and needs a worker again.
+
+        Work is a turn still marked running or a command that has not
+        reached a terminal status. A session outside this set has
+        nothing for a worker to resume, so reviving one for it produces
+        an idle process rather than progress.
+        """
+        with self._lock:
+            turns = self._connection.execute(
+                """
+                SELECT DISTINCT session_id FROM turns
+                WHERE status = 'running'
+                """
+            ).fetchall()
+            commands = self._connection.execute(
+                """
+                SELECT DISTINCT session_id FROM commands
+                WHERE status IN (?, ?, ?)
+                """,
+                (
+                    CommandStatus.QUEUED,
+                    CommandStatus.AWAITING_XHIGH_AUTHORIZATION,
+                    CommandStatus.DISPATCHING,
+                ),
+            ).fetchall()
+        result = {str(row["session_id"]) for row in turns}
+        result.update(str(row["session_id"]) for row in commands)
+        return result
+
     def active_command_summaries(self) -> list[dict[str, Any]]:
         """Enumerate prompt-free durable restart blockers."""
         with self._lock:

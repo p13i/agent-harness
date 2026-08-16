@@ -104,6 +104,16 @@ MAX_STEER_TEXT_LENGTH = 65_536
 UNREACHABLE_PARK_TICKS = 3
 
 
+class _EverySession(frozenset):
+    """Membership sentinel for a store without the open-work predicate."""
+
+    def __contains__(self, item: object) -> bool:
+        return True
+
+
+_RECOVER_EVERY_SESSION = _EverySession()
+
+
 class WorkerManager:
     _RESTART_LIMIT = 3
     _RESTART_WINDOW_SECONDS = 60.0
@@ -680,6 +690,20 @@ class HarnessService:
             for lease in self.store.all_process_leases()
             if lease["state"] == "recovery-blocked"
         }
+        # A session marked RUNNING with no running turn contradicts
+        # itself: its worker died mid-flight, the turn was terminalized,
+        # and the lifecycle was never corrected. It keeps that lifecycle
+        # forever, so every supervision tick revives a worker that has
+        # nothing to resume. On this host 48 such workers were live at
+        # once, and together with the resting ones they held 8.9 GB and
+        # slowed the control socket enough to fail the builder's health
+        # probe on 8 of 30 samples, which left a queued build unclaimed
+        # across five drain ticks.
+        #
+        # PAUSED and STARTING are legitimate resting states and keep
+        # their behaviour: a paused session is waiting to be resumed and
+        # a starting one has not opened its first turn yet.
+        open_work = self._sessions_with_open_work()
         session_ids: list[str] = []
         for session in self.store.list_sessions():
             session = self._name_session_from_history(session)
@@ -689,6 +713,12 @@ class HarnessService:
                 continue
             if self._parked_unreachable(session):
                 continue
+            # Compared by value, not identity: the store hands back a
+            # plain string for this field, and an identity test would
+            # silently never match and leave the filter inert.
+            if session.lifecycle == Lifecycle.RUNNING:
+                if session.session_id not in open_work:
+                    continue
             session_ids.append(session.session_id)
         return sorted(session_ids)
 
@@ -712,6 +742,17 @@ class HarnessService:
             session.session_id,
             STOPPED_SESSION_COMMANDS,
         )
+    def _sessions_with_open_work(self) -> set[str]:
+        """Sessions the store reports as having interrupted work.
+
+        A store without the predicate keeps the previous behaviour of
+        recovering every supervised session, so an older store degrades
+        to the old shape rather than silently recovering nothing.
+        """
+        query = getattr(self.store, "sessions_with_open_work", None)
+        if not callable(query):
+            return _RECOVER_EVERY_SESSION
+        return query()
 
     def _worker_session_pairs(
         self,
