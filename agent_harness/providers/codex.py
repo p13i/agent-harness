@@ -589,7 +589,10 @@ def codex_config_model(home: Path | None = None) -> str:
     Operators pin a real model in config.toml; the harness must
     advertise and dispatch that id.
     """
-    base = Path.home() if home is None else home
+    if home is None:
+        base = Path.home()
+    else:
+        base = home
     path = base / ".codex" / "config.toml"
     try:
         text = path.read_text(encoding="utf-8")
@@ -660,13 +663,17 @@ def _merge_codex_config_models(
     for item in listed:
         if item.model_id == configured:
             continue
+        if only_placeholder:
+            item_default = False
+        else:
+            item_default = item.default
         rest.append(
             ProviderModel(
                 item.model_id,
                 item.display_name,
                 item.efforts,
                 item.context_window,
-                default=False if only_placeholder else item.default,
+                default=item_default,
                 service_tiers=item.service_tiers,
             )
         )

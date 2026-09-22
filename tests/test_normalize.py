@@ -400,6 +400,38 @@ def test_payload_text_handles_every_supported_shape() -> None:
     assert payload_text(42) == "42"
 
 
+def test_prose_credentials_are_redacted() -> None:
+    assert (
+        sanitize("username is someone@example.com; password is hunter2sixty")
+        == "username is someone@example.com; password is [REDACTED]"
+    )
+    assert sanitize("the token was 8Fq2ZrmLpxQ") == "the token was [REDACTED]"
+    assert sanitize("my api key is abcdef123456") == "my api key is [REDACTED]"
+    assert (
+        sanitize("the access key is AKIA1234567890")
+        == "the access key is [REDACTED]"
+    )
+
+
+def test_prose_about_a_credential_is_left_alone() -> None:
+    for text in (
+        "the token is missing",
+        "the password is required",
+        "the api key is unset",
+        "the credential is valid",
+        "the private key is rotated",
+        "the secret is out",
+    ):
+        assert sanitize(text) == text
+
+
+def test_a_secret_shorter_than_the_floor_is_not_detectable() -> None:
+    # Documented limitation, not an oversight: a value this short is
+    # indistinguishable from ordinary prose, so rotation is the only
+    # remedy for one that has already been spoken.
+    assert sanitize("password is abc") == "password is abc"
+
+
 def test_redact_observable_walks_every_container_shape() -> None:
     assert redact_observable(["safe", {"api_key": "leaked"}]) == [
         "safe",
