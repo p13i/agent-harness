@@ -21,6 +21,59 @@ SECRET_ASSIGNMENT = re.compile(
     r"'(?:\\.|[^'])*'|[^\s,;]+)"
 )
 BEARER_VALUE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
+# A credential named in prose ("the password is hunter2sixty") never
+# reaches SECRET_ASSIGNMENT, which requires a ":" or "=". The value is
+# whatever follows the verb, so the floor and the stop list below carry
+# the whole false-positive budget: "the token is missing" must survive
+# and "the token is 8Fq2ZrmLpx" must not. A secret shorter than
+# MIN_PROSE_SECRET is not detectable this way at all and has to be
+# rotated instead.
+MIN_PROSE_SECRET = 6
+PROSE_NON_SECRETS = frozenset(
+    {
+        "absent",
+        "available",
+        "blank",
+        "correct",
+        "expired",
+        "exposed",
+        "handled",
+        "ignored",
+        "invalid",
+        "leaked",
+        "logged",
+        "missing",
+        "needed",
+        "optional",
+        "present",
+        "redacted",
+        "rejected",
+        "required",
+        "rotated",
+        "stored",
+        "unknown",
+        "unset",
+        "valid",
+        "wrong",
+    }
+)
+SECRET_PROSE = re.compile(
+    r"(?i)\b((?:api[_ -]?keys?|passwords?|passwds?|secrets?|tokens?"
+    r"|credentials?|private[_ -]?keys?|access[_ -]?keys?))"
+    r"(\s+(?:is|was)\s+)"
+    r"([^\s,;]+)"
+)
+
+
+def _redact_prose(match: "re.Match[str]") -> str:
+    value = match.group(3)
+    if len(value) < MIN_PROSE_SECRET:
+        return match.group(0)
+    if value.strip(".!?\"'").lower() in PROSE_NON_SECRETS:
+        return match.group(0)
+    return match.group(1) + match.group(2) + "[REDACTED]"
+
+
 SECRET_TOKEN = re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b")
 
 
@@ -34,6 +87,7 @@ def sanitize(text: str) -> str:
         lambda match: match.group(1) + "[REDACTED]",
         value,
     )
+    value = SECRET_PROSE.sub(_redact_prose, value)
     return SECRET_TOKEN.sub("[REDACTED]", value)
 
 
